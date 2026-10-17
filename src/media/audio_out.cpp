@@ -28,13 +28,18 @@ namespace {
 
 constexpr int kRate = 48000;
 constexpr unsigned kGrain = 256;
+// The queue's bound: past 60 ms (a burst from the network) it is cut back to
+// 40 ms, the oldest samples first. It used to hold up to 120 ms: that much
+// delay behind the picture (Moonlight keeps 40-50 ms).
 constexpr size_t kMaxQueued = kRate * 60 / 1000;
 constexpr size_t kTrimTo = kRate * 40 / 1000;
 
 std::mutex g_mutex;
-std::deque<float> g_queue;
+std::deque<float> g_queue;  // interleaved stereo
 std::atomic<bool> g_running{false};
 std::atomic<float> g_volume{1.0f};
+// Measured for the log every ~10 s (under g_mutex): the queue's depth at each
+// grain, the grains that found it empty, what was cut.
 uint64_t g_depthSum = 0, g_depthMax = 0, g_grains = 0, g_underruns = 0, g_trimmed = 0;
 std::thread g_thread;
 
@@ -53,7 +58,7 @@ void loop() {
             g_depthSum += depth;
             g_depthMax = std::max<uint64_t>(g_depthMax, depth);
             if (depth == 0) ++g_underruns;
-            if (++g_grains == 1875) {
+            if (++g_grains == 1875) {  // 256-frame grains: ~10 s
                 XC_LOGI("audio out: queue %.1f ms on average (max %.1f), %llu empty grains, %.0f ms cut",
                         g_depthSum * 1000.0 / kRate / g_grains, g_depthMax * 1000.0 / kRate,
                         static_cast<unsigned long long>(g_underruns), g_trimmed * 1000.0 / kRate);
@@ -69,8 +74,10 @@ void loop() {
             for (float& s : grain) s = std::clamp(s * v, -1.0f, 1.0f);
         h = g_handle;
         if (h < 0) break;
+        // Blocks until the hardware wants the next grain (5.3 ms).
         int rc = sceAudioOutOutput(h, grain.data());
         if (rc < 0) {
+            // Handle revocato in chiusura: si esce senza riprovare.
             if (!g_running || g_handle < 0) break;
             static uint64_t failures = 0;
             if (failures++ % 200 == 0)
@@ -89,6 +96,8 @@ std::atomic<AudioRoute> g_route{AudioRoute::Main};
 bool audioStart() {
     if (g_running) return true;
 #if defined(XCLOUD_PS5) || defined(XCLOUD_PS4)
+    // Once per process: a second sceAudioOutInit answers "already
+    // initialised" (0x8026000E on this firmware, 0x8026000C elsewhere).
     static bool initialised = false;
     if (!initialised) {
         int rc = sceAudioOutInit();
@@ -109,6 +118,7 @@ bool audioStart() {
         }
         return h;
     };
+    // SYSTEM prima: MAIN rifiuta un user id che non ha lanciato il titolo (0x809b0001).
     g_handle = openPort(0xFF, 0, 0);
     for (int idx = 1; g_handle <= 0 && idx <= 3; ++idx) g_handle = openPort(0xFF, 0, idx);
     if (g_handle <= 0) g_handle = openPort(0xFF, 1, 0);
@@ -152,8 +162,12 @@ void audioStop() {
 void audioAbortForExit() {
     g_running = false;
 #if defined(XCLOUD_PS5) || defined(XCLOUD_PS4)
+    // Niente sceAudioOutClose: in chiusura di sistema può appendersi.
+    // Si invalida l'handle; _exit ripulisce.
     g_handle = -1;
 #endif
+    // Niente join: il thread vede g_running/g_handle e esce, oppure
+    // il processo fa _exit subito dopo.
 }
 
 void audioPush(const float* interleaved, size_t frames) {
