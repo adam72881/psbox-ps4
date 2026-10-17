@@ -1,0 +1,154 @@
+diff --git a/src/impl/dtlstransport.cpp b/src/impl/dtlstransport.cpp
+--- a/src/impl/dtlstransport.cpp	2026-10-17 14:08:03.525322773 +0000
++++ b/src/impl/dtlstransport.cpp	2026-10-17 14:08:03.525322773 +0000
+@@ -14,6 +14,7 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <cstdio>
+ #include <cstring>
+ #include <exception>
+ 
+@@ -29,6 +30,12 @@
+ 
+ extern "C" void xc_log_flush_line(const char* level, const char* msg);
+ 
++static void xc_dtls_line(const char* fmt, int a, int b) {
++	char msg[96];
++	std::snprintf(msg, sizeof msg, fmt, a, b);
++	xc_log_flush_line("I", msg);
++}
++
+ namespace rtc::impl {
+ 
+ void DtlsTransport::enqueueRecv() {
+@@ -467,6 +474,7 @@
+ 	}
+ 
+ 	enqueueRecv(); // to initiate the handshake
++	xc_log_flush_line("I", "dtls: recv in coda");
+ }
+ 
+ void DtlsTransport::stop() {
+@@ -528,6 +536,17 @@
+ 	std::lock_guard lock(mRecvMutex);
+ 	--mPendingRecvCount;
+ 
++	{
++		static int n = 0;
++		static int last = -999;
++		int st = static_cast<int>(state());
++		if (n < 16 || st != last) {
++			if (n < 16) ++n;
++			last = st;
++			xc_dtls_line("dtls: recv n %d stato %d", n, st);
++		}
++	}
++
+ 	if (state() != State::Connecting && state() != State::Connected)
+ 		return;
+ 
+@@ -543,8 +562,22 @@
+ 					std::lock_guard lock(mSslMutex);
+ 					ret = mbedtls_ssl_handshake(&mSsl);
+ 				}
++				{
++					static int n = 0;
++					static int last = 0x7fffffff;
++					if (n < 24 || ret != last) {
++						if (n < 24) ++n;
++						last = ret;
++						xc_dtls_line("dtls: handshake rc %d fin %d", ret, static_cast<int>(mFinMs));
++					}
++				}
+ 
+ 				if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
++					static int waits = 0;
++					if (waits < 12) {
++						++waits;
++						xc_dtls_line("dtls: attesa byte fin %d ms", static_cast<int>(mFinMs), waits);
++					}
+ 					ThreadPool::Instance().schedule(mTimerSetAt + milliseconds(mFinMs),
+ 					                                [weak_this = weak_from_this()]() {
+ 						                                if (auto locked = weak_this.lock())
+@@ -554,6 +587,7 @@
+ 				}
+ 
+ 				if (mbedtls::check(ret, "Handshake failed")) {
++					xc_log_flush_line("I", "dtls: handshake fatto");
+ 					// RFC 8261: DTLS MUST support sending messages larger than the current path MTU
+ 					// See https://www.rfc-editor.org/rfc/rfc8261.html#section-5
+ 					{
+@@ -600,6 +634,7 @@
+ 		}
+ 	} catch (const std::exception &e) {
+ 		PLOG_ERROR << "DTLS recv: " << e.what();
++		xc_log_flush_line("E", "dtls: recv eccezione");
+ 	}
+ 
+ 	if (state() == State::Connected) {
+@@ -608,6 +643,7 @@
+ 		recv(nullptr);
+ 	} else {
+ 		PLOG_ERROR << "DTLS handshake failed";
++		xc_log_flush_line("E", "dtls: handshake fallito");
+ 		changeState(State::Failed);
+ 	}
+ }
+@@ -637,6 +673,12 @@
+ 	auto *t = static_cast<DtlsTransport *>(ctx);
+ 	try {
+ 		if (len > 0) {
++			static int n = 0;
++			if (n < 8) {
++				++n;
++				xc_dtls_line("dtls: tx %d", static_cast<int>(len), n);
++			}
+ 			auto b = reinterpret_cast<const byte *>(buf);
+-			t->outgoing(make_message(b, b + len));
++			bool sent = t->outgoing(make_message(b, b + len));
++			if (!sent) xc_log_flush_line("W", "dtls: tx non uscito");
+ 		}
+@@ -663,7 +704,16 @@
+ 
+ 			auto bufMin = std::min(len, size_t(message->size()));
+ 			std::memcpy(buf, message->data(), bufMin);
+-			return int(len);
++			{
++				static int n = 0;
++				if (n < 12) {
++					++n;
++					xc_dtls_line("dtls: rx %d chiesti %d", static_cast<int>(bufMin), static_cast<int>(len));
++				}
++			}
++			/* mbedtls conta i byte copiati. Tornare `len` gli fa leggere
++			 * oltre il datagramma e l'handshake non avanza. */
++			return int(bufMin);
+ 		}
+ 
+ 		// Closed
+@@ -684,6 +734,11 @@
+ 	if (fin_ms != 0) {
+ 		dtlsTransport->mTimerSetAt = std::chrono::steady_clock::now();
+ 	}
++	static int n = 0;
++	if (n < 8) {
++		++n;
++		xc_dtls_line("dtls: timer int %d fin %d", static_cast<int>(int_ms), static_cast<int>(fin_ms));
++	}
+ }
+ 
+ int DtlsTransport::GetTimerCallback(void *ctx) {
+@@ -693,6 +748,12 @@
+ 	if (dtlsTransport->mFinMs == 0) {
+ 		return -1;
+ 	} else if (now >= dtlsTransport->mTimerSetAt + milliseconds(dtlsTransport->mFinMs)) {
++		static int n = 0;
++		if (n < 8) {
++			++n;
++			xc_dtls_line("dtls: timeout fin %d int %d", static_cast<int>(dtlsTransport->mFinMs),
++			             static_cast<int>(dtlsTransport->mIntMs));
++		}
+ 		return 2;
+ 	} else if (now >= dtlsTransport->mTimerSetAt + milliseconds(dtlsTransport->mIntMs)) {
+ 		return 1;
