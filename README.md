@@ -43,6 +43,15 @@ Client homebrew di **Xbox Cloud Gaming**: login Microsoft, catalogo Game Pass, s
 - Pad DualShock 4 mappato come Xbox
 - Menu in-stream (touchpad), invio log, auto-update da `/data/psbox/update`
 
+## Download
+
+| File | Note |
+| --- | --- |
+| [`PSBox-PS4-01.38.pkg`](https://github.com/adam72881/psbox-ps4/releases/download/v1.0.38/PSBox-PS4-01.38.pkg) | Build corrente — Package Installer / GoldHEN |
+| [Release v1.0.38](https://github.com/adam72881/psbox-ps4/releases/tag/v1.0.38) | Note di versione e checksum |
+
+Se il link release non è ancora online, il pkg è anche in `releases/PSBox-PS4-01.38.pkg` nel repo (dopo il push del binario).
+
 ## Installazione
 
 1. Con GoldHEN attivo, installa `PSBox-PS4-01.38.pkg` (Package Installer / GoldHEN).
