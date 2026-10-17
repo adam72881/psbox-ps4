@@ -153,9 +153,235 @@ bool rollBack(const std::string& dir, bool& complete) {
 
 }  // namespace
 
-bool verifySignature(const std::string& data, the_sig_placeholder, const char* publicKeyPem, std::string& err) {
+bool verifySignature(const std::string& data, const std::string& sigDer, const char* publicKeyPem, std::string& err) {
 #if defined(MBEDTLS_PSA_CRYPTO_C)
-    psa_crypto_init();
+    psa_crypto_init();  // once per process; the TLS setup did it already in the app
 #endif
+    unsigned char hash[32];
+    mbedtls_sha256(reinterpret_cast<const unsigned char*>(data.data()), data.size(), hash, 0);
+    mbedtls_pk_context pk;
+    mbedtls_pk_init(&pk);
+    int rc = mbedtls_pk_parse_public_key(&pk, reinterpret_cast<const unsigned char*>(publicKeyPem),
+                                         std::strlen(publicKeyPem) + 1);
+    if (rc == 0)
+        rc = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, sizeof hash,
+                               reinterpret_cast<const unsigned char*>(sigDer.data()), sigDer.size());
+    mbedtls_pk_free(&pk);
+    if (rc != 0) {
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "-0x%04x", static_cast<unsigned>(-rc));
+        err = std::string("the signature doesn't match (") + buf + ")";
+    }
+    return rc == 0;
+}
+
+bool updatablePath(const std::string& path) {
+    if (path.empty() || path[0] == '/' || path.find('\\') != std::string::npos ||
+        path.find(':') != std::string::npos || path.find('\0') != std::string::npos)
+        return false;
+    for (size_t start = 0;;) {
+        size_t slash = path.find('/', start);
+        std::string part = path.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+        if (part.empty() || part == "." || part == "..") return false;
+        if (slash == std::string::npos) break;
+        start = slash + 1;
+    }
+    static const std::set<std::string> kUsers = {"account.json", "settings.json",  "library.json",
+                                                 "prices.json",  "xcloud.log",     "autoplay.txt",
+                                                 "update.journal", "store_import.done", "settings.json.bad"};
+    std::string top = path.substr(0, path.find('/'));
+    return !kUsers.count(path) && top != "imgcache" && top.rfind("update.", 0) != 0 && path.find(".ppm") == std::string::npos;
+}
+
+bool unzip(const std::string& zip, const std::string& prefix, std::vector<ZipEntry>& out, std::string& err) {
+    out.clear();
+    // The end of central directory record: within the last 64 KiB + 22.
+    size_t eocd = std::string::npos;
+    for (size_t back = 22; back <= std::min<size_t>(zip.size(), 65557); ++back)
+        if (le32(zip, zip.size() - back) == 0x06054b50) {
+            eocd = zip.size() - back;
+            break;
+        }
+    if (eocd == std::string::npos) {
+        err = "not a zip archive";
+        return false;
+    }
+    size_t count = le16(zip, eocd + 10), at = le32(zip, eocd + 16);
+    size_t total = 0;
+    std::set<std::string> seen;
+    for (size_t n = 0; n < count; ++n) {
+        if (at + 46 > zip.size() || le32(zip, at) != 0x02014b50) {
+            err = "damaged zip directory";
+            return false;
+        }
+        uint32_t method = le16(zip, at + 10), packed = le32(zip, at + 20), size = le32(zip, at + 24);
+        size_t nameLen = le16(zip, at + 28), extraLen = le16(zip, at + 30), commentLen = le16(zip, at + 32);
+        size_t local = le32(zip, at + 42);
+        if (at + 46 + nameLen > zip.size()) {
+            err = "damaged zip directory";
+            return false;
+        }
+        std::string name = zip.substr(at + 46, nameLen);
+        at += 46 + nameLen + extraLen + commentLen;
+        if (!name.empty() && name.back() == '/') continue;  // a folder
+        if (name.rfind(prefix, 0) != 0 || !updatablePath(name.substr(prefix.size()))) {
+            err = "unexpected file in the archive: " + name;
+            return false;
+        }
+        if (!seen.insert(name).second) {  // twice: the second would replace the first's backup
+            err = "file twice in the archive: " + name;
+            return false;
+        }
+        if (local + 30 > zip.size() || le32(zip, local) != 0x04034b50) {
+            err = "damaged zip entry " + name;
+            return false;
+        }
+        size_t data = local + 30 + le16(zip, local + 26) + le16(zip, local + 28);
+        total += size;
+        if (data + packed > zip.size() || total > kMaxUnpacked) {
+            err = "damaged zip entry " + name;
+            return false;
+        }
+        ZipEntry e;
+        e.path = name.substr(prefix.size());
+        if (method == 0 && packed == size) {
+            e.data = zip.substr(data, size);
+        } else if (method == 8) {
+            e.data.resize(size);
+            int got = stbi_zlib_decode_noheader_buffer(e.data.data(), static_cast<int>(size), zip.data() + data,
+                                                       static_cast<int>(packed));
+            if (got != static_cast<int>(size)) {
+                err = "could not unpack " + name;
+                return false;
+            }
+        } else {
+            err = "unsupported compression in " + name;
+            return false;
+        }
+        out.push_back(std::move(e));
+    }
     return true;
 }
+
+bool installRelease(const Release& release, const std::string& dir, const std::string& currentVersion,
+                    const UpdateProgress& progress, std::string& err) {
+    auto report = [&](UpdateStep step, double f) {
+        if (progress) progress(step, f);
+    };
+    if (!isNewerVersion(release.tag, currentVersion)) {
+        err = release.tag + " is not newer than " + currentVersion;
+        return false;
+    }
+    if (release.zipUrl.empty() || release.sigUrl.empty()) {
+        err = release.tag + " has no signed package";
+        return false;
+    }
+    report(UpdateStep::Downloading, 0);
+    std::string sig, zip;
+    if (!download(release.sigUrl, -1, sig, nullptr, err)) return false;
+    if (!download(release.zipUrl, release.zipSize, zip, [&](double f) { report(UpdateStep::Downloading, f); }, err))
+        return false;
+    XC_LOGI("update: %s downloaded, %zu bytes", release.tag.c_str(), zip.size());
+
+    report(UpdateStep::Verifying, -1);
+    if (!verifySignature(zip, sig, kReleaseKey, err)) return false;
+    std::vector<ZipEntry> files;
+    if (!unzip(zip, "PPSA99810/", files, err)) return false;
+    zip.clear();
+    zip.shrink_to_fit();
+    // The package must be that version: an older signed one can't be
+    // offered again under a new tag.
+    std::string wanted = contentVersionOf(release.tag), packaged;
+    bool hasEboot = false;
+    for (const auto& f : files) {
+        hasEboot |= f.path == "eboot.bin";
+        if (f.path == "sce_sys/param.json")
+            if (auto j = json::parse(f.data)) packaged = (*j)["contentVersion"].str();
+    }
+    if (!hasEboot || wanted.empty() || packaged != wanted) {
+        err = "the package is not " + release.tag + " (contentVersion " + (packaged.empty() ? "?" : packaged) + ")";
+        return false;
+    }
+    XC_LOGI("update: signature ok, %zu files, contentVersion %s", files.size(), packaged.c_str());
+
+    report(UpdateStep::Installing, -1);
+    recoverUpdate(dir);  // leftovers of an earlier try
+    if (exists(dir + "/update.journal")) {  // its old files couldn't all go back: not over them
+        err = "an earlier update could not be undone";
+        return false;
+    }
+    const std::string staged = dir + "/update.new", old = dir + "/update.old";
+    for (const auto& f : files) {
+        std::string p = staged + "/" + f.path;
+        // As the console's FTP servers leave a package's files: without the
+        // execute bit, eboot.bin doesn't start (the restart then fails).
+        if (!makeParents(p) || !platform::writeFileAtomic(p, f.data) || ::chmod(p.c_str(), 0777) != 0) {
+            err = "could not write " + p;
+            removeTree(staged);
+            return false;
+        }
+    }
+    // eboot.bin last: until then, a failure leaves the old app whole.
+    std::stable_sort(files.begin(), files.end(),
+                     [](const ZipEntry& a, const ZipEntry& b) { return a.path != "eboot.bin" && b.path == "eboot.bin"; });
+    if (!platform::writeFileAtomic(dir + "/update.journal", "swapping\n")) {
+        err = "could not write the update journal";
+        removeTree(staged);
+        return false;
+    }
+    for (const auto& f : files) {
+        std::string target = dir + "/" + f.path;
+        bool moved = !exists(target) || (makeParents(old + "/" + f.path) &&
+                                         ::rename(target.c_str(), (old + "/" + f.path).c_str()) == 0);
+        if (!moved || !makeParents(target) || ::rename((staged + "/" + f.path).c_str(), target.c_str()) != 0) {
+            err = "could not put " + f.path + " in place (errno " + std::to_string(errno) + ")";
+            bool complete;
+            rollBack(dir, complete);
+            if (!complete) return false;  // the journal stays: the next start tries again
+            ::unlink((dir + "/update.journal").c_str());
+            removeTree(staged);
+            removeTree(old);
+            return false;
+        }
+    }
+    ::unlink((dir + "/update.journal").c_str());
+    removeTree(staged);
+    XC_LOGI("update: %s installed", release.tag.c_str());
+    return true;
+}
+
+bool importStoreLeftovers(const std::string& dir, const std::string& previousDir) {
+    std::string text;
+    const std::string done = dir + "/store_import.done";
+    if (!platform::readFile(previousDir + "/account.json", text) || platform::readFile(done, text)) return false;
+    // Signed in here already (the store's folder is older): never later.
+    bool signedIn = platform::readFile(dir + "/account.json", text);
+    platform::writeFileAtomic(done, "1\n");
+    if (signedIn) return false;
+    int copied = 0;
+    for (const char* name : {"account.json", "settings.json", "library.json", "prices.json"})
+        if (platform::readFile(previousDir + "/" + name, text) && platform::writeFileAtomic(dir + "/" + name, text))
+            ++copied;
+    XC_LOGI("store update: %d user file(s) brought back from the previous version's folder", copied);
+    return copied > 0;
+}
+
+bool recoverUpdate(const std::string& dir) {
+    bool rolledBack = false;
+    if (exists(dir + "/update.journal")) {
+        XC_LOGW("update: the last one was cut short; the old files go back");
+        bool complete;
+        rolledBack = rollBack(dir, complete);
+        if (!complete) {
+            // What is left of the old files stays where it is, for the next try.
+            XC_LOGE("update: the old files could not all go back; trying again at the next start");
+            return rolledBack;
+        }
+        ::unlink((dir + "/update.journal").c_str());
+    }
+    removeTree(dir + "/update.new");
+    removeTree(dir + "/update.old");
+    return rolledBack;
+}
+
+}  // namespace xc::app
