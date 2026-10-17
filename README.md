@@ -47,10 +47,12 @@ Client homebrew di **Xbox Cloud Gaming**: login Microsoft, catalogo Game Pass, s
 
 | File | Note |
 | --- | --- |
-| [`PSBox-PS4-01.38.pkg`](https://github.com/adam72881/psbox-ps4/releases/download/v1.0.38/PSBox-PS4-01.38.pkg) | Build corrente — Package Installer / GoldHEN |
-| [Release v1.0.38](https://github.com/adam72881/psbox-ps4/releases/tag/v1.0.38) | Note di versione e checksum |
+| [**PSBox-PS4-01.38.pkg**](https://github.com/adam72881/psbox-ps4/releases/latest) | Build corrente — Package Installer / GoldHEN (firmware **11.52**) |
+| [Releases](https://github.com/adam72881/psbox-ps4/releases) | Storico versioni e checksum SHA-256 |
 
-Se il link release non è ancora online, il pkg è anche in `releases/PSBox-PS4-01.38.pkg` nel repo (dopo il push del binario).
+**SHA-256 (01.38):** `f795986f7e39ba0e9b25aebbd8cb2a7fc4028f6edbe1c84ff2e7b86cbae02e65`
+
+Se la Release non è ancora pubblicata, compila con `./scripts/build_pkg.sh` oppure usa il pkg già in `dist/` sul tuo PC di build. Vedi [`docs/RELEASE.md`](docs/RELEASE.md).
 
 ## Installazione
 
@@ -116,7 +118,7 @@ src/
   xcloud/       Catalogo, auth helpers
 tools/          ps4_deploy.ps1, register-ps4-worker, …
 scripts/        build_pkg.sh, …
-docs/           PROBLEMI.md e note
+docs/           PROBLEMI.md, RELEASE.md
 ```
 
 ## Crediti
