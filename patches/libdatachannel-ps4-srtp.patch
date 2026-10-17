@@ -1,0 +1,74 @@
+--- a/src/impl/dtlstransport.cpp
++++ b/src/impl/dtlstransport.cpp
+@@ -562,8 +562,9 @@
+ 					}
+ 
+ 					PLOG_INFO << "DTLS handshake finished";
++					// SRTP prima dello stato: SCTP parte con le chiavi già pronte.
++					postHandshake();
+ 					changeState(State::Connected);
+-					postHandshake();
+ 					break;
+ 				}
+ 			}
+--- a/src/impl/dtlssrtptransport.cpp
++++ b/src/impl/dtlssrtptransport.cpp
+@@ -15,6 +15,8 @@
+ 
+ #include <cstring>
+ #include <exception>
++
++extern "C" void xc_log_flush_line(const char* level, const char* msg);
+ 
+ using std::to_integer;
+ using std::to_string;
+@@ -365,6 +367,7 @@
+ 		throw std::runtime_error("SRTP add outbound stream failed, status=" +
+ 		                         to_string(static_cast<int>(err)));
+ 
++	xc_log_flush_line("I", "srtp keys ok");
+ 	mInitDone = true;
+ }
+ 
+--- a/src/impl/sctptransport.cpp
++++ b/src/impl/sctptransport.cpp
+@@ -348,7 +348,8 @@
+ 	sconn.sconn_family = AF_CONN;
+ 	sconn.sconn_port = htons(port);
+ 	sconn.sconn_addr = this;
+-#ifdef HAVE_SCONN_LEN
++#if defined(__FreeBSD__) || defined(__APPLE__) || defined(__DragonFly__) || defined(__OpenBSD__) || \
++    defined(__NetBSD__) || defined(__Bitrig__) || defined(HAVE_SCONN_LEN)
+ 	sconn.sconn_len = sizeof(sconn);
+ #endif
+ 	return sconn;
+--- a/src/impl/peerconnection.cpp
++++ b/src/impl/peerconnection.cpp
+@@ -373,6 +373,9 @@
+ 
+ 	} catch (const std::exception &e) {
+ 		PLOG_ERROR << e.what();
++		std::string line = std::string("sctp: ") + e.what();
++		if (line.size() > 110) line.resize(110);
++		xc_log_flush_line("E", line.c_str());
+ 		changeState(State::Failed);
+ 		throw std::runtime_error("SCTP transport initialization failed");
+ 	}
+--- a/deps/libjuice/src/stun.c
++++ b/deps/libjuice/src/stun.c
+@@ -1051,6 +1051,7 @@
+ 		mapped->len = sizeof(struct sockaddr_in);
+ 		struct sockaddr_in *sin = (struct sockaddr_in *)&mapped->addr;
+ 		sin->sin_family = AF_INET;
++		sin->sin_len = sizeof(*sin);
+ 		sin->sin_port = value->port ^ *((uint16_t *)mask);
+ 		uint8_t *bytes = (uint8_t *)&sin->sin_addr;
+ 		for (int i = 0; i < 4; ++i)
+@@ -1067,6 +1068,7 @@
+ 		mapped->len = sizeof(struct sockaddr_in6);
+ 		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&mapped->addr;
+ 		sin6->sin6_family = AF_INET6;
++		sin6->sin6_len = sizeof(*sin6);
+ 		sin6->sin6_port = value->port ^ *((uint16_t *)mask);
+ 		uint8_t *bytes = (uint8_t *)&sin6->sin6_addr;
+ 		for (int i = 0; i < 16; ++i)
