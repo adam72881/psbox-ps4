@@ -6,6 +6,13 @@
 </p>
 
 <p align="center">
+  <img alt="Build" src="https://img.shields.io/badge/build-01.38-0b6bcb?style=flat-square" />
+  <img alt="Console" src="https://img.shields.io/badge/PS4-GoldHEN%2011.52-003087?style=flat-square" />
+  <img alt="Stream" src="https://img.shields.io/badge/xCloud-1080HQ-107c10?style=flat-square" />
+  <img alt="License" src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue?style=flat-square" />
+</p>
+
+<p align="center">
   <a href="https://github.com/RafaelNGP/xbox-cloud-gaming-ps5">Upstream PS5</a> ·
   <a href="NOTICE.md">Attribuzione</a> ·
   <a href="docs/PROBLEMI.md">Problemi &amp; fix</a> ·
