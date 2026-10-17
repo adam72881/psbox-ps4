@@ -77,7 +77,7 @@ Dopo una sessione, su console:
 Dettaglio e lezioni da altri port PS4 → [`docs/PROBLEMI.md`](docs/PROBLEMI.md).
 
 | Sintomo | Causa | Fix (build) |
-| --- | --- |
+| --- | --- | --- |
 | DTLS 0 byte RX, niente video | SDP senza `transport-cc` (01.36) | Ripristinato transport-cc / ext id 3 (**01.37**) |
 | Stream muore dopo ~1 min | TWCC malformato / troppo grande | TWCC cap ≤40, solo ext id 3, flush dal pump (**01.37**) |
 | ICE ok ma DTLS non parte | Candidati/porte incompleti | Re-iniezione candidati a 3 s se 0 RX (**01.38**) |
