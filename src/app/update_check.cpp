@@ -30,7 +30,7 @@ std::vector<int> parts(const std::string& v) {
 
 }  // namespace
 
-bool isNewerVersion(const std::string& tag, the std::string& current) {
+bool isNewerVersion(const std::string& tag, const std::string& current) {
     auto a = parts(tag), b = parts(current);
     return !a.empty() && !b.empty() && a > b;
 }
