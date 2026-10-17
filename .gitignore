@@ -1,0 +1,18 @@
+
+account.envraw
+*account*.json
+/build-ps4/
+/deps/
+/dist/
+*.elf
+# Local secrets — never commit
+*.oelf
+**/.psbox/
+.psbox/
+secrets.h
+/third_party/opus/
+**/uploads/
+uploads/
+
+/build-host/
+/agent-tools/
