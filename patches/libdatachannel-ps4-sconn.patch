@@ -1,0 +1,80 @@
+--- a/src/impl/sctptransport.cpp
++++ b/src/impl/sctptransport.cpp
+@@ -8,6 +8,7 @@
+ #include "utils.hpp"
+ 
+ #include <algorithm>
++#include <cstddef>
+ #include <chrono>
+ #include <cstdarg>
+ #include <cstdio>
+@@ -343,14 +344,16 @@
+ }
+ 
+ struct sockaddr_conn SctpTransport::getSockAddrConn(uint16_t port) {
++	/* PSBOX_SCONN: stesso layout di usrsctp (HAVE_SCONN_LEN). La famiglia sta
++	 * al byte 1, la lunghezza 16 al byte 0. Il layout Linux (famiglia uint16
++	 * all'offset 0) fa leggere 0 a usrsctp e il bind torna EAFNOSUPPORT. */
++	static_assert(sizeof(struct sockaddr_conn) == 16, "sockaddr_conn");
++	static_assert(offsetof(struct sockaddr_conn, sconn_family) == 1, "sconn_family");
+ 	struct sockaddr_conn sconn = {};
+ 	sconn.sconn_family = AF_CONN;
+ 	sconn.sconn_port = htons(port);
+ 	sconn.sconn_addr = this;
+-#if defined(__FreeBSD__) || defined(__APPLE__) || defined(__DragonFly__) || defined(__OpenBSD__) || \
+-    defined(__NetBSD__) || defined(__Bitrig__) || defined(HAVE_SCONN_LEN)
+ 	sconn.sconn_len = sizeof(sconn);
+-#endif
+ 	return sconn;
+ }
+ 
+@@ -466,6 +469,10 @@
+ 
+ 	PLOG_VERBOSE << "Incoming size=" << message->size();
+ 
++	{
++		static int once = 0;
++		if (!once++) xc_log_flush_line("I", "sctp: conninput");
++	}
+ 	usrsctp_conninput(this, message->data(), message->size(), 0);
+ }
+ 
+@@ -769,6 +776,13 @@
+ 		std::unique_lock lock(mWriteMutex);
+ 		PLOG_VERBOSE << "Handle write, len=" << len;
+ 
++		{
++			static int once = 0;
++			if (!once++) {
++				char msg[48];
++				std::snprintf(msg, sizeof msg, "sctp: conn_output %zu", len);
++				xc_log_flush_line("I", msg);
++			}
++		}
+ 		if (!outgoing(make_message(data, data + len)))
+ 			return -1;
+ 
+--- a/deps/usrsctp/usrsctplib/usrsctp.h
++++ b/deps/usrsctp/usrsctplib/usrsctp.h
+@@ -120,8 +120,9 @@
+  * tune with other sockaddr_* structures.
+  */
+ #if defined(__APPLE__) || defined(__Bitrig__) || defined(__DragonFly__) || \
+-    defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
++    defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || \
++    defined(__ORBIS__) || defined(__PS4__) || defined(HAVE_SCONN_LEN)
++/* PSBOX_SCONN: byte 0 lunghezza, byte 1 famiglia. */
+ struct sockaddr_conn {
+ 	uint8_t sconn_len;
+ 	uint8_t sconn_family;
+--- a/deps/usrsctp/usrsctplib/netinet/sctp_os_userspace.h
++++ b/deps/usrsctp/usrsctplib/netinet/sctp_os_userspace.h
+@@ -1007,7 +1007,7 @@
+ 
+ #define AF_CONN 123
+ struct sockaddr_conn {
+-#ifdef HAVE_SCONN_LEN
++#if defined(HAVE_SCONN_LEN) || defined(__ORBIS__) || defined(__PS4__) || defined(__FreeBSD__)
+ 	uint8_t sconn_len;
+ 	uint8_t sconn_family;
+ #else
