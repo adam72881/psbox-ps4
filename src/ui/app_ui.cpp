@@ -1,1 +1,1 @@
-@file:///home/ubuntu/.cursor/projects/workspace/agent-tools/upload_app_ui.cpp
+/home/ubuntu/.cursor/projects/workspace/agent-tools/upload_app_ui.cpp
