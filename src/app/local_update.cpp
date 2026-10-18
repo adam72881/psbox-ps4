@@ -833,21 +833,52 @@ bool installWithBgft(const char* dataPath, uint32_t size) {
 
 using LoadExecFn = int32_t (*)(const char*, const char**);
 
-// Dopo install completo: LoadExec("exit"). Niente relaunch del titolo in corso
-// (non provato in open-source). L'utente riapre da home.
+// Il payload installa dopo che questo processo è morto. LoadExec("exit")
+// sulla 01.45 restava dentro la syscall (crash.marker fermo su «enter») e
+// lo _exit dopo non partiva. Qui si esce con sceKernelExit; un thread di
+// riserva fa _exit se LoadExec o KernelExit non tornano.
 bool exitAfterUpdate() {
-    updLog("LoadExec exit dopo install completo");
+    updLog("uscita del processo: il payload installa da /data/pkg");
+    std::thread([] {
+        platform::sleepMs(2000);
+        xc_log_stamp("exit: processo terminato (watchdog update)");
+        _exit(0);
+    }).detach();
+
+    using KernelExitFn = void (*)(int);
+    using UserTermFn = int32_t (*)();
+    KernelExitFn kexit = nullptr;
+    UserTermFn userTerm = nullptr;
+    void* sym = nullptr;
+    if (sceKernelDlsym(0x2001, "sceKernelExit", &sym) == 0 && sym)
+        kexit = reinterpret_cast<KernelExitFn>(sym);
+    sym = nullptr;
+    if (sceKernelDlsym(0x2001, "sceUserServiceTerminate", &sym) == 0 && sym)
+        userTerm = reinterpret_cast<UserTermFn>(sym);
+    if (userTerm) {
+        int tr = userTerm();
+        updLog("sceUserServiceTerminate 0x%08x", static_cast<unsigned>(tr));
+    }
+
+    if (kexit) {
+        xc_log_stamp("exit: processo terminato (sceKernelExit update)");
+        kexit(0);
+    }
+
     const char* sysPaths[] = {"/system/priv/lib/libSceSystemService.sprx", "/system/common/lib/libSceSystemService.sprx"};
     int32_t sys = loadModule("SystemService", sysPaths, 2, 0x80000010, "sceSystemServiceLoadExec");
     LoadExecFn loadExec = nullptr;
-    if (!resolveSym(sys, "sceSystemServiceLoadExec", &loadExec) || !loadExec) {
+    if (resolveSym(sys, "sceSystemServiceLoadExec", &loadExec) && loadExec) {
+        xc_log_stamp("exit: processo terminato (LoadExec update)");
+        stampEnter("sceSystemServiceLoadExec(exit)");
+        int rc = loadExec("exit", nullptr);
+        stampLeave("sceSystemServiceLoadExec(exit)", rc);
+    } else {
         updWarn("sceSystemServiceLoadExec assente");
-        return false;
     }
-    stampEnter("sceSystemServiceLoadExec(exit)");
-    int rc = loadExec("exit", nullptr);
-    stampLeave("sceSystemServiceLoadExec(exit)", rc);
-    return false;  // se torna, fallito
+    xc_log_stamp("exit: processo terminato (_exit update)");
+    _exit(0);
+    return false;
 }
 
 // Sceglie il pkg più nuovo tra le cartelle di scan (nessuna modifica file).
@@ -1136,7 +1167,8 @@ bool installViaGoldhenRpi(const std::string& pkgPath, const std::string& fileNam
     updLog("RPI probe 127.0.0.1:12800");
     int probe = -1;
     if (!tcpOpen(0x7f000001u, 12800, 800, probe)) {
-        updWarn("RPI non raggiungibile");
+        updWarn("RPI 127.0.0.1:12800 rifiutato: GoldHEN non apre quella porta");
+        updLog("il Remote Package Installer di flatz è un homebrew a parte; il menu GoldHEN installa da /data/pkg. Provo BinLoader 9090");
         return false;
     }
     close(probe);
@@ -1213,18 +1245,29 @@ bool installViaGoldhenRpi(const std::string& pkgPath, const std::string& fileNam
     return done;
 }
 
+std::atomic<int> g_payloadSent{0};
+
 bool sendBinloaderPayload() {
+    if (g_payloadSent.exchange(1) != 0) {
+        updWarn("payload già inviato una volta, non si rimanda");
+        return false;
+    }
     updLog("BinLoader probe 127.0.0.1:9090 (%u byte)", kPsboxInstallBinLen);
     int fd = -1;
     if (!tcpOpen(0x7f000001u, 9090, 800, fd)) {
+        g_payloadSent.store(0);
         updWarn("BinLoader non raggiungibile");
         return false;
     }
     bool ok = sendAll(fd, reinterpret_cast<const char*>(kPsboxInstallBin), kPsboxInstallBinLen);
     shutdown(fd, SHUT_WR);
     close(fd);
-    if (!ok) updWarn("BinLoader invio incompleto");
-    else updLog("payload consegnato a BinLoader, attende l'uscita dell'app e installa da /data/pkg");
+    if (!ok) {
+        g_payloadSent.store(0);
+        updWarn("BinLoader invio incompleto");
+    } else {
+        updLog("payload consegnato una volta a BinLoader, attende l'uscita e installa da /data/pkg");
+    }
     return ok;
 }
 
@@ -1327,8 +1370,7 @@ LocalUpdateResult installLocalUpdate(const std::string& current) {
     stampEnter("exitAfterUpdate");
     (void)exitAfterUpdate();
     stampLeave("exitAfterUpdate", -1);
-    updWarn("LoadExec exit non ha preso — _exit");
-    xc_log_stamp("[UPDATE] _exit dopo install");
+    xc_log_stamp("exit: processo terminato (update, exitAfterUpdate tornata)");
     _exit(0);
     return r;
 }

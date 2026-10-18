@@ -85,29 +85,46 @@ bool resolveIPv4(const std::string& host, uint32_t& addr, std::string& err) {
         addr = literal.s_addr;
         return true;
     }
-    int pool = g_netPool.load();
-    if (pool < 0) {
-        err = "DNS non inizializzato per " + host;
-        return false;
+    // 0x8041013d al boot: la rete non è ancora pronta (login.live.com, 01.46).
+    // Si riprova per qualche secondo invece di fallire il sign-in al primo giro.
+    constexpr unsigned kNetDown = 0x8041013du;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        int pool = g_netPool.load();
+        if (pool < 0) {
+            err = "DNS non inizializzato per " + host;
+            if (attempt + 1 == 8) return false;
+            XC_LOGW("DNS %s: pool assente, attendo la rete (%d)", host.c_str(), attempt + 1);
+            sleepMs(1000);
+            continue;
+        }
+        int rid = sceNetResolverCreate("psbox", pool, 0);
+        if (rid < 0) {
+            char buf[64];
+            std::snprintf(buf, sizeof buf, "sceNetResolverCreate 0x%08x", static_cast<unsigned>(rid));
+            err = "DNS fallito per " + host + ": " + buf;
+            if (attempt + 1 == 8) return false;
+            XC_LOGW("%s, attendo la rete (%d)", err.c_str(), attempt + 1);
+            sleepMs(1000);
+            continue;
+        }
+        OrbisNetInAddr a{};
+        int rc = sceNetResolverStartNtoa(rid, host.c_str(), &a, 0, 0, 0);
+        sceNetResolverDestroy(rid);
+        if (rc < 0) {
+            char buf[64];
+            std::snprintf(buf, sizeof buf, "0x%08x", static_cast<unsigned>(rc));
+            err = "DNS fallito per " + host + " (" + buf + ")";
+            bool netDown = static_cast<unsigned>(rc) == kNetDown;
+            if (!netDown || attempt + 1 == 8) return false;
+            XC_LOGW("%s, attendo la rete (%d)", err.c_str(), attempt + 1);
+            sleepMs(1000);
+            continue;
+        }
+        addr = a.s_addr;
+        if (attempt) XC_LOGI("DNS %s ok al tentativo %d", host.c_str(), attempt + 1);
+        return true;
     }
-    int rid = sceNetResolverCreate("psbox", pool, 0);
-    if (rid < 0) {
-        char buf[64];
-        std::snprintf(buf, sizeof buf, "sceNetResolverCreate 0x%08x", static_cast<unsigned>(rid));
-        err = "DNS fallito per " + host + ": " + buf;
-        return false;
-    }
-    OrbisNetInAddr a{};
-    int rc = sceNetResolverStartNtoa(rid, host.c_str(), &a, 0, 0, 0);
-    sceNetResolverDestroy(rid);
-    if (rc < 0) {
-        char buf[64];
-        std::snprintf(buf, sizeof buf, "0x%08x", static_cast<unsigned>(rc));
-        err = "DNS fallito per " + host + " (" + buf + ")";
-        return false;
-    }
-    addr = a.s_addr;
-    return true;
+    return false;
 }
 
 bool restartApp() {

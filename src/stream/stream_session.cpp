@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace xc::stream {
@@ -120,6 +121,21 @@ bool decodeTeredo(const std::string& ipv6, std::string& ipv4, int& port) {
 std::atomic<bool> g_streamStop{false};
 
 void requestStop() { g_streamStop.store(true); }
+
+void armNewSession() {
+    g_streamStop.store(false);
+    XC_LOGI("stream: nuova sessione, stop azzerato");
+}
+
+void logSdpLine(const char* which, const std::string& sdp, const char* key) {
+    auto p = sdp.find(key);
+    if (p == std::string::npos) {
+        XC_LOGI("sdp %s %s assente", which, key);
+        return;
+    }
+    auto e = sdp.find_first_of("\r\n", p);
+    XC_LOGI("sdp %s %s", which, sdp.substr(p, e == std::string::npos ? 120 : e - p).c_str());
+}
 
 struct StreamSession::Impl {
     xcloud::GssvClient& gssv;
@@ -830,6 +846,8 @@ struct StreamSession::Impl {
         }
         std::string offer = std::string(*local);
         XC_LOGD("local offer:\n%s", offer.c_str());
+        logSdpLine("offer", offer, "a=setup:");
+        logSdpLine("offer", offer, "a=fingerprint:");
         if (!gssv.sendSdpOffer(offer, err)) return false;
 
         std::string answer;
@@ -846,6 +864,8 @@ struct StreamSession::Impl {
             return false;
         }
         XC_LOGD("remote answer:\n%s", answer.c_str());
+        logSdpLine("answer", answer, "a=setup:");
+        logSdpLine("answer", answer, "a=fingerprint:");
         for (size_t p = answer.find("a=rtpmap:"); p != std::string::npos; p = answer.find("a=rtpmap:", p + 1))
             XC_LOGI("answer %s", answer.substr(p, answer.find_first_of("\r\n", p) - p).c_str());
 #if defined(XCLOUD_PS4)
@@ -941,6 +961,13 @@ struct StreamSession::Impl {
             return false;
         }
         XC_LOGI("ice: connected");
+        try {
+            rtc::Candidate localCand, remoteCand;
+            if (pc && pc->getSelectedCandidatePair(&localCand, &remoteCand))
+                XC_LOGI("ice: pair selezionata %s -> %s", std::string(localCand).c_str(),
+                        std::string(remoteCand).c_str());
+        } catch (...) {
+        }
 #if defined(XCLOUD_PS4)
         ::xc::app::trace::setStage("ICE_CONNECTED");
 #endif
@@ -1004,8 +1031,8 @@ struct StreamSession::Impl {
     }
 
     bool start(std::string& err) {
-        // Un solo tentativo: il riparto ICE/DTLS a 3 s della 01.27–01.32
-        // chiudeva la PC mentre il server era già connesso.
+        // Un solo tentativo dentro questa PeerConnection. Il retry DTLS è
+        // una sessione nuova (StreamPlayer), non un close a metà handshake.
         std::string localErr;
         if (negotiateOnce(localErr)) {
             lastKeepaliveMs = lastKeyframeMs = platform::nowMs();
@@ -1128,6 +1155,10 @@ struct StreamSession::Impl {
         open = false;
         if (pc) {
             try {
+                pc->silenceIce();
+            } catch (...) {
+            }
+            try {
                 pc->close();
             } catch (const std::exception& e) {
                 XC_LOGW("closing peer connection: %s", e.what());
@@ -1227,11 +1258,52 @@ void StreamSession::abandon() {
     // Solo il guard: le callback diventano no-op. Niente resetCallbacks —
     // quella attende la callback in corso (RTP/juice) e teneva dieNow
     // appeso dopo uno stream → il sistema revocava Videodec2/Audio/VideoOut
-    // e la PS4 mostrava CE-34878-0. Niente pc->close().
+    // e la PS4 mostrava CE-34878-0. Niente pc->close() su questo thread.
+    // halt ferma i keepalive STUN anche se _exit arriva tardi.
     if (impl_->guard) {
         std::lock_guard<std::mutex> lock(impl_->guard->mutex);
         impl_->guard->self = nullptr;
     }
+    try {
+        if (impl_->pc) impl_->pc->silenceIce();
+    } catch (...) {
+    }
+    xc_log_stamp("stream: ICE halt (abandon)");
+}
+
+void StreamSession::releaseAgent() {
+    impl_->closedNotified = true;
+    impl_->open = false;
+    if (impl_->guard) {
+        std::lock_guard<std::mutex> lock(impl_->guard->mutex);
+        impl_->guard->self = nullptr;
+    }
+    auto pc = std::move(impl_->pc);
+    impl_->chat.reset();
+    impl_->control.reset();
+    impl_->input.reset();
+    impl_->message.reset();
+    impl_->audio.reset();
+    impl_->video.reset();
+    impl_->videoReporter.reset();
+    if (!pc) {
+        XC_LOGI("stream: nessun agent da chiudere");
+        return;
+    }
+    try {
+        pc->silenceIce();
+    } catch (...) {
+    }
+    XC_LOGI("stream: ICE halt, keepalive STUN fermi");
+    xc_log_stamp("stream: ICE halt");
+    std::thread([pc]() mutable {
+        try {
+            pc->close();
+        } catch (...) {
+        }
+        pc.reset();
+        xc_log_stamp("stream: PeerConnection distrutta");
+    }).detach();
 }
 
 void StreamSession::armNeutralPad() {

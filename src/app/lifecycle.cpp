@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <pthread.h>
 #include <unistd.h>
 
 namespace xc::app {
@@ -127,6 +128,7 @@ void dieNow(const char* why) {
     // ATTRIBUTE=0: niente LoadExec. _exit evita i dtor di libdatachannel /
     // Videodec2 che in chiusura di sistema sono CE-34878-0.
     xc_log_stamp("exit: _exit(0)");
+    xc_log_stamp("exit: processo terminato (dieNow)");
     _exit(0);
 }
 
@@ -260,15 +262,17 @@ void onResume(const char* why) {
 void onTerm(int sig) {
     (void)sig;
     const char a[] = "exit: segnale TERM/USR\n";
-    const char b[] = "exit: _exit\n";
+    const char b[] = "exit: processo terminato (USR)\n";
     (void)!write(STDERR_FILENO, a, sizeof a - 1);
     (void)!write(STDERR_FILENO, b, sizeof b - 1);
     xc_log_stamp("exit: segnale");
+    xc_log_stamp("exit: processo terminato (USR)");
     _exit(0);
 }
 
 extern "C" void xc_on_libc_exit(void) {
     xc_log_stamp("exit: exit()");
+    xc_log_stamp("exit: processo terminato (exit)");
     _exit(0);
 }
 
@@ -278,7 +282,7 @@ void softReleaseStreamResources(const char* why) {
     xc_log_stamp("exit: soft-release stream");
     XC_LOGI("exit: soft-release stream (%s)", why ? why : "");
     g_psMenu.store(true);
-    stream::requestStop();
+    // Niente requestStop: è globale e il tentativo dopo usciva con «chiusura».
     media::audioAbortForExit();
     display::releaseForExit();
     if (g_playerMutex.try_lock()) {
@@ -311,6 +315,7 @@ void applyLifeResult(const LifeResult& step) {
         input::suspendForHome();
         xc_log_stamp("exit: bg=1 risorse rilasciate");
         XC_LOGI("exit: bg=1 VideoOut/audio/pad rilasciati, flip fermi, app sospesa");
+        xc_log_stamp("exit: Chiudi dal menu = SIGTERM sullo stack normale");
     }
     if (step.homeResume) {
         input::resumeFromHome();
@@ -576,6 +581,13 @@ void pumpLifecycle(bool fromMain) {
 
 void monitorLoop() {
     ensureModules();
+    sigset_t open;
+    sigemptyset(&open);
+    sigaddset(&open, SIGTERM);
+    sigaddset(&open, SIGINT);
+    sigaddset(&open, SIGQUIT);
+    sigaddset(&open, SIGHUP);
+    pthread_sigmask(SIG_UNBLOCK, &open, nullptr);
     xc_log_stamp("exit: monitor avviato");
     while (!g_appStopping.load() && !g_dying.load()) {
         pumpLifecycle(false);
@@ -601,7 +613,7 @@ void installExitHooks() {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     for (int sig : {SIGUSR1, SIGUSR2}) sigaction(sig, &sa, nullptr);
-    XC_LOGI("exit: agganci pronti (fault/TERM → _exit, ATTRIBUTE=0, niente Close in dieNow)");
+    XC_LOGI("exit: agganci pronti (SIGTERM stack normale → _exit, tasto PS non chiude)");
     XC_LOGI("exit: monitor stack 8 MiB, status %zu, evento %zu; pump anche sul main ogni frame",
             kStatusBytes, kEventBytes);
     ensureModules();

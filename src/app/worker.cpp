@@ -616,7 +616,21 @@ void signInAndLoad(auth::AuthManager& am, xcloud::GssvClient& gssv) {
         country = g_settings.loginCountry;
     }
     gssv.setLoginCountry(country);
-    if (!am.signIn(gssv, onCode, err, &g_cancel)) {
+    bool signedIn = false;
+    for (int attempt = 0; attempt < 4 && !g_cancel.load(); ++attempt) {
+        err.clear();
+        if (am.signIn(gssv, onCode, err, &g_cancel)) {
+            signedIn = true;
+            break;
+        }
+        bool netDown = err.find("0x8041013d") != std::string::npos || err.find("DNS fallito") != std::string::npos ||
+                       err.find("DNS non inizializzato") != std::string::npos;
+        if (!netDown || attempt + 1 == 4) break;
+        XC_LOGW("sign-in: rete non pronta (%s), riprovo %d", err.c_str(), attempt + 1);
+        g_ui->showSplash("Attendo la rete");
+        platform::sleepMs(2000);
+    }
+    if (!signedIn) {
         XC_LOGE("sign-in failed: %s", err.c_str());
         if (gssv.loginRefused()) {
             // xCloud said no: maybe not offered in this country. Offers to

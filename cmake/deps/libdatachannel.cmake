@@ -151,4 +151,21 @@ if(EXISTS "${_xc_ldc_udp}")
     endif()
 endif()
 
+# Halt dei keepalive STUN e fanout del ClientHello DTLS. deps/ non è nel git.
+set(_xc_ldc_juice_h "${CMAKE_SOURCE_DIR}/deps/libdatachannel/deps/libjuice/include/juice/juice.h")
+if(EXISTS "${_xc_ldc_juice_h}")
+    file(READ "${_xc_ldc_juice_h}" _xc_ldc_juice_src)
+    if(NOT _xc_ldc_juice_src MATCHES "juice_halt")
+        execute_process(
+            COMMAND patch -p1 --forward --batch
+            INPUT_FILE "${CMAKE_SOURCE_DIR}/patches/libdatachannel-ps4-ice-halt.patch"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/deps/libdatachannel"
+            RESULT_VARIABLE _xc_ldc_halt
+        )
+        if(NOT _xc_ldc_halt EQUAL 0)
+            message(FATAL_ERROR "patch libdatachannel-ps4-ice-halt fallita (${_xc_ldc_halt})")
+        endif()
+    endif()
+endif()
+
 add_subdirectory(deps/libdatachannel ${CMAKE_BINARY_DIR}/libdatachannel EXCLUDE_FROM_ALL)

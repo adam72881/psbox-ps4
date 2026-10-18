@@ -842,31 +842,64 @@ struct StreamPlayer::Impl {
             running = false;
             return false;
         }
+        if (g_appStopping.load()) {
+            err = "chiusura";
+            running = false;
+            return false;
+        }
+        stream::armNewSession();
         XC_LOGI("stream: avvio PeerConnection");
-        if (!current() || !current()->start(err)) {
-            if (err.empty()) err = "PeerConnection non avviata";
+        auto dropSession = [](std::shared_ptr<stream::StreamSession> failed) {
+            if (!failed) return;
+            try {
+                failed->releaseAgent();
+            } catch (...) {
+            }
+        };
+        auto tryStart = [&](std::shared_ptr<stream::StreamSession> s) {
+            err.clear();
+            if (!s || !s->start(err)) {
+                if (err.empty()) err = "PeerConnection non avviata";
+                return false;
+            }
+            return true;
+        };
+        if (!tryStart(current())) {
+            bool dtlsTimeout = err.find("timed out connecting the stream") != std::string::npos;
             XC_LOGE("stream: PeerConnection: %s", err.c_str());
-            // Niente pc->close()/join qui: su Orbis dopo un timeout DTLS
-            // close() può restare appeso e lascia il watchdog su stream=1.
-            // abandon + running=false; i thread escono, dieNow può _exit.
-            end(err);
-            reconnecting = false;
-            stream::requestStop();
-            cv.notify_all();
-            audioCv.notify_all();
+            // Non requestStop: quel flag è globale e il tentativo dopo
+            // usciva subito con «chiusura» (01.46, secondo avvio Fortnite).
+            // end() solo a fallimento definitivo: spegne i thread audio/video.
             std::shared_ptr<stream::StreamSession> failed;
             {
                 std::lock_guard<std::mutex> lock(sessionMutex);
                 failed = std::move(session);
             }
-            if (failed) {
-                try {
-                    failed->abandon();
-                } catch (...) {
+            dropSession(std::move(failed));
+            if (dtlsTimeout && !g_appStopping.load() && running) {
+                XC_LOGW("stream: timeout DTLS, un nuovo tentativo con PeerConnection nuova");
+                stream::armNewSession();
+                auto next = std::make_shared<stream::StreamSession>(gssv, callbacks, options);
+                {
+                    std::lock_guard<std::mutex> lock(sessionMutex);
+                    session = next;
                 }
-                static std::vector<std::shared_ptr<stream::StreamSession>> failedStarts;
-                failedStarts.push_back(std::move(failed));
+                if (tryStart(next)) {
+                    XC_LOGI("stream: PeerConnection avviata (retry DTLS)");
+                    updateMicState();
+                    return true;
+                }
+                XC_LOGE("stream: retry DTLS: %s", err.c_str());
+                {
+                    std::lock_guard<std::mutex> lock(sessionMutex);
+                    if (session == next) session.reset();
+                }
+                dropSession(std::move(next));
             }
+            end(err);
+            reconnecting = false;
+            cv.notify_all();
+            audioCv.notify_all();
             return false;
         }
         XC_LOGI("stream: PeerConnection avviata");
@@ -916,16 +949,13 @@ struct StreamPlayer::Impl {
             old.swap(session);
         }
         if (old) {
-            // Come abortForExit: niente pc->close()/resetCallbacks/join.
-            // Su Orbis close() del peer precedente bloccava il worker e la
-            // chiusura di sistema (log 01.36: flood getstatus, niente dieNow).
+            // halt subito, close sul thread staccato: il worker non si
+            // blocca e i keepalive STUN del peer vecchio finiscono.
             try {
-                old->abandon();
+                old->releaseAgent();
             } catch (...) {
             }
-            static std::vector<std::shared_ptr<stream::StreamSession>> abandonedPeers;
-            abandonedPeers.push_back(std::move(old));
-            XC_LOGI("webrtc: peer precedente abbandonato (no close)");
+            XC_LOGI("webrtc: peer precedente chiuso");
         }
         if (g_appStopping.load() || !running) {
             reconnecting = false;
@@ -940,6 +970,7 @@ struct StreamPlayer::Impl {
             std::lock_guard<std::mutex> lock(sessionMutex);
             session = next;
         }
+        if (!g_appStopping.load()) stream::armNewSession();
         if (!next->start(err)) {
             XC_LOGW("reconnect %d failed: %s", reconnectAttempts, err.c_str());
             {
@@ -947,11 +978,9 @@ struct StreamPlayer::Impl {
                 if (session == next) session.reset();
             }
             try {
-                next->abandon();
+                next->releaseAgent();
             } catch (...) {
             }
-            static std::vector<std::shared_ptr<stream::StreamSession>> abandonedPeers;
-            abandonedPeers.push_back(std::move(next));
             if (g_appStopping.load() || !running) reconnecting = false;
             else reconnecting = true;
             return;

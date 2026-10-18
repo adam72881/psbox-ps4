@@ -100,8 +100,12 @@ inline bool terminateEvent(int32_t t) {
 // 0 = attiva. Negativo = SCE error (es. 0x80A10009 = -2136932343): ignorare.
 inline bool appSuspendedFromRc(int32_t rc) { return rc > 0; }
 
-// Nessun API SystemService/AppMessaging è un «Chiudi applicazione» affidabile.
-// Chiude solo Esci in-app o il kill del sistema (SIGKILL / soft-kill).
+// HB-Store, Itemzflow, RetroArch e DolphinPS4 non hanno un evento
+// SystemService «Chiudi». Restano aperti con bg=1 / overlay e muoiono quando
+// la shell manda SIGTERM (disposition di default, oppure _exit). Il tasto PS
+// e IsAppSuspended con rc negativo non sono una chiusura: 0x80A10009 al boot
+// uccideva l'app. Qui isCloseSignal resta falso; SIGTERM è in crash_guard,
+// sullo stack normale, e scrive «processo terminato» prima di _exit.
 inline bool isCloseSignal(const LifeState& /*st*/, const LifeSample& /*s*/) { return false; }
 
 inline LifeResult lifeStep(LifeState& st, const LifeSample& s) {

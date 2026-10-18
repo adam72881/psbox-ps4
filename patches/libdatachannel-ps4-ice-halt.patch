@@ -1,0 +1,300 @@
+diff -ruN a/deps/libjuice/include/juice/juice.h b/deps/libjuice/include/juice/juice.h
+--- a/deps/libjuice/include/juice/juice.h	2026-10-18 12:15:31.699247562 +0000
++++ b/deps/libjuice/include/juice/juice.h	2026-10-18 12:15:31.635247582 +0000
+@@ -115,6 +115,8 @@
+ 
+ JUICE_EXPORT juice_agent_t *juice_create(const juice_config_t *config);
+ JUICE_EXPORT void juice_destroy(juice_agent_t *agent);
++/* Cancella keepalive STUN (anche il binding verso il server) senza join. */
++JUICE_EXPORT void juice_halt(juice_agent_t *agent);
+ 
+ JUICE_EXPORT int juice_gather_candidates(juice_agent_t *agent);
+ JUICE_EXPORT int juice_get_local_description(juice_agent_t *agent, char *buffer, size_t size);
+@@ -124,6 +126,8 @@
+ JUICE_EXPORT int juice_set_remote_gathering_done(juice_agent_t *agent);
+ JUICE_EXPORT int juice_send(juice_agent_t *agent, const char *data, size_t size);
+ JUICE_EXPORT int juice_send_diffserv(juice_agent_t *agent, const char *data, size_t size, int ds);
++/* Handshake DTLS: selected pair più le altre pair già succeeded. */
++JUICE_EXPORT int juice_send_dtls_fanout(juice_agent_t *agent, const char *data, size_t size, int ds);
+ JUICE_EXPORT juice_state_t juice_get_state(juice_agent_t *agent);
+ JUICE_EXPORT int juice_get_selected_candidates(juice_agent_t *agent, char *local, size_t local_size,
+                                                char *remote, size_t remote_size);
+diff -ruN a/deps/libjuice/src/agent.c b/deps/libjuice/src/agent.c
+--- a/deps/libjuice/src/agent.c	2026-10-18 12:15:31.723247554 +0000
++++ b/deps/libjuice/src/agent.c	2026-10-18 12:15:31.647247577 +0000
+@@ -634,6 +634,46 @@
+ 	return 0;
+ }
+ 
++void agent_halt(juice_agent_t *agent) {
++	conn_lock(agent);
++	for (int i = 0; i < agent->entries_count; ++i) {
++		agent->entries[i].state = AGENT_STUN_ENTRY_STATE_CANCELLED;
++		agent->entries[i].next_transmission = 0;
++	}
++	atomic_store(&agent->selected_entry, NULL);
++	conn_unlock(agent);
++	conn_interrupt(agent);
++	JLOG_INFO("ICE halted: STUN keepalives cancelled");
++}
++
++int agent_send_dtls_fanout(juice_agent_t *agent, const char *data, size_t size, int ds) {
++	int ret = agent_send(agent, data, size, ds);
++	agent_stun_entry_t *selected = atomic_load(&agent->selected_entry);
++	addr_record_t extra[8];
++	int nextra = 0;
++	conn_lock(agent);
++	for (int i = 0; i < agent->entries_count && nextra < 8; ++i) {
++		agent_stun_entry_t *entry = agent->entries + i;
++		if (entry == selected || entry->type != AGENT_STUN_ENTRY_TYPE_CHECK || !entry->pair)
++			continue;
++		if (entry->relay_entry)
++			continue;
++		if (entry->state != AGENT_STUN_ENTRY_STATE_SUCCEEDED &&
++		    entry->state != AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE &&
++		    entry->pair->state != ICE_CANDIDATE_PAIR_STATE_SUCCEEDED)
++			continue;
++		extra[nextra++] = entry->record;
++	}
++	conn_unlock(agent);
++	for (int i = 0; i < nextra; ++i) {
++		if (agent_direct_send(agent, &extra[i], data, size, ds) >= 0 && ret < 0)
++			ret = 0;
++	}
++	if (nextra > 0)
++		JLOG_INFO("DTLS handshake copied to %d extra succeeded pairs", nextra);
++	return ret;
++}
++
+ int agent_send(juice_agent_t *agent, const char *data, size_t size, int ds) {
+ 	// Try not to lock in the send path
+ 	agent_stun_entry_t *selected_entry = atomic_load(&agent->selected_entry);
+@@ -803,6 +843,13 @@
+ 		JLOG_WARN("Received a datagram from unknown address, ignoring");
+ 		return -1;
+ 	}
++	if (entry->type == AGENT_STUN_ENTRY_TYPE_CHECK && entry != atomic_load(&agent->selected_entry)) {
++		static int noted = 0;
++		if (noted < 4) {
++			++noted;
++			JLOG_INFO("Non-STUN accepted from a validated pair that is not the selected one");
++		}
++	}
+ 	switch (entry->type) {
+ 	case AGENT_STUN_ENTRY_TYPE_RELAY:
+ 		if (is_channel_data(buf, len)) {
+diff -ruN a/deps/libjuice/src/agent.h b/deps/libjuice/src/agent.h
+--- a/deps/libjuice/src/agent.h	2026-10-18 12:15:31.699247562 +0000
++++ b/deps/libjuice/src/agent.h	2026-10-18 12:15:31.643247579 +0000
+@@ -154,6 +154,7 @@
+ 
+ juice_agent_t *agent_create(const juice_config_t *config);
+ void agent_destroy(juice_agent_t *agent);
++void agent_halt(juice_agent_t *agent);
+ 
+ int agent_gather_candidates(juice_agent_t *agent);
+ int agent_resolve_servers(juice_agent_t *agent);
+@@ -164,6 +165,7 @@
+ int agent_add_turn_server(juice_agent_t *agent, const juice_turn_server_t *turn_server);
+ int agent_set_remote_gathering_done(juice_agent_t *agent);
+ int agent_send(juice_agent_t *agent, const char *data, size_t size, int ds);
++int agent_send_dtls_fanout(juice_agent_t *agent, const char *data, size_t size, int ds);
+ int agent_direct_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
+                       int ds);
+ int agent_relay_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr_record_t *dst,
+diff -ruN a/deps/libjuice/src/juice.c b/deps/libjuice/src/juice.c
+--- a/deps/libjuice/src/juice.c	2026-10-18 12:15:31.699247562 +0000
++++ b/deps/libjuice/src/juice.c	2026-10-18 12:15:31.639247581 +0000
+@@ -30,6 +30,11 @@
+ 		agent_destroy(agent);
+ }
+ 
++JUICE_EXPORT void juice_halt(juice_agent_t *agent) {
++	if (agent)
++		agent_halt(agent);
++}
++
+ JUICE_EXPORT int juice_gather_candidates(juice_agent_t *agent) {
+ 	if (!agent)
+ 		return JUICE_ERR_INVALID;
+@@ -101,6 +106,20 @@
+ 		return JUICE_ERR_TOO_LARGE;
+ 	return JUICE_ERR_FAILED;
+ }
++
++JUICE_EXPORT int juice_send_dtls_fanout(juice_agent_t *agent, const char *data, size_t size, int ds) {
++	if (!agent || (!data && size))
++		return JUICE_ERR_INVALID;
++
++	int ret = agent_send_dtls_fanout(agent, data, size, ds);
++	if (ret >= 0)
++		return JUICE_ERR_SUCCESS;
++	if (ret == -SEAGAIN || ret == -SEWOULDBLOCK)
++		return JUICE_ERR_AGAIN;
++	if (ret == -SEMSGSIZE)
++		return JUICE_ERR_TOO_LARGE;
++	return JUICE_ERR_FAILED;
++}
+ 
+ JUICE_EXPORT juice_state_t juice_get_state(juice_agent_t *agent) { return agent_get_state(agent); }
+ 
+diff -ruN a/include/rtc/peerconnection.hpp b/include/rtc/peerconnection.hpp
+--- a/include/rtc/peerconnection.hpp	2026-10-18 12:15:43.251243956 +0000
++++ b/include/rtc/peerconnection.hpp	2026-10-18 12:15:31.679247567 +0000
+@@ -80,6 +80,8 @@
+ 	~PeerConnection();
+ 
+ 	void close();
++	// Ferma i keepalive STUN dell'agent senza aspettare il join.
++	void silenceIce();
+ 
+ 	const Configuration *config() const;
+ 	State state() const;
+diff -ruN a/src/impl/dtlstransport.cpp b/src/impl/dtlstransport.cpp
+--- a/src/impl/dtlstransport.cpp	2026-10-18 12:15:43.251243956 +0000
++++ b/src/impl/dtlstransport.cpp	2026-10-18 12:15:31.659247574 +0000
+@@ -394,7 +394,8 @@
+       mIncomingQueue(RECV_QUEUE_LIMIT, message_size_func) {
+ 
+ 	PLOG_DEBUG << "Initializing DTLS transport (MbedTLS)";
+-	xc_log_flush_line("I", "dtls ctor");
++	xc_log_flush_line("I", mIsClient ? "dtls: ruolo client (active, manda ClientHello)"
++	                                 : "dtls: ruolo server (passive, attende ClientHello)");
+ 
+ 	if (!mCertificate)
+ 		throw std::invalid_argument("DTLS certificate is null");
+diff -ruN a/src/impl/icetransport.cpp b/src/impl/icetransport.cpp
+--- a/src/impl/icetransport.cpp	2026-10-18 12:15:43.251243956 +0000
++++ b/src/impl/icetransport.cpp	2026-10-18 12:15:31.655247575 +0000
+@@ -185,9 +185,19 @@
+ 
+ IceTransport::~IceTransport() {
+ 	PLOG_DEBUG << "Destroying ICE transport";
++	halt();
+ 	mAgent.reset();
+ }
+ 
++void IceTransport::halt() {
++#if !USE_NICE
++	if (mAgent)
++		juice_halt(mAgent.get());
++#else
++	(void)0;
++#endif
++}
++
+ Description::Role IceTransport::role() const { return mRole; }
+ 
+ Description IceTransport::getLocalDescription(Description::Type type) const {
+@@ -220,6 +230,27 @@
+ 		mRole = description.role() == Description::Role::Active ? Description::Role::Passive
+ 		                                                        : Description::Role::Active;
+ 
++	{
++		const char *remote = description.role() == Description::Role::Active    ? "active"
++		                     : description.role() == Description::Role::Passive ? "passive"
++		                                                                        : "actpass";
++		const char *local = mRole == Description::Role::Active    ? "active"
++		                    : mRole == Description::Role::Passive ? "passive"
++		                                                          : "actpass";
++		char line[96];
++		std::snprintf(line, sizeof line, "ice: setup remoto %s, ruolo locale %s", remote, local);
++		xc_log_flush_line("I", line);
++		if (auto fp = description.fingerprint()) {
++			string algo = CertificateFingerprint::AlgorithmIdentifier(fp->algorithm);
++			char fline[180];
++			std::snprintf(fline, sizeof fline, "ice: fingerprint remoto %s %s", algo.c_str(),
++			              fp->value.c_str());
++			xc_log_flush_line("I", fline);
++		} else {
++			xc_log_flush_line("W", "ice: fingerprint remoto assente");
++		}
++	}
++
+ 	if (mRole == description.role())
+ 		throw std::invalid_argument("Incompatible roles with remote description");
+ 
+@@ -302,8 +333,13 @@
+ bool IceTransport::outgoing(message_ptr message) {
+ 	// Explicit Congestion Notification takes the least-significant 2 bits of the DS field
+ 	int ds = int(message->dscp << 2);
+-	return juice_send_diffserv(mAgent.get(), reinterpret_cast<const char *>(message->data()),
+-	                           message->size(), ds) >= 0;
++	const char *bytes = reinterpret_cast<const char *>(message->data());
++	unsigned b0 = message->size() ? static_cast<unsigned char>(bytes[0]) : 0;
++	// Record DTLS di handshake (20 change_cipher_spec, 21 alert, 22 handshake).
++	// Il 23 è application data: non si duplica su altre pair.
++	if (b0 >= 20 && b0 <= 22)
++		return juice_send_dtls_fanout(mAgent.get(), bytes, message->size(), ds) >= 0;
++	return juice_send_diffserv(mAgent.get(), bytes, message->size(), ds) >= 0;
+ }
+ 
+ void IceTransport::changeGatheringState(GatheringState state) {
+@@ -413,6 +449,8 @@
+ 
+ #else // USE_NICE == 1
+ 
++void IceTransport::halt() {}
++
+ IceTransport::MainLoopWrapper *IceTransport::MainLoop = nullptr;
+ 
+ IceTransport::MainLoopWrapper::MainLoopWrapper()
+diff -ruN a/src/impl/icetransport.hpp b/src/impl/icetransport.hpp
+--- a/src/impl/icetransport.hpp	2026-10-18 12:15:43.247243958 +0000
++++ b/src/impl/icetransport.hpp	2026-10-18 12:15:31.651247577 +0000
+@@ -57,6 +57,8 @@
+ 	optional<string> getRemoteAddress() const;
+ 
+ 	bool send(message_ptr message) override; // false if dropped
++	// Ferma i keepalive STUN subito, senza join del thread juice.
++	void halt();
+ 
+ 	bool getSelectedCandidatePair(Candidate *local, Candidate *remote);
+ 
+diff -ruN a/src/impl/peerconnection.cpp b/src/impl/peerconnection.cpp
+--- a/src/impl/peerconnection.cpp	2026-10-18 12:15:43.251243956 +0000
++++ b/src/impl/peerconnection.cpp	2026-10-18 12:15:31.671247571 +0000
+@@ -100,6 +100,11 @@
+ 	mProcessor.join();
+ }
+ 
++void PeerConnection::silenceIce() {
++	if (auto ice = std::atomic_load(&mIceTransport))
++		ice->halt();
++}
++
+ void PeerConnection::close() {
+ 	if (!closing.exchange(true)) {
+ 		PLOG_VERBOSE << "Closing PeerConnection";
+@@ -411,6 +416,8 @@
+ 	auto sctp = std::atomic_exchange(&mSctpTransport, decltype(mSctpTransport)(nullptr));
+ 	auto dtls = std::atomic_exchange(&mDtlsTransport, decltype(mDtlsTransport)(nullptr));
+ 	auto ice = std::atomic_exchange(&mIceTransport, decltype(mIceTransport)(nullptr));
++	if (ice)
++		ice->halt();
+ 
+ 	if (sctp) {
+ 		sctp->onRecv(nullptr);
+diff -ruN a/src/impl/peerconnection.hpp b/src/impl/peerconnection.hpp
+--- a/src/impl/peerconnection.hpp	2026-10-18 12:15:43.251243956 +0000
++++ b/src/impl/peerconnection.hpp	2026-10-18 12:15:31.667247571 +0000
+@@ -38,6 +38,7 @@
+ 
+ 	void close();
+ 	void remoteClose();
++	void silenceIce();
+ 
+ 	optional<Description> localDescription() const;
+ 	optional<Description> remoteDescription() const;
+diff -ruN a/src/peerconnection.cpp b/src/peerconnection.cpp
+--- a/src/peerconnection.cpp	2026-10-18 12:15:43.251243956 +0000
++++ b/src/peerconnection.cpp	2026-10-18 12:15:31.675247569 +0000
+@@ -47,6 +47,8 @@
+ 
+ void PeerConnection::close() { impl()->close(); }
+ 
++void PeerConnection::silenceIce() { impl()->silenceIce(); }
++
+ const Configuration *PeerConnection::config() const { return &impl()->config; }
+ 
+ PeerConnection::State PeerConnection::state() const { return impl()->state; }

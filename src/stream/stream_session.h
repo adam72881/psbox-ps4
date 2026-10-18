@@ -21,6 +21,8 @@ namespace xc::stream {
 
 // La chiusura dell'app: le attese ICE escono entro un giro breve.
 void requestStop();
+// Nuova partita: azzera lo stop lasciato da un tentativo fallito.
+void armNewSession();
 
 // The game asks for text (a name, a chat line): the server's
 // "ShowVirtualKeyboard". Answer with completeTextInput() or cancelTextInput().
@@ -105,10 +107,12 @@ public:
     uint64_t framesAcked() const;
     // Chiude il peer e stacca i callback prima che ne nasca un altro.
     void retire();
-    // Chiusura di sistema: solo null del guard, niente resetCallbacks/close
-    // (entrambi possono attendere una callback in corso → hang → CE-34878-0).
-    // Il peer resta vivo fino a _exit.
+    // Chiusura di sistema: halt dei keepalive, niente resetCallbacks/close
+    // sul thread che sta uscendo (possono attendere una callback → CE-34878-0).
     void abandon();
+    // Tentativo fallito o peer sostituito: halt subito, close su un thread
+    // staccato. Non trattiene la sessione: i keepalive STUN devono finire.
+    void releaseAgent();
     // The clock FrameMetadata times are on, in ms (stream::clockMs()).
     double clockMs() const;
     // Test hook: drops the connection as a network outage would.

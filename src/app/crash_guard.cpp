@@ -9,6 +9,7 @@
 #include "util/log.h"
 
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <csignal>
 #include <cstddef>
@@ -142,9 +143,22 @@ void onSignal(int sig, siginfo_t* info, void* uctx) {
     const char done[] = "exit: _exit after signal\n";
     flushFd(STDERR_FILENO, done, static_cast<int>(sizeof done - 1));
     flushFd(g_logFd, done, static_cast<int>(sizeof done - 1));
+    const char fin[] = "exit: processo terminato (segnale)\n";
+    flushFd(STDERR_FILENO, fin, static_cast<int>(sizeof fin - 1));
+    flushFd(g_logFd, fin, static_cast<int>(sizeof fin - 1));
 
     // CE-34878-0 nasce dal re-raise / dai dtor. Qui si esce puliti.
     _exit(0);
+}
+
+void unblockCloseSignals() {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGQUIT);
+    sigaddset(&set, SIGHUP);
+    pthread_sigmask(SIG_UNBLOCK, &set, nullptr);
 }
 
 }  // namespace
@@ -161,16 +175,28 @@ void install(const std::string& markerPath) {
     ss.ss_size = sizeof g_alt;
     ss.ss_flags = 0;
     int alt = sigaltstack(&ss, nullptr);
+    if (alt != 0)
+        XC_LOGW("crash guard: sigaltstack errno %d — lo stack alternativo non c'è", errno);
     XC_LOGI("crash guard: alt stack %d (%zu byte) base %p, fault → _exit(0)", alt, sizeof g_alt,
             reinterpret_cast<void*>(g_base));
-    struct sigaction sa {};
-    sa.__sa_handler.__sa_sigaction = onSignal;
     // Niente SA_RESETHAND: se arriva un secondo fault durante il log, si
     // ripete _exit invece del default (report CE).
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    sigemptyset(&sa.sa_mask);
-    for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTERM, SIGINT, SIGQUIT, SIGHUP})
-        sigaction(sig, &sa, nullptr);
+    struct sigaction fault {};
+    fault.__sa_handler.__sa_sigaction = onSignal;
+    fault.sa_flags = SA_SIGINFO | (alt == 0 ? SA_ONSTACK : 0);
+    sigemptyset(&fault.sa_mask);
+    for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(sig, &fault, nullptr);
+    // 01.46: sigaltstack ha tornato -1 e SIGTERM era SA_ONSTACK. Orbis non
+    // consegna il segnale, «Chiudi applicazione» non scrive nulla e il
+    // processo resta vivo (keepalive STUN). TERM/INT/QUIT/HUP stanno sullo
+    // stack normale, come Itemzflow / RetroArch / HB-Store.
+    struct sigaction closeSig {};
+    closeSig.__sa_handler.__sa_sigaction = onSignal;
+    closeSig.sa_flags = SA_SIGINFO;
+    sigemptyset(&closeSig.sa_mask);
+    for (int sig : {SIGTERM, SIGINT, SIGQUIT, SIGHUP}) sigaction(sig, &closeSig, nullptr);
+    unblockCloseSignals();
+    XC_LOGI("crash guard: SIGTERM/INT/QUIT/HUP sullo stack normale, sbloccati");
     std::set_terminate([] {
         const char* what = "uncaught exception";
         try {
@@ -184,6 +210,8 @@ void install(const std::string& markerPath) {
         writeMarker("uncaught exception");
         const char done[] = "exit: _exit after terminate\n";
         flushFd(g_logFd, done, static_cast<int>(sizeof done - 1));
+        const char fin[] = "exit: processo terminato (terminate)\n";
+        flushFd(g_logFd, fin, static_cast<int>(sizeof fin - 1));
         _exit(0);
     });
 }
