@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Decoder H.264 hardware PS4. La sequenza e quella di Moonlight-ps4
+// Decoder H.264 hardware PS4. La sequenza è quella di Moonlight-ps4
 // (videodec2_loader.c + decoder_orbis.c): load dei moduli, coda compute
-// su piu pipe, memorie ONION/GARLIC, AU da 1 MiB a rotazione, piu framebuffer.
+// su più pipe, memorie ONION/GARLIC, AU da 1 MiB a rotazione, più framebuffer.
 // Il present resta su display_ps4: renderer_videoout.c aprirebbe un secondo
 // VideoOut e il percorso YCbCr dipende da un kpayload solo per il firmware 9.00.
 #include "media/hw_decoder.h"
@@ -26,6 +26,9 @@ namespace xc::media {
 namespace {
 constexpr int kProtRw = 0x33;
 constexpr size_t kAlign = 0x4000;
+// Profondità 2, senza Flush a ogni frame. Sulla 01.22 depth 1 più Flush
+// stava sui 10–12 ms; depth 2 senza Flush stava sui 2.4 ms. Moonlight-ps4
+// (videodec2.h) nota che depth 1 serializza sulla coda compute.
 constexpr int kDepth = 2;
 constexpr int kFbCount = kDepth + 2;
 
@@ -263,8 +266,8 @@ bool HwDecoder::decode(const uint8_t* data, size_t len, uint64_t pts, Picture& o
     st->auI = (st->auI + 1) % st->auN;
     Block& au = st->au[st->auI];
     if (len > au.size) {
-        XC_LOGE("hwdec: AU %zu piu grande del buffer %zu", len, au.size);
-        if (st->decodeLogs++ < 4) lastError_ = "access unit piu grande del buffer Videodec2";
+        XC_LOGE("hwdec: AU %zu più grande del buffer %zu", len, au.size);
+        if (st->decodeLogs++ < 4) lastError_ = "access unit più grande del buffer Videodec2";
         return false;
     }
     std::memcpy(au.ptr, data, len);
@@ -287,18 +290,24 @@ bool HwDecoder::decode(const uint8_t* data, size_t len, uint64_t pts, Picture& o
     std::memset(&info, 0, sizeof info);
     info.thisSize = sizeof info;
 
+    // NAL type dal primo start code o dal primo byte dell'AU.
     uint8_t nalType = 0;
     if (len >= 5 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1)
         nalType = data[4] & 0x1F;
     else if (len >= 1)
         nalType = data[0] & 0x1F;
 
+    // Se Decode si pianta (moduli 0x80020002), l'ultima riga è enter e il
+    // watchdog vede il video idle. Niente lock condivisi col thread rete.
     static int onceDec = 0;
     if (onceDec == 0) {
         onceDec = 1;
         XC_LOGI("hwdec: Decode enter AU %zu nal %u", len, static_cast<unsigned>(nalType));
     }
     int rc = st->api.Decode(st->dec, &in, &fb, &info);
+    // 0x811D0300 = NEW_SEQUENCE (SPS/PPS nuovi o cambio risoluzione): senza
+    // Reset ogni Decode successiva fallisce, anche gli IDR. 0x811D0304 =
+    // FATAL_STREAM. Si Reset e si ritenta la stessa AU (contiene la sequenza).
     constexpr unsigned kNewSequence = 0x811d0300u;
     constexpr unsigned kFatalStream = 0x811d0304u;
     if (rc < 0) {
@@ -306,7 +315,7 @@ bool HwDecoder::decode(const uint8_t* data, size_t len, uint64_t pts, Picture& o
         if ((u == kNewSequence || u == kFatalStream) && st->api.Reset) {
             lastNeededReset_ = true;
             int rr = st->api.Reset(st->dec);
-            XC_LOGW("hwdec: Decode %s -> Reset %s, ritento AU %zu nal %u", hex(rc), hex(rr), len,
+            XC_LOGW("hwdec: Decode %s → Reset %s, ritento AU %zu nal %u", hex(rc), hex(rr), len,
                     static_cast<unsigned>(nalType));
             if (rr >= 0) {
                 std::memset(&info, 0, sizeof info);
@@ -359,6 +368,11 @@ bool HwDecoder::decode(const uint8_t* data, size_t len, uint64_t pts, Picture& o
         auto off = src - static_cast<const uint8_t*>(st->fb.ptr);
         if (off >= 0 && static_cast<size_t>(off) < st->fb.size) src = static_cast<const uint8_t*>(st->fbCpu) + off;
     }
+    // L'alias ONION è già leggibile: il loop video lo copia sullo scanout
+    // prima della Decode successiva (tre framebuffer, questo non viene
+    // riusato subito). Senza alias la memoria è WC_GARLIC e una lettura
+    // sparsa è lentissima: una sola copia in RAM cacheabile, come il bounce
+    // di Moonlight-ps4.
     const uint8_t* picture = src;
     if (!st->fbAlias) {
         st->shadow.resize(bytes);
