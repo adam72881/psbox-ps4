@@ -1,0 +1,26 @@
+audio_orbis.c e audio_orbis.h provengono da
+https://github.com/JaimeJimenezG/Moonlight-ps4
+(percorso src/audio/), autore Jaime Jiménez e i contributori di quel port.
+
+Quel repository non pubblica un file LICENSE. Il port è un client Moonlight:
+Moonlight e moonlight-common-c sono GPL-3.0. Questo progetto è GPL-3.0-or-later
+e redistribuisce quei due file con la stessa licenza, senza togliere
+l'attribuzione.
+
+Unica modifica rispetto all'originale: il buffer di decodifica passa da 512 a
+960 campioni per canale, perché i frame Opus di xCloud durano fino a 20 ms.
+Il resto (anello PCM, sceAudioOut a 48 kHz in blocchi da 256, PLC con
+pacchetto nullo) è il file originale.
+
+libopus (third_party/opus) è la 1.5.2 di Xiph.Org, licenza BSD, la stessa
+libreria che Moonlight-ps4 compila per OpenOrbis.
+
+Videodec2, dalla stessa origine e con la stessa licenza:
+- src/orbis/videodec2.h, videodec2_loader.c, video_out_c.h (compilati)
+- src/video/nv12_blit.c e nv12_blit.h (compilati)
+- src/video/decoder_orbis.c e renderer_videoout.c sono nel tree come
+  riferimento della sequenza di init e del present. Non sono nel link:
+  renderer_videoout apre un secondo sceVideoOut e il percorso YCbCr usa un
+  kpayload valido sul firmware 9.00, non su 11.52. Il present dello stream
+  resta display_ps4. L'init e il Decode seguono loader + decoder_orbis
+  (memorie ONION/GARLIC, AU da 1 MiB, framebuffer a rotazione).
