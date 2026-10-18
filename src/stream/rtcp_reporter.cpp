@@ -1,1 +1,9 @@
-file:///workspace/src/stream/rtcp_reporter.cpp
+#include "rtcp_reporter.cpp.r0.inc"
+#include "rtcp_reporter.cpp.r1.inc"
+#include "rtcp_reporter.cpp.r2.inc"
+#include "rtcp_reporter.cpp.r3.inc"
+#include "rtcp_reporter.cpp.r4.inc"
+#include "rtcp_reporter.cpp.r5.inc"
+#include "rtcp_reporter.cpp.r6.inc"
+#include "rtcp_reporter.cpp.r7.inc"
+#include "rtcp_reporter.cpp.r8.inc"
