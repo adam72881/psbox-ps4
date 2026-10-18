@@ -38,6 +38,7 @@ bool loadAccountJson(std::string& pathOut) {
         if (looksLikeJson(v)) {
             text = std::move(v);
         } else {
+            // Env may hold a path (e.g. ~/.psbox/account.json); never log it.
             if (!platform::readFile(v, text) || text.empty()) {
                 XC_LOGE("harness: PSBOX_ACCOUNT_JSON path unreadable");
                 return false;
@@ -147,6 +148,9 @@ int runStream(auth::AuthManager& am, const std::string& titleId, int seconds, bo
         return 4;
     }
 
+    // RTP/juice thread only enqueues AUs. Decode + reportFrame run on the
+    // main loop — sending on the input DC from the RTP callback freezes SCTP
+    // (reproduced: Fortnite hung after the first frame when ack was inline).
     constexpr size_t kMaxQueued = 48;
     std::mutex qMu;
     std::deque<Au> q;
@@ -183,6 +187,7 @@ int runStream(auth::AuthManager& am, const std::string& titleId, int seconds, bo
     opts.maxBitrate = res == xcloud::Resolution::P720      ? 12000000u
                       : res == xcloud::Resolution::P1080HQ ? 30000000u
                                                            : 20000000u;
+    // Come PSBox PS5 stream_player.
     if (forceAlias) opts.resolutionAlias = forceAlias;
     else if (res == xcloud::Resolution::P720) opts.resolutionAlias = "720HQ";
     else if (res == xcloud::Resolution::P1080 || res == xcloud::Resolution::P1080HQ)
@@ -208,6 +213,8 @@ int runStream(auth::AuthManager& am, const std::string& titleId, int seconds, bo
     int rc = 0;
     stream::GamepadFrame pad;
     pad.index = 0;
+    // Idle xCloud (~8–10 min senza input “reale”): un tap A periodico evita
+    // serverInitiatedDisconnect / KickForBeingIdle (visto a t≈517s).
     uint64_t nextIdleTap = t0 + 45000;
     bool tapDown = false;
 
@@ -242,6 +249,7 @@ int runStream(auth::AuthManager& am, const std::string& titleId, int seconds, bo
     };
 
     while (platform::nowMs() < end && !c.closed.load()) {
+        // Pochi AU per giro: lascia tempo a pumpFast (flush message/ack/pad).
         drainVideo(3);
         uint64_t now = platform::nowMs();
         if (doPad) {
@@ -249,8 +257,8 @@ int runStream(auth::AuthManager& am, const std::string& titleId, int seconds, bo
                 tapDown = !tapDown;
                 if (tapDown) pad.buttons |= stream::kA;
                 else pad.buttons &= static_cast<uint16_t>(~stream::kA);
-                if (!tapDown) nextIdleTap = now + 60000;
-                else nextIdleTap = now + 80;
+                if (!tapDown) nextIdleTap = now + 60000;  // un tap/min
+                else nextIdleTap = now + 80;              // 80 ms premuto
             }
             session.sendGamepad(pad);
         }
