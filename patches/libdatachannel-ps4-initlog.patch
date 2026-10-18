@@ -1,0 +1,358 @@
+diff --git a/include/rtc/utils.hpp b/include/rtc/utils.hpp
+index be27733..009adf2 100644
+--- a/include/rtc/utils.hpp
++++ b/include/rtc/utils.hpp
+@@ -50,7 +50,21 @@ private:
+ };
+ 
+ // callback with built-in synchronization
++extern "C" void xc_log_flush_line(const char* level, const char* msg);
++
+ template <typename... Args> class synchronized_callback {
++	/* Prima del mutex ricorsivo: sulla 01.06 il ctor moriva fra un "mtx rc 0"
++	 * e il callback successivo, prima di "pc body". */
++	struct XcProbe {
++		XcProbe() {
++			static int n;
++			if (n < 16) {
++				xc_log_flush_line("I", "cb");
++				++n;
++			}
++		}
++	} xcProbe_;
++
+ public:
+ 	synchronized_callback() = default;
+ 	synchronized_callback(synchronized_callback &&cb) { *this = std::move(cb); }
+diff --git a/src/impl/certificate.cpp b/src/impl/certificate.cpp
+index ff0e5c3..866e96f 100644
+--- a/src/impl/certificate.cpp
++++ b/src/impl/certificate.cpp
+@@ -594,8 +594,12 @@ string make_fingerprint(X509 *x509, CertificateFingerprint::Algorithm fingerprin
+ 
+ // Common for GnuTLS, Mbed TLS, and OpenSSL
+ 
++extern "C" void xc_log_flush_line(const char* level, const char* msg);
++
+ future_certificate_ptr make_certificate(CertificateType type) {
++	xc_log_flush_line("I", "cert");
+ 	return ThreadPool::Instance().enqueue([type, token = Init::Instance().token()]() {
++		xc_log_flush_line("I", "cert gen");
+ 		return std::make_shared<Certificate>(Certificate::Generate(type, "libdatachannel"));
+ 	});
+ }
+diff --git a/src/impl/dtlstransport.cpp b/src/impl/dtlstransport.cpp
+index 6a289ef..394ae68 100644
+--- a/src/impl/dtlstransport.cpp
++++ b/src/impl/dtlstransport.cpp
+@@ -27,6 +27,8 @@
+ 
+ using namespace std::chrono;
+ 
++extern "C" void xc_log_flush_line(const char* level, const char* msg);
++
+ namespace rtc::impl {
+ 
+ void DtlsTransport::enqueueRecv() {
+@@ -385,6 +387,7 @@ DtlsTransport::DtlsTransport(shared_ptr<IceTransport> lower, certificate_ptr cer
+       mIncomingQueue(RECV_QUEUE_LIMIT, message_size_func) {
+ 
+ 	PLOG_DEBUG << "Initializing DTLS transport (MbedTLS)";
++	xc_log_flush_line("I", "dtls ctor");
+ 
+ 	if (!mCertificate)
+ 		throw std::invalid_argument("DTLS certificate is null");
+@@ -452,6 +455,7 @@ void DtlsTransport::Cleanup() {
+ 
+ void DtlsTransport::start() {
+ 	PLOG_DEBUG << "Starting DTLS transport";
++	xc_log_flush_line("I", "dtls start");
+ 	registerIncoming();
+ 	changeState(State::Connecting);
+ 
+diff --git a/src/impl/icetransport.cpp b/src/impl/icetransport.cpp
+index f28422c..105d399 100644
+--- a/src/impl/icetransport.cpp
++++ b/src/impl/icetransport.cpp
+@@ -13,6 +13,7 @@
+ #include "utils.hpp"
+ 
+ #include <algorithm>
++#include <cstdio>
+ #include <iostream>
+ #include <random>
+ #include <sstream>
+@@ -29,6 +30,8 @@
+ 
+ #include <sys/types.h>
+ 
++extern "C" void xc_log_flush_line(const char* level, const char* msg);
++extern "C" void xc_dtls_note_rx(size_t n);
++
+ using namespace std::chrono_literals;
+ using std::chrono::system_clock;
+ 
+@@ -235,6 +238,7 @@ bool IceTransport::addRemoteCandidate(const Candidate &candidate) {
+ 
+ void IceTransport::gatherLocalCandidates(string mid, std::vector<IceServer> additionalIceServers) {
+ 	mMid = std::move(mid);
++	xc_log_flush_line("I", "ice gather");
+ 
+ 	std::shuffle(additionalIceServers.begin(), additionalIceServers.end(), utils::random_engine());
+ 	for (const auto &server : additionalIceServers)
+@@ -244,8 +248,10 @@ void IceTransport::gatherLocalCandidates(string mid, std::vector<IceServer> addi
+ 	changeGatheringState(GatheringState::InProgress);
+ 
+ 	if (juice_gather_candidates(mAgent.get()) < 0) {
++		xc_log_flush_line("W", "ice gather no");
+ 		throw std::runtime_error("Failed to gather local ICE candidates");
+ 	}
++	xc_log_flush_line("I", "ice gather ok");
+ }
+ 
+ optional<string> IceTransport::getLocalAddress() const {
+@@ -361,6 +367,16 @@ void IceTransport::RecvCallback(juice_agent_t *, const char *data, size_t size,
+ 	auto iceTransport = static_cast<rtc::impl::IceTransport *>(user_ptr);
+ 	try {
+ 		PLOG_VERBOSE << "Incoming size=" << size;
++		if (data && size > 0) {
++			static int n = 0;
++			unsigned b0 = static_cast<unsigned>(static_cast<unsigned char>(data[0]));
++			/* 20-63 è DTLS (RFC 7983). Contatore per ripartenza a freddo. */
++			if (b0 >= 20 && b0 <= 63) {
++				xc_dtls_note_rx(size);
++				if (n < 8) {
++					++n;
++					char msg[40];
++					std::snprintf(msg, sizeof msg, "ice: rx %u b0 %u", static_cast<unsigned>(size), b0);
++					xc_log_flush_line("I", msg);
++				}
++			}
++		}
+ 		auto b = reinterpret_cast<const byte *>(data);
+ 		iceTransport->incoming(make_message(b, b + size));
+ 	} catch (const std::exception &e) {
+diff --git a/src/impl/init.cpp b/src/impl/init.cpp
+index aad72dd..8b7e5d4 100644
+--- a/src/impl/init.cpp
++++ b/src/impl/init.cpp
+@@ -31,6 +31,12 @@
+ 
+ #include <thread>
+ 
++#include <cstdio>
++#include <time.h>
++
++extern "C" void xc_log_flush_line(const char* level, const char* msg);
++extern "C" void xc_log_stamp(const char* msg);
++
+ namespace rtc::impl {
+ 
+ struct Init::TokenPayload {
+@@ -106,11 +112,29 @@ void Init::setSctpSettings(SctpSettings s) {
+ 
+ void Init::doInit() {
+ 	// mMutex needs to be locked
++	xc_log_flush_line("I", "init enter");
++	/* Nel binario 01.10 la prima istruzione DOPO il ritorno di quel flush è
++	 * movzbl 0x28(%rbx): legge mInitialized per formattare "init flag", prima
++	 * di stamparlo. Se il flush non torna, "init back" non c'è (muore in
++	 * unlock o noteProgress: i timbri "init after fsync/note"). Questo timbro
++	 * non tocca l'oggetto. */
++	xc_log_stamp("init back");
++	{
++		char msg[80];
++		std::snprintf(msg, sizeof msg, "init this %p sizeof %zu", static_cast<void *>(this), sizeof(*this));
++		xc_log_stamp(msg);
++		xc_log_stamp("init before flag");
++		int flag = mInitialized ? 1 : 0;
++		std::snprintf(msg, sizeof msg, "init flag %d", flag);
++		xc_log_stamp(msg);
++	}
+ 
+-	if (std::exchange(mInitialized, true))
++	if (std::exchange(mInitialized, true)) {
++		xc_log_flush_line("I", "init gia");
+ 		return;
++	}
+ 
+-	PLOG_DEBUG << "Global initialization";
++	xc_log_flush_line("I", "init hw");
+ 
+ #ifdef _WIN32
+ 	WSADATA wsaData;
+@@ -118,10 +142,25 @@ void Init::doInit() {
+ 		throw std::runtime_error("WSAStartup failed, error=" + std::to_string(WSAGetLastError()));
+ #endif
+ 
+-	int concurrency = std::thread::hardware_concurrency();
+-	int count = std::max(concurrency, MIN_THREADPOOL_SIZE);
+-	PLOG_DEBUG << "Spawning " << count << " threads";
++	/* La 01.08 moriva qui, prima di "init nproc". Nel binario, fra i due log
++	 * c'era PLOG_DEBUG (singleton di plog, poi Record/iostream se la severità
++	 * è debug). std::thread::hardware_concurrency sta DOPO quel log e chiama
++	 * sysconf(84): su Orbis musl entra in cpuset_getaffinity. Il pool è fisso,
++	 * uguale a MIN_THREADPOOL_SIZE. Nessuna delle due chiamate. */
++	xc_log_flush_line("I", "init nproc");
++	int count = MIN_THREADPOOL_SIZE;
++	{
++		char msg[40];
++		std::snprintf(msg, sizeof msg, "nproc %d pool %d", count, count);
++		xc_log_flush_line("I", msg);
++		struct timespec ts;
++		int crc = clock_gettime(CLOCK_MONOTONIC, &ts);
++		std::snprintf(msg, sizeof msg, "clock %d", crc);
++		xc_log_flush_line("I", msg);
++	}
++	xc_log_flush_line("I", "pool");
+ 	ThreadPool::Instance().spawn(count);
++	xc_log_flush_line("I", "pool ok");
+ 
+ #if RTC_ENABLE_WEBSOCKET
+ 	PollService::Instance().start();
+@@ -135,16 +174,22 @@ void Init::doInit() {
+ 	openssl::init();
+ #endif
+ 
++	xc_log_flush_line("I", "sctp");
+ 	SctpTransport::Init();
++	xc_log_flush_line("I", "sctp set");
+ 	SctpTransport::SetSettings(mCurrentSctpSettings);
++	xc_log_flush_line("I", "dtls");
+ 	DtlsTransport::Init();
+ #if RTC_ENABLE_WEBSOCKET
+ 	TlsTransport::Init();
+ #endif
+ #if RTC_ENABLE_MEDIA
++	xc_log_flush_line("I", "srtp");
+ 	DtlsSrtpTransport::Init();
+ #endif
++	xc_log_flush_line("I", "ice");
+ 	IceTransport::Init();
++	xc_log_flush_line("I", "ice ok");
+ }
+ 
+ void Init::doCleanup() {
+diff --git a/src/impl/peerconnection.cpp b/src/impl/peerconnection.cpp
+index c9eefca..b8b00f0 100644
+--- a/src/impl/peerconnection.cpp
++++ b/src/impl/peerconnection.cpp
+@@ -24,6 +24,8 @@
+ #endif
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <memory>
+ #include <array>
+ #include <iomanip>
+ #include <set>
+@@ -46,7 +48,21 @@ static LogCounter
+ 
+ const string PemBeginCertificateTag = "-----BEGIN CERTIFICATE-----";
+ 
++extern "C" void xc_log_flush_line(const char* level, const char* msg);
++extern "C" void xc_log_stamp(const char* msg);
++
++PeerConnection::XcSize::XcSize(const PeerConnection *self) {
++	char msg[120];
++	// make_shared alloca __shared_ptr_emplace, non solo l'oggetto: se i due
++	// numeri non tornano, il layout scritto non entra nel blocco.
++	using Emplace = std::__shared_ptr_emplace<PeerConnection, std::allocator<PeerConnection>>;
++	std::snprintf(msg, sizeof msg, "pc this %p sizeof %zu alloc %zu", static_cast<const void *>(self),
++	              sizeof(PeerConnection), sizeof(Emplace));
++	xc_log_stamp(msg);
++}
++
+ PeerConnection::PeerConnection(Configuration config_) : config(std::move(config_)) {
++	xc_log_flush_line("I", "pc body");
+ 	PLOG_VERBOSE << "Creating PeerConnection";
+ 
+ 	if (config.certificatePemFile && config.keyPemFile) {
+diff --git a/src/impl/peerconnection.hpp b/src/impl/peerconnection.hpp
+index 22826cc..7bd5743 100644
+--- a/src/impl/peerconnection.hpp
++++ b/src/impl/peerconnection.hpp
+@@ -135,6 +135,14 @@ private:
+ 	void dispatchMedia(message_ptr message);
+ 	void updateTrackSsrcCache(const Description &description);
+ 
++	struct XcMembersDone {
++		XcMembersDone() { xc_log_flush_line("I", "pc members"); }
++	} mXcMembersDone;
++	/* Prima di Init::token(): this e sizeof, senza entrare in doInit.
++	 * L'allocazione (make_shared) è un altro numero, loggato dal ctor. */
++	struct XcSize {
++		explicit XcSize(const PeerConnection *self);
++	} mXcSize{this};
+ 	const init_token mInitToken = Init::Instance().token();
+ 	future_certificate_ptr mCertificate;
+ 
+diff --git a/src/impl/sctptransport.cpp b/src/impl/sctptransport.cpp
+index 6afe772..bd481df 100644
+--- a/src/impl/sctptransport.cpp
++++ b/src/impl/sctptransport.cpp
+@@ -84,8 +84,12 @@ private:
+ 
+ std::unique_ptr<SctpTransport::InstancesSet> SctpTransport::Instances = std::make_unique<InstancesSet>();
+ 
++extern "C" void xc_log_flush_line(const char* level, const char* msg);
++
+ void SctpTransport::Init() {
++	xc_log_flush_line("I", "sctp init");
+ 	usrsctp_init(0, SctpTransport::WriteCallback, SctpTransport::DebugCallback);
++	xc_log_flush_line("I", "sctp flags");
+ 	usrsctp_sysctl_set_sctp_pr_enable(1);  // Enable Partial Reliability Extension (RFC 3758)
+ 	usrsctp_sysctl_set_sctp_ecn_enable(0); // Disable Explicit Congestion Notification
+ #ifndef SCTP_ACCEPT_ZERO_CHECKSUM
+@@ -94,6 +98,7 @@ void SctpTransport::Init() {
+ #ifdef SCTP_DEBUG
+ 	usrsctp_sysctl_set_sctp_debug_on(SCTP_DEBUG_ALL);
+ #endif
++	xc_log_flush_line("I", "sctp flags ok");
+ }
+ 
+ void SctpTransport::SetSettings(const SctpSettings &s) {
+@@ -143,6 +148,7 @@ void SctpTransport::SetSettings(const SctpSettings &s) {
+ 	// Heartbeat interval
+ 	usrsctp_sysctl_set_sctp_heartbeat_interval_default(
+ 	    to_uint32(s.heartbeatInterval.value_or(10000ms).count()));
++	xc_log_flush_line("I", "sctp set ok");
+ }
+ 
+ void SctpTransport::Cleanup() {
+diff --git a/src/impl/threadpool.cpp b/src/impl/threadpool.cpp
+index 1fda4e2..7a9c776 100644
+--- a/src/impl/threadpool.cpp
++++ b/src/impl/threadpool.cpp
+@@ -9,6 +9,8 @@
+ #include "threadpool.hpp"
+ #include "utils.hpp"
+ 
++extern "C" void xc_log_flush_line(const char* level, const char* msg);
++
+ namespace rtc::impl {
+ 
+ ThreadPool &ThreadPool::Instance() {
+@@ -26,9 +28,13 @@ int ThreadPool::count() const {
+ }
+ 
+ void ThreadPool::spawn(int count) {
++	xc_log_flush_line("I", "pool spawn");
+ 	std::unique_lock lock(mWorkersMutex);
+-	while (count-- > 0)
++	while (count-- > 0) {
++		xc_log_flush_line("I", "pool thread");
+ 		mWorkers.emplace_back(std::bind(&ThreadPool::run, this));
++		xc_log_flush_line("I", "pool thread ok");
++	}
+ }
+ 
+ void ThreadPool::join() {
+@@ -55,6 +61,7 @@ void ThreadPool::clear() {
+ }
+ 
+ void ThreadPool::run() {
++	xc_log_flush_line("I", "worker");
+ 	utils::this_thread::set_name("RTC worker");
+ 	++mBusyWorkers;
+ 	scope_guard guard([&]() { --mBusyWorkers; });
