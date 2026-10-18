@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 RafaelNGP
 // DualShock 4 via scePad (OpenOrbis). Stessa mappatura Xbox di controller.cpp
-// sulla PS5. Niente grilletti adattivi DualSense: setTriggerRumble e un no-op
+// sulla PS5. Niente grilletti adattivi DualSense: setTriggerRumble è un no-op
 // (il DS4 non li ha). Lightbar e vibrazione restano.
 #include "input/controller.h"
 #include "input/tuning.h"
@@ -170,6 +170,9 @@ bool pollPad(int index, ControllerState& out) {
     out.btnR1 = (b & ORBIS_PAD_BUTTON_R1) != 0;
     out.btnL3 = (b & ORBIS_PAD_BUTTON_L3) != 0;
     out.btnR3 = (b & ORBIS_PAD_BUTTON_R3) != 0;
+    // DS4 → Xbox, per posizione: Options=Menu, Share=View, PS=Guide.
+    // Il clic del touchpad non è View: apre il menu dell'app (btnAppMenu).
+    // Il bit Share (0x1) c'è nel SDK Sony; l'enum OpenOrbis parte da L3.
     constexpr uint32_t kShare = 0x00000001;
     constexpr uint32_t kPlayStation = 0x00010000;
     out.btnOptions = (b & ORBIS_PAD_BUTTON_OPTIONS) != 0;
