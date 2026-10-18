@@ -22,6 +22,6 @@ bool fetchPrices(const std::vector<std::string>& productIds, const std::string& 
                  std::map<std::string, Price>& out, std::string& err);
 
 // "R$ 78,82", "$59.99", "59,99 €"...
-std::string formatPrice(double amount, the std::string& currency);
+std::string formatPrice(double amount, const std::string& currency);
 
 }  // namespace xc::xcloud
