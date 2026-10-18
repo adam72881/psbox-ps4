@@ -39,7 +39,7 @@
  	usrsctp_conninput(this, message->data(), message->size(), 0);
  }
  
-@@ -769,6 +776,13 @@
+@@ -769,6 +776,14 @@
  		std::unique_lock lock(mWriteMutex);
  		PLOG_VERBOSE << "Handle write, len=" << len;
  
@@ -56,7 +56,7 @@
  
 --- a/deps/usrsctp/usrsctplib/usrsctp.h
 +++ b/deps/usrsctp/usrsctplib/usrsctp.h
-@@ -120,8 +120,9 @@
+@@ -120,7 +120,9 @@
   * tune with other sockaddr_* structures.
   */
  #if defined(__APPLE__) || defined(__Bitrig__) || defined(__DragonFly__) || \
