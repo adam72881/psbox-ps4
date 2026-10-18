@@ -34,7 +34,7 @@
     }
 }
 
-void RtcpReporter::incoming(rtc::message_vector& messages, the rtc::message_callback& send) {
+void RtcpReporter::incoming(rtc::message_vector& messages, const rtc::message_callback& send) {
     std::lock_guard<std::mutex> lock(mu_);
     send_ = send;
     uint64_t now = nowUs();
