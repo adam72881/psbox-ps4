@@ -82,7 +82,7 @@ index f28422c..105d399 100644
  #include <iostream>
  #include <random>
  #include <sstream>
-@@ -29,6 +30,8 @@
+@@ -29,6 +30,9 @@
  
  #include <sys/types.h>
  
@@ -111,7 +111,7 @@ index f28422c..105d399 100644
  }
  
  optional<string> IceTransport::getLocalAddress() const {
-@@ -361,6 +367,16 @@ void IceTransport::RecvCallback(juice_agent_t *, const char *data, size_t size,
+@@ -361,6 +367,20 @@ void IceTransport::RecvCallback(juice_agent_t *, const char *data, size_t size,
  	auto iceTransport = static_cast<rtc::impl::IceTransport *>(user_ptr);
  	try {
  		PLOG_VERBOSE << "Incoming size=" << size;
