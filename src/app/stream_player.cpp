@@ -17,6 +17,7 @@
 
 #if defined(XCLOUD_PS4)
 #include "app/ps5_app.h"
+#include "app/screenshot.h"
 #include "app/stream_trace.h"
 #include "audio_orbis.h"
 #include <chrono>
@@ -61,6 +62,7 @@ struct StreamPlayer::Impl {
     // to 20 attempts a second apart while the cloud session is still there.
     std::atomic<bool> reconnecting{false};
     std::atomic<bool> needDecoderReset{false};
+    std::atomic<bool> waitIdr{false};  // dopo Reset: solo Decode su IDR
     std::atomic<bool> titleFocused{true};
     int reconnectAttempts = 0;
     std::atomic<uint32_t> reconnects{0};
@@ -279,12 +281,42 @@ struct StreamPlayer::Impl {
             // Dopo riconnessione o cambio sequenza: Reset esplicito prima
             // della prossima AU (NEW_SEQUENCE 0x811d0300).
             if (needDecoderReset.exchange(false)) {
-                XC_LOGI("video: Reset decoder (nuova sessione/sequenza)");
+                XC_LOGI("video: Reset decoder (nuova sessione/sequenza) — attendo IDR");
                 hw.reset();
+                waitIdr.store(true);
+                keyframeWanted = true;
+                requestKeyframeIfWanted();
             }
-            // Chiusura: non entrare in Decode (può restare in syscall mentre
-            // il sistema revoca Videodec2 → CE-34878-0).
+            // Chiusura / menu PS: non entrare in Decode (Videodec2 in syscall
+            // mentre ShellCore revoca → CE-34878-0). Sessione e TWCC restano
+            // vivi: si scartano solo i frame finché non si riprende.
             if (g_appStopping.load()) break;
+            if (g_psMenu.load()) {
+                crash::videoHeartbeat();
+                continue;
+            }
+            // Dopo Reset: niente Decode finché non arriva un IDR (evita 0x811d0303).
+            if (waitIdr.load()) {
+                auto isIdrAu = [](const std::vector<uint8_t>& d) {
+                    for (size_t i = 0; i + 4 < d.size(); ++i) {
+                        if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 0 && d[i + 3] == 1) {
+                            if ((d[i + 4] & 0x1f) == 5) return true;
+                            ++i;
+                        } else if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1) {
+                            if ((d[i + 3] & 0x1f) == 5) return true;
+                        }
+                    }
+                    return false;
+                };
+                if (!isIdrAu(frame.data)) {
+                    keyframeWanted = true;
+                    requestKeyframeIfWanted();
+                    crash::videoHeartbeat();
+                    continue;
+                }
+                waitIdr.store(false);
+                XC_LOGI("video: IDR dopo reset, riprendo Decode");
+            }
             media::HwDecoder::Picture hp;
             bool got = false;
             double submittedMs = stream::clockMs();
@@ -391,7 +423,13 @@ struct StreamPlayer::Impl {
                     }
                     if (drawn) {
                         display::present();
-                        if (decodedFrames == 1) XC_LOGI("primo frame Videodec2 presentato %dx%d", w, h);
+                        if (decodedFrames == 1) {
+                            XC_LOGI("primo frame Videodec2 presentato %dx%d", w, h);
+                            if (shot::enabled()) {
+                                shot::request(shot::Kind::FirstStream, true);
+                                shot::afterPresent();
+                            }
+                        }
                     }
                 } else {
                     ++lateFrames;

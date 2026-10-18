@@ -65,6 +65,7 @@ private:
     int twccHead_ = 0;
     int twccCount_ = 0;
     uint8_t twccFbCount_ = 0;
+    bool twccActive_ = false;  // dopo il 1° TWCC: niente REMB (solo RR+TWCC)
 
     rtc::message_callback send_;
     std::mutex mu_;

@@ -13,6 +13,7 @@
 #include <orbis/UserService.h>
 #include <orbis/libkernel.h>
 
+#include <cstdarg>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -29,12 +30,33 @@
 namespace xc::app {
 namespace {
 
+// File I/O solo su /data/... (vista sandbox = /user/data). BGFT (ShellCore)
+// vuole la stringa /user/data/... sullo stesso inode (FPKGi #31). Mai mkdir/
+// open/copy sotto /user — in sandbox errno 2 (01.41).
 constexpr const char* kUpdateDir = "/data/psbox/update";
-constexpr const char* kPkgDir = "/data/pkg";
+constexpr const char* kPkgDirLegacy = "/data/pkg";  // solo scan residui
 constexpr const char* kTitleId = "XCLD00001";
 constexpr const char* kContentId = "IV0000-XCLD00001_00-PSBOXCLOUD000001";
 constexpr const char* kPendingPath = "/data/psbox/update.pending";
-constexpr const char* kManualInstall = "Installa a mano da /data/pkg";
+constexpr const char* kManualInstall = "Installa a mano con Package Installer";
+
+// Solo per contentUrl BGFT: /data/foo → /user/data/foo. Non usarlo per I/O.
+std::string toBgftUrl(const std::string& dataPath) {
+    if (dataPath.rfind("/user/", 0) == 0) return dataPath;
+    if (dataPath.rfind("/data/", 0) == 0) return "/user" + dataPath;
+    return dataPath;
+}
+
+bool ensureDir(const char* path) {
+    // Mai /user/...: in sandbox non esiste.
+    if (path && std::strncmp(path, "/user/", 6) == 0) {
+        XC_LOGW("[UPDATE] mkdir %s saltato (solo /data per I/O)", path);
+        return false;
+    }
+    if (mkdir(path, 0755) == 0 || errno == EEXIST) return true;
+    XC_LOGW("[UPDATE] mkdir %s errno %d", path, errno);
+    return false;
+}
 // 0x80990001 è il «già inizializzato» classico. 0x80990050 è la sessione
 // assente (o l'init rifiutato) visto sulla 01.19: dopo i parametri giusti
 // si prosegue comunque con RegisterTask, non si abbandona il pkg.
@@ -50,16 +72,40 @@ constexpr uint32_t kBgftBusy = 0x80990086u;
 // Stamp + fsync prima di una chiamata che può uccidere il processo.
 void stampEnter(const char* what) {
     char line[160];
-    std::snprintf(line, sizeof line, "update: %s enter", what ? what : "?");
+    std::snprintf(line, sizeof line, "[UPDATE] %s enter", what ? what : "?");
     xc_log_stamp(line);
     XC_LOGI("%s", line);
 }
 
 void stampLeave(const char* what, int rc) {
     char line[160];
-    std::snprintf(line, sizeof line, "update: %s leave 0x%08x", what ? what : "?", static_cast<unsigned>(rc));
+    std::snprintf(line, sizeof line, "[UPDATE] %s leave 0x%08x", what ? what : "?", static_cast<unsigned>(rc));
     xc_log_stamp(line);
     XC_LOGI("%s", line);
+}
+
+void updLog(const char* fmt, ...) {
+    char body[240];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(body, sizeof body, fmt, ap);
+    va_end(ap);
+    char line[280];
+    std::snprintf(line, sizeof line, "[UPDATE] %s", body);
+    xc_log_stamp(line);
+    XC_LOGI("%s", line);
+}
+
+void updWarn(const char* fmt, ...) {
+    char body[240];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(body, sizeof body, fmt, ap);
+    va_end(ap);
+    char line[280];
+    std::snprintf(line, sizeof line, "[UPDATE] %s", body);
+    xc_log_stamp(line);
+    XC_LOGW("%s", line);
 }
 
 bool readAll(const std::string& path, std::string& out) {
@@ -121,7 +167,9 @@ std::string appVerFromPkg(const std::string& bytes) {
             size_t ks = keys + krel;
             if (ks + 8 >= n) continue;
             if (std::strcmp(reinterpret_cast<const char*>(p + ks), "APP_VER") != 0) continue;
-            if ((fmt & 0x0400) == 0) continue;  // non è una stringa
+            // UTF-8: 0x0004 o 0x0204 (PkgTool). 0x0404 = int32.
+            // Bug 01.38: (fmt & 0x0400)==0 scartava 0x0204 → sfo sempre ''.
+            if (fmt != 0x0004 && fmt != 0x0204) continue;
             size_t ds = data + doff;
             if (ds >= n || len == 0 || ds + len > n) continue;
             std::string s(reinterpret_cast<const char*>(p + ds), strnlen(reinterpret_cast<const char*>(p + ds), len));
@@ -189,6 +237,35 @@ Measured measurePkg(const std::string& path) {
     if (lseek(fd, 0, SEEK_SET) == 0 && read(fd, m.mag, 4) == 4) m.magic = pkgMagicOk(m.mag);
     close(fd);
     return m;
+}
+
+// FTP ancora in corso: la size deve restare stabile per ~300 ms.
+bool waitStableSize(const std::string& path, Measured& out) {
+    long long prev = -1;
+    int stable = 0;
+    for (int i = 0; i < 40; ++i) {
+        Measured m = measurePkg(path);
+        if (!m.exists) {
+            updWarn("pkg sparito durante l'attesa: %s", path.c_str());
+            return false;
+        }
+        if (m.lseekBytes > 0 && m.lseekBytes == prev) {
+            if (++stable >= 3) {
+                out = m;
+                updLog("size stabile %lld dopo %d check", m.lseekBytes, i + 1);
+                return true;
+            }
+        } else {
+            stable = 0;
+            if (i == 0 || m.lseekBytes != prev)
+                updLog("size in movimento %lld → %lld (FTP?)", prev, m.lseekBytes);
+            prev = m.lseekBytes;
+        }
+        platform::sleepMs(100);
+    }
+    out = measurePkg(path);
+    updWarn("size non stabilizzata (ultimo %lld) — uso comunque", out.lseekBytes);
+    return out.exists && out.lseekBytes >= 1024;
 }
 
 std::vector<std::string> listPkgs(const std::string& dir) {
@@ -548,13 +625,63 @@ int callBgftInit(BgftInit fn, const char* name, void* params) {
     return rc;
 }
 
-// BGFT lavora in ShellCore: dopo StartTask il sistema continua anche se
-// questa app esce. Per sovrascrivere il titolo già installato si usa
-// FORCE_UPDATE; non si chiama mai UnInstall né PrepareOverwritePkg.
-// Ritorna true se il task è partito (o era già in corso): il chiamante
-// chiude e riapre mentre ShellCore finisce.
-bool installWithBgft(const char* path, uint32_t size) {
+// Attende fine/errore del task BGFT. Non uscire prima: 01.39 usciva subito
+// e ShellCore lasciava il titolo «danneggiata».
+bool waitBgftTask(BgftProgFn prog, int32_t task) {
+    if (!prog || task < 0) {
+        updWarn("BGFT progress assente — non posso verificare la fine");
+        return false;
+    }
+    constexpr int kMaxTicks = 600;  // 600 × 500 ms ≈ 5 min
+    for (int i = 0; i < kMaxTicks; ++i) {
+        BgftProgEx p{};
+        stampEnter("DownloadGetProgress");
+        int pr = prog(task, &p);
+        stampLeave("DownloadGetProgress", pr);
+        updLog("bgft task %d %lu/%lu tot %lu/%lu prep %d copy %d err 0x%08x rc 0x%08x", task, p.transferred,
+               p.length, p.transferredTotal, p.lengthTotal, p.preparingPercent, p.localCopyPercent,
+               static_cast<unsigned>(p.errorResult), static_cast<unsigned>(pr));
+        if (p.errorResult != 0) {
+            updWarn("bgft errore task 0x%08x", static_cast<unsigned>(p.errorResult));
+            return false;
+        }
+        if (bgftProgressDone(p)) {
+            updLog("bgft task %d completo", task);
+            return true;
+        }
+        platform::sleepMs(500);
+    }
+    updWarn("bgft timeout dopo ~5 min (task %d)", task);
+    return false;
+}
+
+// Ordine Itemzflow/flatz: AppInstUtilInitialize PRIMA di BGFT init/register.
+// `dataPath` = path sandbox (/data/...). contentUrl prova /user+dataPath, poi
+// fallback /data/... (log di entrambi i rc). Mai UnInstall.
+bool installWithBgft(const char* dataPath, uint32_t size) {
+    std::string ioPath = dataPath ? dataPath : "";
+    if (ioPath.rfind("/data/", 0) != 0) {
+        updWarn("BGFT I/O path non-/data: %s", ioPath.c_str());
+        return false;
+    }
+    std::string urlUser = toBgftUrl(ioPath);
+    static char urlBuf[512];
+    std::snprintf(urlBuf, sizeof urlBuf, "%s", urlUser.c_str());
+    updLog("BGFT contentUrl %s (file I/O %s) size %u", urlBuf, ioPath.c_str(), size);
+
     tryRaiseCreds();
+    {
+        const char* ap[] = {"/system/common/lib/libSceAppInstUtil.sprx", "/system/priv/lib/libSceAppInstUtil.sprx"};
+        int32_t ah = loadModule("AppInst", ap, 2, ORBIS_SYSMODULE_INTERNAL_APP_INST_UTIL, "sceAppInstUtilInitialize");
+        AppInit init = nullptr;
+        if (resolveSym(ah, "sceAppInstUtilInitialize", &init) && init) {
+            stampEnter("sceAppInstUtilInitialize(pre-BGFT)");
+            int irc = init();
+            stampLeave("sceAppInstUtilInitialize(pre-BGFT)", irc);
+        } else {
+            updWarn("AppInst init pre-BGFT non disponibile — provo comunque BGFT");
+        }
+    }
     const char* paths[] = {"/system/priv/lib/libSceBgft.sprx", "/system/common/lib/libSceBgft.sprx"};
     int32_t handle = loadModule("BGFT", paths, 2, ORBIS_SYSMODULE_INTERNAL_BGFT, "sceBgftServiceIntInit");
     BgftInit initPub = nullptr;
@@ -566,22 +693,20 @@ bool installWithBgft(const char* path, uint32_t size) {
     resolveSym(handle, "sceBgftServiceInit", &initPub);
     resolveSym(handle, "sceBgftServiceIntInit", &initInt);
     if (!resolveSym(handle, "sceBgftServiceIntDownloadRegisterTaskByStorageEx", &reg) || (!initPub && !initInt)) {
-        XC_LOGW("update: BGFT simboli assenti");
+        updWarn("BGFT simboli assenti");
         return false;
     }
     resolveSym(handle, "sceBgftServiceDownloadStartTask", &start);
     resolveSym(handle, "sceBgftServiceIntDownloadStartTask", &startInt);
     resolveSym(handle, "sceBgftServiceDownloadGetProgress", &prog);
     if (!start && !startInt) {
-        XC_LOGW("update: BGFT StartTask assente");
+        updWarn("BGFT StartTask assente");
         return false;
     }
-    // Il servizio tiene l'heap per tutta la vita del processo: non si libera
-    // dopo l'init, altrimenti BGFT scrive in memoria già rilasciata.
     static void* heap = nullptr;
     if (!heap) heap = std::calloc(1, 1 << 20);
     if (!heap) {
-        XC_LOGW("update: bgft heap assente");
+        updWarn("bgft heap assente");
         return false;
     }
     BgftInitEx ip{};
@@ -605,61 +730,74 @@ bool installWithBgft(const char* path, uint32_t size) {
         }
         rc = rc2;
     }
-    if (!bgftReady(rc)) return false;
+    if (!bgftReady(rc)) {
+        updWarn("BGFT init non pronto rc 0x%08x", static_cast<unsigned>(rc));
+        return false;
+    }
     if (static_cast<uint32_t>(rc) == kBgftNoSession || static_cast<uint32_t>(rc) == kBgftAlreadyInit)
-        XC_LOGI("update: bgft già inizializzato, registro il task");
+        updLog("bgft già inizializzato, registro il task");
     int32_t user = currentUserId();
     if (user <= 0) return false;
-    auto fill = [&](BgftParamEx& ex, int32_t uid, uint32_t bytes, int32_t opt) {
+    // Niente DELETE_AFTER_UPLOAD: cancelliamo noi su /data solo dopo wait OK.
+    const int32_t kOpt = ORBIS_BGFT_TASK_OPT_DISABLE_CDN_QUERY_PARAM | ORBIS_BGFT_TASK_OPT_FORCE_UPDATE;
+
+    auto fill = [&](BgftParamEx& ex, const char* url) {
         ex = {};
-        ex.param.userId = uid;
+        ex.param.userId = user;
         ex.param.entitlementType = 5;
         ex.param.id = "";
-        ex.param.contentUrl = path;
+        ex.param.contentUrl = url;
         ex.param.contentExUrl = "";
         ex.param.contentName = "PSBox";
         ex.param.iconPath = "";
         ex.param.skuId = "";
-        ex.param.option = opt;
+        ex.param.option = kOpt;
         ex.param.playgoScenarioId = "0";
         ex.param.releaseDate = "";
         ex.param.packageType = "";
         ex.param.packageSubType = "";
-        ex.param.packageSize = bytes;
+        ex.param.packageSize = size;
         ex.slot = 0;
     };
-    // Self-update: FORCE_UPDATE subito. Itemzflow chiede conferma e fa
-    // UnInstall: qui non si disinstalla mai la versione corrente.
-    const int32_t kForce = ORBIS_BGFT_TASK_OPT_DISABLE_CDN_QUERY_PARAM | ORBIS_BGFT_TASK_OPT_FORCE_UPDATE;
+
+    auto registerOnce = [&](const char* url, int32_t* taskOut) -> int {
+        BgftParamEx ex{};
+        fill(ex, url);
+        stampEnter("DownloadRegisterTaskByStorageEx");
+        updLog("BGFT register size %u user %d opt 0x%x path %s", size, user, kOpt, url);
+        int rr = reg(&ex, taskOut);
+        stampLeave("DownloadRegisterTaskByStorageEx", rr);
+        updLog("BGFT task %d rc 0x%08x path %s", *taskOut, static_cast<unsigned>(rr), url);
+        return rr;
+    };
+
     int32_t task = -1;
-    BgftParamEx ex{};
-    fill(ex, user, size, kForce);
-    stampEnter("DownloadRegisterTaskByStorageEx");
-    XC_LOGI("update: BGFT register size %u user %d opt 0x%x FORCE_UPDATE", size, user, kForce);
-    int rr = reg(&ex, &task);
-    stampLeave("DownloadRegisterTaskByStorageEx", rr);
-    XC_LOGI("update: BGFT task %d", task);
+    int rr = registerOnce(urlBuf, &task);
     uint32_t urr = static_cast<uint32_t>(rr);
-    if (urr == kBgftBusy) {
-        XC_LOGI("update: BGFT task già in corso, lascio lavorare ShellCore");
-        return true;
+    // Se /user/data viene rifiutato, riprova con /data/... e logga entrambi.
+    if (rr != 0 && urr != kBgftBusy && urr != kBgftAlreadyInstalled && urr != kBgftExists) {
+        static char urlData[512];
+        std::snprintf(urlData, sizeof urlData, "%s", ioPath.c_str());
+        int32_t task2 = -1;
+        int rr2 = registerOnce(urlData, &task2);
+        updWarn("BGFT register /user rc 0x%08x, fallback /data rc 0x%08x", urr, static_cast<unsigned>(rr2));
+        rr = rr2;
+        urr = static_cast<uint32_t>(rr2);
+        task = task2;
+        std::snprintf(urlBuf, sizeof urlBuf, "%s", urlData);
     }
-    if (urr == kBgftInvalidArg) {
-        XC_LOGW("update: BGFT argomento rifiutato (user %d)", user);
+
+    if (urr == kBgftAlreadyInstalled || urr == kBgftExists) {
+        updWarn("BGFT 0x%08x già installato/patch — niente UnInstall, usa Package Installer", urr);
         return false;
     }
-    if ((urr == kBgftAlreadyInstalled || urr == kBgftExists) && task < 0) {
-        // Riprova con le stesse opzioni (già FORCE): a volte il primo giro
-        // rifiuta e il secondo accetta dopo che ShellCore ha visto il pkg.
-        task = -1;
-        stampEnter("DownloadRegisterTaskByStorageEx retry");
-        rr = reg(&ex, &task);
-        stampLeave("DownloadRegisterTaskByStorageEx retry", rr);
-        XC_LOGI("update: BGFT task %d", task);
-        urr = static_cast<uint32_t>(rr);
-        if (urr == kBgftBusy) return true;
+    if (urr == kBgftBusy) {
+        updLog("BGFT task già in corso — attendo progresso");
+        if (task < 0) return false;
+    } else if (rr != 0 || task < 0) {
+        updWarn("BGFT register fallito rc 0x%08x task %d", urr, task);
+        return false;
     }
-    if (rr != 0 || task < 0) return false;
     int st = -1;
     if (start) {
         stampEnter("sceBgftServiceDownloadStartTask");
@@ -671,233 +809,194 @@ bool installWithBgft(const char* path, uint32_t size) {
         st = startInt(task);
         stampLeave("sceBgftServiceIntDownloadStartTask", st);
     }
-    if (st != 0) {
-        XC_LOGW("update: BGFT StartTask 0x%08x", static_cast<unsigned>(st));
+    if (st != 0 && urr != kBgftBusy) {
+        updWarn("BGFT StartTask 0x%08x", static_cast<unsigned>(st));
         return false;
     }
-    // Breve controllo che il task si muova; poi si esce: restare in attesa
-    // mentre ShellCore sovrascrive questa app rischia di uccidere il processo
-    // a metà, e il progresso continua comunque fuori da qui.
-    if (prog) {
-        for (int i = 0; i < 8; ++i) {
-            BgftProgEx p{};
-            int pr = prog(task, &p);
-            XC_LOGI("update: bgft %lu/%lu prep %d err 0x%08x (rc 0x%08x)", p.transferred, p.length, p.preparingPercent,
-                    static_cast<unsigned>(p.errorResult), static_cast<unsigned>(pr));
-            if (p.errorResult != 0) {
-                XC_LOGW("update: bgft errore subito 0x%08x", static_cast<unsigned>(p.errorResult));
-                return false;
-            }
-            if (bgftProgressDone(p)) {
-                XC_LOGI("update: bgft già completo in processo");
-                return true;
-            }
-            platform::sleepMs(500);
-        }
-    }
-    XC_LOGI("update: bgft avviato, ShellCore continua dopo l'uscita");
-    return true;
+    stampEnter("waitBgftTask");
+    bool done = waitBgftTask(prog, task);
+    stampLeave("waitBgftTask", done ? 0 : -1);
+    return done;
 }
 
 using LoadExecFn = int32_t (*)(const char*, const char**);
-using LncInit = int32_t (*)();
-using LncLaunch = int32_t (*)(const char*, const char**, LncAppParam*);
 
-bool relaunch() {
-    XC_LOGI("update: relaunch enter");
+// Dopo install completo: LoadExec("exit"). Niente relaunch del titolo in corso
+// (non provato in open-source). L'utente riapre da home.
+bool exitAfterUpdate() {
+    updLog("LoadExec exit dopo install completo");
     const char* sysPaths[] = {"/system/priv/lib/libSceSystemService.sprx", "/system/common/lib/libSceSystemService.sprx"};
     int32_t sys = loadModule("SystemService", sysPaths, 2, 0x80000010, "sceSystemServiceLoadExec");
     LoadExecFn loadExec = nullptr;
-    const char* argv[] = {nullptr};
-    if (resolveSym(sys, "sceSystemServiceLoadExec", &loadExec)) {
-        XC_LOGI("update: sceSystemServiceLoadExec enter");
-        int rc = loadExec("/app0/eboot.bin", argv);
-        XC_LOGI("update: sceSystemServiceLoadExec leave 0x%08x", static_cast<unsigned>(rc));
-    } else {
-        XC_LOGW("update: sceSystemServiceLoadExec assente");
-    }
-    const char* lncPaths[] = {"/system/priv/lib/libSceLncUtil.sprx", "/system/common/lib/libSceLncUtil.sprx"};
-    int32_t lnc = loadModule("Lnc", lncPaths, 2, 0, "sceLncUtilLaunchApp");
-    LncInit init = nullptr;
-    LncLaunch launch = nullptr;
-    if (!resolveSym(lnc, "sceLncUtilInitialize", &init) || !resolveSym(lnc, "sceLncUtilLaunchApp", &launch)) {
-        XC_LOGW("update: Lnc simboli assenti");
+    if (!resolveSym(sys, "sceSystemServiceLoadExec", &loadExec) || !loadExec) {
+        updWarn("sceSystemServiceLoadExec assente");
         return false;
     }
-    XC_LOGI("update: sceLncUtilInitialize enter");
-    int ir = init();
-    XC_LOGI("update: sceLncUtilInitialize leave 0x%08x", static_cast<unsigned>(ir));
-    int32_t user = 0;
-    sceUserServiceGetInitialUser(&user);
-    LncAppParam param{};
-    param.size = sizeof param;
-    param.user_id = static_cast<uint32_t>(user);
-    param.LaunchAppCheck_flag = LaunchApp_SkipSystemUpdate;
-    const char* largv[] = {nullptr};
-    XC_LOGI("update: sceLncUtilLaunchApp enter");
-    int lrc = launch(kTitleId, largv, &param);
-    XC_LOGI("update: sceLncUtilLaunchApp leave 0x%08x", static_cast<unsigned>(lrc));
-    return lrc == 0;
+    stampEnter("sceSystemServiceLoadExec(exit)");
+    int rc = loadExec("exit", nullptr);
+    stampLeave("sceSystemServiceLoadExec(exit)", rc);
+    return false;  // se torna, fallito
+}
+
+// Sceglie il pkg più nuovo tra le cartelle di scan (nessuna modifica file).
+bool pickNewerPkg(const std::string& current, std::string& outPath, std::string& outVer, std::string& outName,
+                  long long& outBytes, bool& hardReject) {
+    hardReject = false;
+    outPath.clear();
+    outVer.clear();
+    outName.clear();
+    outBytes = 0;
+    ensureDir("/data/psbox");
+    ensureDir(kUpdateDir);
+    const char* dirs[] = {kUpdateDir, kPkgDirLegacy};
+    PkgVer cur = parsePkgVer(current);
+    PkgVer best{};
+    for (const char* dir : dirs) {
+        for (const auto& name : listPkgs(dir)) {
+            std::string path = std::string(dir) + "/" + name;
+            Measured m{};
+            if (!waitStableSize(path, m)) {
+                hardReject = true;
+                updWarn("scarto %s: upload incompleto / assente", name.c_str());
+                continue;
+            }
+            updLog("misura %s lseek %lld magic %02x%02x%02x%02x", name.c_str(), m.lseekBytes, m.mag[0], m.mag[1],
+                   m.mag[2], m.mag[3]);
+            if (m.lseekBytes < 1024 || m.lseekBytes > 32ll * 1024 * 1024 || !m.magic) {
+                hardReject = true;
+                updWarn("scarto %s: size/magic non validi", name.c_str());
+                continue;
+            }
+            std::string bytes, fromSfo;
+            if (readAll(path, bytes)) fromSfo = appVerFromPkg(bytes);
+            PkgVer vs = parsePkgVer(fromSfo);
+            PkgVer vf = parsePkgVer(name);
+            PkgVer use = vs.ok ? vs : vf;
+            updLog("%s sfo '%s' (%s) nome %s", name.c_str(), fromSfo.c_str(), vs.ok ? pkgVerText(vs).c_str() : "-",
+                   vf.ok ? pkgVerText(vf).c_str() : "-");
+            if (!use.ok) {
+                hardReject = true;
+                updWarn("scarto %s: versione illeggibile", name.c_str());
+                continue;
+            }
+            if (cur.ok && cmpPkgVer(use, cur) <= 0) {
+                updLog("scarto %s: %s non più nuova di %s", name.c_str(), pkgVerText(use).c_str(),
+                       pkgVerText(cur).c_str());
+                continue;
+            }
+            if (outPath.empty() || cmpPkgVer(use, best) > 0) {
+                best = use;
+                outName = name;
+                outVer = vs.ok ? fromSfo : pkgVerText(vf);
+                outPath = path;
+                outBytes = m.lseekBytes;
+            }
+        }
+    }
+    return !outPath.empty();
 }
 
 }  // namespace
 
-LocalUpdateResult applyLocalUpdate(const std::string& current) {
+LocalUpdateResult findLocalUpdate(const std::string& current) {
     LocalUpdateResult r;
-    XC_LOGI("update: controllo %s (questa è %s)", kUpdateDir, current.c_str());
+    updLog("scan (no install) %s (questa è %s)", kUpdateDir, current.c_str());
     {
-        // Un aggiornamento precedente ha lasciato il marker: se siamo già
-        // alla versione richiesta, il BGFT ha finito. Il pkg in /data/pkg resta
-        // finché non è più nuova della build corrente.
         std::string pending = readPending();
         if (!pending.empty()) {
             PkgVer pend = parsePkgVer(pending);
             PkgVer cur = parsePkgVer(current);
-            XC_LOGI("update: pending '%s' corrente %s", pending.c_str(), current.c_str());
+            updLog("pending '%s' corrente %s", pending.c_str(), current.c_str());
             if (pend.ok && cur.ok && cmpPkgVer(cur, pend) >= 0) {
                 clearPending();
-                XC_LOGI("update: installazione già applicata");
+                updLog("installazione già applicata");
             }
         }
     }
-    auto names = listPkgs(kUpdateDir);
-    std::string srcDir = kUpdateDir;
-    if (names.empty()) {
-        // Dopo un tentativo interrotto il pkg può essere già in /data/pkg
-        // (la 01.23 c'è rimasta mentre l'icona spariva).
-        names = listPkgs(kPkgDir);
-        srcDir = kPkgDir;
-        if (!names.empty()) XC_LOGI("update: uso i pkg già in %s", kPkgDir);
-    }
-    if (names.empty()) {
-        XC_LOGI("update: nessun PSBox-PS4-*.pkg");
-        return r;
-    }
-    PkgVer cur = parsePkgVer(current);
-    std::string bestName;
-    PkgVer best{};
-    std::string bestLabel;
-    long long bestBytes = 0;
+    std::string path, ver, name;
+    long long bytes = 0;
     bool hardReject = false;
-    for (const auto& name : names) {
-        std::string path = srcDir + "/" + name;
-        Measured m = measurePkg(path);
-        XC_LOGI("update: misura %s lseek %lld stat48 %lld magic %02x%02x%02x%02x", name.c_str(), m.lseekBytes, m.stat48,
-                m.mag[0], m.mag[1], m.mag[2], m.mag[3]);
-        std::string bytes;
-        std::string fromSfo;
-        if (m.magic && m.lseekBytes >= 1024 && m.lseekBytes <= 32ll * 1024 * 1024 && readAll(path, bytes))
-            fromSfo = appVerFromPkg(bytes);
-        PkgVer vs = parsePkgVer(fromSfo);
-        PkgVer vf = parsePkgVer(name);
-        PkgVer use = vs.ok ? vs : vf;
-        XC_LOGI("update: %s sfo '%s' (%s) nome %s", name.c_str(), fromSfo.c_str(), vs.ok ? pkgVerText(vs).c_str() : "-",
-                vf.ok ? pkgVerText(vf).c_str() : "-");
-        if (m.lseekBytes < 1024) {
-            hardReject = true;
-            XC_LOGI("update: scarto %s motivo dimensione %lld", name.c_str(), m.lseekBytes);
-            continue;
-        }
-        if (!m.magic) {
-            hardReject = true;
-            XC_LOGI("update: scarto %s motivo magic", name.c_str());
-            continue;
-        }
-        if (!use.ok) {
-            hardReject = true;
-            XC_LOGI("update: scarto %s motivo versione illeggibile (sfo '%s' nome '%s')", name.c_str(), fromSfo.c_str(),
-                    name.c_str());
-            continue;
-        }
-        if (cur.ok && cmpPkgVer(use, cur) <= 0) {
-            XC_LOGI("update: scarto %s motivo %s non è più nuova di %s", name.c_str(), pkgVerText(use).c_str(),
-                    pkgVerText(cur).c_str());
-            continue;
-        }
-        if (bestName.empty() || cmpPkgVer(use, best) > 0) {
-            best = use;
-            bestName = name;
-            bestLabel = vs.ok ? fromSfo : pkgVerText(vf);
-            bestBytes = m.lseekBytes;
-        }
-    }
-    if (bestName.empty()) {
+    if (!pickNewerPkg(current, path, ver, name, bytes, hardReject)) {
         if (hardReject) {
             r.status = LocalUpdateStatus::Failed;
             r.detail = "pkg scartato";
         }
-        XC_LOGI("update: nessun pkg più nuovo");
+        updLog("nessun pkg più nuovo → Nessun aggiornamento");
         return r;
     }
-    r.version = bestLabel;
-    XC_LOGI("update: scelto %s versione %s dimensione %lld magic 7f434e54", bestName.c_str(), pkgVerText(best).c_str(),
-            bestBytes);
-    if (mkdir(kPkgDir, 0755) != 0 && errno != EEXIST) XC_LOGW("update: mkdir %s (%d)", kPkgDir, errno);
-    std::string src = srcDir + "/" + bestName;
-    std::string dst = std::string(kPkgDir) + "/" + bestName;
-    if (src != dst) {
-        if (rename(src.c_str(), dst.c_str()) != 0) {
-            XC_LOGI("update: rename non riuscita (%d), copio", errno);
-            if (!copyFile(src, dst)) {
-                r.status = LocalUpdateStatus::Failed;
-                r.detail = "copia fallita";
-                XC_LOGW("update: copia in %s fallita", dst.c_str());
-                return r;
-            }
-            if (unlink(src.c_str()) != 0) XC_LOGW("update: originale non rimosso (%d)", errno);
-            XC_LOGI("update: copiato in %s", dst.c_str());
-        } else {
-            XC_LOGI("update: spostato in %s", dst.c_str());
-        }
-    } else {
-        XC_LOGI("update: pkg già in %s", dst.c_str());
-    }
-    unlinkOthers(kPkgDir, bestName);
-    Measured placed = measurePkg(dst);
-    XC_LOGI("update: pkg %s, lseek %lld stat48 %lld", dst.c_str(), placed.lseekBytes, placed.stat48);
-    if (placed.lseekBytes < 1024 || !placed.magic) {
+    r.status = LocalUpdateStatus::Available;
+    r.version = ver;
+    r.path = path;
+    r.detail = name;
+    updLog("disponibile %s versione %s size %lld path %s — attendo scelta utente", name.c_str(), ver.c_str(), bytes,
+           path.c_str());
+    return r;
+}
+
+LocalUpdateResult installLocalUpdate(const std::string& current) {
+    LocalUpdateResult r;
+    updLog("install richiesto (Sì) corrente %s", current.c_str());
+    std::string src, ver, name;
+    long long bytes = 0;
+    bool hardReject = false;
+    if (!pickNewerPkg(current, src, ver, name, bytes, hardReject)) {
         r.status = LocalUpdateStatus::Failed;
-        r.detail = "pkg a destinazione non valido";
-        XC_LOGI("update: scarto %s motivo dopo lo spostamento lseek %lld magic %d", bestName.c_str(), placed.lseekBytes,
-                placed.magic ? 1 : 0);
+        r.detail = hardReject ? "pkg scartato" : "nessun pkg";
+        updWarn("install: nessun pkg più nuovo");
         return r;
     }
-    // Prima BGFT (ShellCore, sopravvive alla chiusura), poi AppInstallPkg
-    // senza PrepareOverwrite. Mai disinstallare la build corrente.
+    r.version = ver;
+    r.path = src;
+    updLog("install %s versione %s da %s (niente copia, BGFT url %s)", name.c_str(), ver.c_str(), src.c_str(),
+           toBgftUrl(src).c_str());
+
+    // Pkg resta dove è (/data/...). Solo stringa /user/data/... a BGFT.
+    Measured placed{};
+    if (!waitStableSize(src, placed) || placed.lseekBytes < 1024 || !placed.magic) {
+        r.status = LocalUpdateStatus::Failed;
+        r.detail = "pkg non valido";
+        updWarn("pkg invalido %s", src.c_str());
+        return r;
+    }
     uint32_t pkgSize = placed.lseekBytes > 0xffffffffll ? 0xffffffffu : static_cast<uint32_t>(placed.lseekBytes);
-    writePending(pkgVerText(best));
+    writePending(ver);
+
     stampEnter("install BGFT");
-    bool ok = installWithBgft(dst.c_str(), pkgSize);
+    bool ok = installWithBgft(src.c_str(), pkgSize);
     stampLeave("install BGFT", ok ? 0 : -1);
     if (!ok) {
-        XC_LOGW("update: BGFT non è bastato, provo AppInstallPkg senza overwrite");
+        updWarn("BGFT fallito, provo AppInstallPkg su %s (niente UnInstall)", src.c_str());
         stampEnter("install AppInst");
-        ok = installWithAppInst(dst.c_str());
+        ok = installWithAppInst(src.c_str());
         stampLeave("install AppInst", ok ? 0 : -1);
     }
     if (!ok) {
         clearPending();
         r.status = LocalUpdateStatus::Failed;
         r.detail = kManualInstall;
-        XC_LOGW("update: %s (%s)", kManualInstall, dst.c_str());
-        platform::notify(kManualInstall, std::string("update: ") + kManualInstall);
+        updWarn("%s (%s)", kManualInstall, src.c_str());
+        platform::notify(kManualInstall, std::string("[UPDATE] ") + kManualInstall);
         return r;
     }
-    // Non svuotare /data/pkg: se l'app muore a metà, il pkg resta per un
-    // nuovo tentativo o per l'installazione a mano. Solo la cartella update.
+
+    // Solo dopo BGFT/AppInst OK: unlink su path /data.
+    if (unlink(src.c_str()) == 0) updLog("rimosso pkg %s", src.c_str());
+    else updWarn("pkg non rimosso %s (%d)", src.c_str(), errno);
     clearUpdateDir();
-    XC_LOGI("update: task avviato per %s, chiudo e riapro", pkgVerText(best).c_str());
-    platform::notify("Installazione in corso", "update: ShellCore installa, riapertura");
+    unlinkOthers(kPkgDirLegacy, "");
+
+    updLog("install completa %s — LoadExec exit", ver.c_str());
+    platform::notify("Aggiornamento in corso, riapri PSBox tra poco", "[UPDATE] install ok");
     platform::sleepMs(800);
-    stampEnter("relaunch");
-    relaunch();
-    stampLeave("relaunch", -1);
     r.status = LocalUpdateStatus::Installed;
-    r.detail = "riavvio non partito";
-    XC_LOGW("update: riavvio non partito, _exit per lasciare lavorare ShellCore");
-    xc_log_stamp("update: _exit dopo install");
+    stampEnter("exitAfterUpdate");
+    (void)exitAfterUpdate();
+    stampLeave("exitAfterUpdate", -1);
+    updWarn("LoadExec exit non ha preso — _exit");
+    xc_log_stamp("[UPDATE] _exit dopo install");
     _exit(0);
     return r;
 }
 
 }  // namespace xc::app
+

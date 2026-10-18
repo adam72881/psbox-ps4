@@ -53,6 +53,8 @@ int g_index = 0;
 int g_bufCount = kBuffers;
 uint64_t g_presentId = 0;
 int64_t g_shownArg = -1;
+// Indice del buffer passato a SubmitFlip (frame compositato sullo scanout).
+int g_lastFlipped = -1;
 Scan g_scan = Scan::Ui;
 bool g_bound = false;
 // Su 11.52 RegisterBuffers YCbCr420 torna 0x80290003 (niente kpayload).
@@ -765,8 +767,9 @@ void present() {
     flushScanout();
     if (g_video < 0 || xc::app::g_appStopping.load(std::memory_order_relaxed)) return;
     ++g_presentId;
+    const int flipIdx = g_index;
     auto flip = [&](int mode) {
-        return sceVideoOutSubmitFlip(g_video, g_index, static_cast<uint32_t>(mode), static_cast<int64_t>(g_presentId));
+        return sceVideoOutSubmitFlip(g_video, flipIdx, static_cast<uint32_t>(mode), static_cast<int64_t>(g_presentId));
     };
     int rc = -1;
     if (!g_flipProbed) {
@@ -797,6 +800,8 @@ void present() {
             return;
         }
     }
+    g_lastFlipped = flipIdx;
+    g_shownArg = static_cast<int64_t>(g_presentId);
     g_index = (g_index + 1) % g_bufCount;
 }
 
@@ -883,19 +888,39 @@ bool lastShown(uint64_t& id, uint64_t& atUs) {
 }
 
 bool readBackRgb(std::vector<uint8_t>& rgb, int& width, int& height) {
-    if (!g_fb[0]) return false;
-    int shown = (g_index + kBuffers - 1) % kBuffers;
-    auto* src = reinterpret_cast<uint32_t*>(g_fb[shown]);
-    width = static_cast<int>(kWidth);
-    height = static_cast<int>(kHeight);
-    rgb.resize(static_cast<size_t>(width) * height * 3);
-    for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i) {
-        uint32_t p = src[i];
-        rgb[i * 3] = static_cast<uint8_t>(p);
-        rgb[i * 3 + 1] = static_cast<uint8_t>(p >> 8);
-        rgb[i * 3 + 2] = static_cast<uint8_t>(p >> 16);
+    // Solo il buffer passato a SubmitFlip (UI/stream + overlay già compositati).
+    // Non usare g_index (back buffer parziale) né un layer offscreen.
+    if (g_lastFlipped < 0 || g_lastFlipped >= g_bufCount) return false;
+    if (g_scan == Scan::Ui) {
+        if (!g_fb[0]) return false;
+        auto* src = reinterpret_cast<uint32_t*>(g_fb[g_lastFlipped]);
+        width = static_cast<int>(kWidth);
+        height = static_cast<int>(kHeight);
+        rgb.resize(static_cast<size_t>(width) * height * 3);
+        for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i) {
+            uint32_t p = src[i];
+            rgb[i * 3] = static_cast<uint8_t>(p);
+            rgb[i * 3 + 1] = static_cast<uint8_t>(p >> 8);
+            rgb[i * 3 + 2] = static_cast<uint8_t>(p >> 16);
+        }
+        return true;
     }
-    return true;
+    if (g_scan == Scan::Bgra && g_bgraFb[g_lastFlipped]) {
+        // Scanout 1280×720 BGRA (stesso buffer inviato a VideoOut).
+        auto* src = reinterpret_cast<uint32_t*>(g_bgraFb[g_lastFlipped]);
+        width = static_cast<int>(kViewW);
+        height = static_cast<int>(kViewH);
+        rgb.resize(static_cast<size_t>(width) * height * 3);
+        for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i) {
+            uint32_t p = src[i];  // BGRA in memoria
+            rgb[i * 3] = static_cast<uint8_t>(p >> 16);
+            rgb[i * 3 + 1] = static_cast<uint8_t>(p >> 8);
+            rgb[i * 3 + 2] = static_cast<uint8_t>(p);
+        }
+        return true;
+    }
+    // YCbCr420: niente conversione qui (FirstStream su FW YCC resta skip).
+    return false;
 }
 
 namespace gpu {

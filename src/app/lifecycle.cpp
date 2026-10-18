@@ -71,11 +71,14 @@ constexpr uint32_t kSystemServiceModule = 0x80000010;
 
 using TryReceiveMsgFn = int32_t (*)(void* msg, size_t size);
 using ReceiveMsgFn = int32_t (*)(void* msg, size_t size, int32_t* unk);
-using IsAppSuspendedFn = int32_t (*)(int32_t* out);
+// SDK / shadPS4: sceSystemServiceIsAppSuspended(void) — non-zero = sospesa.
+using IsAppSuspendedFn = int32_t (*)();
+using IsShellUiFgFn = int32_t (*)();
 using GetPsButtonFn = int32_t (*)(int32_t* out);
 TryReceiveMsgFn g_tryReceiveMsg = nullptr;
 ReceiveMsgFn g_receiveMsg = nullptr;
 IsAppSuspendedFn g_isAppSuspended = nullptr;
+IsShellUiFgFn g_isShellUiFg = nullptr;
 GetPsButtonFn g_getPsButton = nullptr;
 int g_sysHandle = -1;
 bool g_modsTried = false;
@@ -90,14 +93,16 @@ void postCmd(int cmd) { g_lifeCmd.store(cmd); }
 // Poi _exit(0) PRIMA che il sistema revochi decoder/video/audio — niente dtor.
 void dieNow(const char* why) {
     if (g_dying.exchange(true)) {
-        xc_log_stamp("exit: dieNow re-enter → _exit");
+        xc_log_stamp("[EXIT] dieNow re-enter → _exit");
         _exit(0);
     }
     // Flag subito: i thread video/audio non entrano più in Decode/Output.
     g_appStopping.store(true);
     g_psMenu.store(false);
+    xc_log_stamp("[EXIT] chiusura richiesta dal sistema");
+    XC_LOGI("[EXIT] chiusura richiesta dal sistema (%s)", why ? why : "");
     char line[96];
-    std::snprintf(line, sizeof line, "exit: dieNow (%s)", why ? why : "");
+    std::snprintf(line, sizeof line, "[EXIT] dieNow (%s)", why ? why : "");
     xc_log_stamp(line);
 
     xc_log_stamp("exit: stream requestStop");
@@ -164,12 +169,15 @@ void ensureModules() {
         }
     }
 
+    // AppMessaging è esportato da libSceSystemService (non uno sprx separato).
     void* sym = nullptr;
     if (dlsymAny("sceAppMessagingTryReceiveMsg", &sym) == 0) {
         g_tryReceiveMsg = reinterpret_cast<TryReceiveMsgFn>(sym);
-        xc_log_stamp("exit: AppMessaging Try ok");
+        xc_log_stamp("exit: AppMessaging Try ok (SystemService)");
     } else {
         const char* msgPaths[] = {
+            "/system/common/lib/libSceSystemService.sprx",
+            "/system/priv/lib/libSceSystemService.sprx",
             "/system/common/lib/libSceAppMessaging.sprx",
             "/system/priv/lib/libSceAppMessaging.sprx",
         };
@@ -177,6 +185,7 @@ void ensureModules() {
             int rc = sceKernelLoadStartModule(p, 0, nullptr, 0, nullptr, nullptr);
             if (rc > 0 && sceKernelDlsym(rc, "sceAppMessagingTryReceiveMsg", &sym) == 0 && sym) {
                 g_tryReceiveMsg = reinterpret_cast<TryReceiveMsgFn>(sym);
+                g_sysHandle = rc;
                 xc_log_stamp("exit: AppMessaging Try ok (sprx)");
                 break;
             }
@@ -195,6 +204,11 @@ void ensureModules() {
         xc_log_stamp("exit: IsAppSuspended ok");
     }
     sym = nullptr;
+    if (dlsymAny("sceSystemServiceIsShellUiFgAndGameBgCpuMode", &sym) == 0) {
+        g_isShellUiFg = reinterpret_cast<IsShellUiFgFn>(sym);
+        xc_log_stamp("exit: IsShellUiFgAndGameBgCpuMode ok");
+    }
+    sym = nullptr;
     if (dlsymAny("sceSystemServiceGetPSButtonEvent", &sym) == 0) {
         g_getPsButton = reinterpret_cast<GetPsButtonFn>(sym);
         xc_log_stamp("exit: GetPSButtonEvent ok");
@@ -205,6 +219,8 @@ void ensureModules() {
 }
 
 bool pollAppMessaging() {
+    // Solo diagnostica: un messaggio non significa «Chiudi» (su 11.52
+    // AppMessaging è spesso assente; se presente non chiude l'app).
     std::memset(g_appMsgBuf, 0, sizeof g_appMsgBuf);
     if (g_tryReceiveMsg) {
         int32_t rc = g_tryReceiveMsg(g_appMsgBuf, sizeof g_appMsgBuf);
@@ -212,13 +228,11 @@ bool pollAppMessaging() {
             int32_t kind = 0;
             std::memcpy(&kind, g_appMsgBuf, sizeof kind);
             char line[80];
-            std::snprintf(line, sizeof line, "exit: AppMessaging Try 0x%08x", static_cast<unsigned>(kind));
+            std::snprintf(line, sizeof line, "exit: AppMessaging Try 0x%08x (no close)",
+                          static_cast<unsigned>(kind));
             xc_log_stamp(line);
-            return true;
         }
     }
-    // Alcune chiusure arrivano solo su ReceiveMsg (non Try). Parametro
-    // sconosciuto: si passa nullptr / 0 come fanno gli homebrew.
     if (g_receiveMsg) {
         std::memset(g_appMsgBuf, 0, sizeof g_appMsgBuf);
         int32_t unk = 0;
@@ -227,12 +241,12 @@ bool pollAppMessaging() {
             int32_t kind = 0;
             std::memcpy(&kind, g_appMsgBuf, sizeof kind);
             char line[80];
-            std::snprintf(line, sizeof line, "exit: AppMessaging Recv 0x%08x", static_cast<unsigned>(kind));
+            std::snprintf(line, sizeof line, "exit: AppMessaging Recv 0x%08x (no close)",
+                          static_cast<unsigned>(kind));
             xc_log_stamp(line);
-            return true;
         }
     }
-    return false;
+    return false;  // mai campione appMsg → mai Close
 }
 
 void onResume(const char* why) {
@@ -258,6 +272,22 @@ extern "C" void xc_on_libc_exit(void) {
     _exit(0);
 }
 
+void softReleaseStreamResources(const char* why) {
+    // HB-Store/Itemzflow: in background si rilasciano VO/Audio subito così
+    // «Chiudi applicazione» non resta bloccato su Decode/Output.
+    xc_log_stamp("exit: soft-release stream");
+    XC_LOGI("exit: soft-release stream (%s)", why ? why : "");
+    g_psMenu.store(true);
+    stream::requestStop();
+    media::audioAbortForExit();
+    display::releaseForExit();
+    if (g_playerMutex.try_lock()) {
+        if (g_player) g_player->abortForExit();
+        g_playerMutex.unlock();
+    }
+    g_cancel.store(true);
+}
+
 void applyLifeResult(const LifeResult& step) {
     if (step.logSuspend) {
         xc_log_stamp("exit: sospensione");
@@ -274,6 +304,14 @@ void applyLifeResult(const LifeResult& step) {
         XC_LOGI("exit: chiusura chiesta");
     }
     if (step.stopReceive) XC_LOGE("exit: receive disattivato");
+    if (step.releaseStream) softReleaseStreamResources("bg>300ms");
+    if (step.resumeStream) {
+        XC_LOGI("exit: ripresa dopo soft-release (VideoOut)");
+        media::audioStop();
+        display::resumeAfterRest();
+        g_psMenu.store(false);
+        g_cancel.store(true);  // torna in libreria; nuova partita = nuovo stream
+    }
     if (step.cmd == LifeCmd::Close) {
         g_appStopping.store(true);
         dieNow("sistema");
@@ -296,8 +334,15 @@ void applyLifeResult(const LifeResult& step) {
             xc_log_stamp("exit: pad neutro saltato (mutex busy)");
         }
     } else if (step.cmd == LifeCmd::ResumeMenu) {
-        g_psMenu.store(false);
-        XC_LOGI("exit: ripresa dal menu PS, disegno ripreso");
+        if (!step.resumeStream) {
+            g_psMenu.store(false);
+            XC_LOGI("exit: ripresa dal menu PS, disegno ripreso");
+            // Decode era in pausa: serve un keyframe fresco.
+            if (g_playerMutex.try_lock()) {
+                if (g_player) g_player->requestKeyframe();
+                g_playerMutex.unlock();
+            }
+        }
     } else if (step.cmd == LifeCmd::ResumeRest) {
         g_psMenu.store(false);
         postCmd(1);
@@ -399,15 +444,9 @@ void pumpLifecycle(bool fromMain) {
                 std::snprintf(line, sizeof line, "exit: evento 0x%08x", static_cast<unsigned>(evType));
                 xc_log_stamp(line);
                 XC_LOGI("%s", line);
-                // Chiusura esplicita subito (prima di lifeStep).
-                if (terminateEvent(evType) ||
-                    (st.wasMenu && !resumeEvent(evType) && !shareEvent(evType))) {
-                    // Non chiudere sul solo tasto PS: resume/share già esclusi;
-                    // overlay bit 256 è Pause, non Close.
-                    xc_log_stamp("exit: chiusura da evento");
-                    lock.unlock();
-                    dieNow("evento");
-                }
+                // Nessun evento SystemService chiude l'app (ricerca A1–A4 /
+                // log 01.39). Resume → ripresa; resto solo diagnostica.
+                (void)terminateEvent(evType);
                 continue;
             }
             if (receiveEmpty(er)) {
@@ -428,11 +467,34 @@ void pumpLifecycle(bool fromMain) {
     }
 
     if (g_isAppSuspended) {
-        int32_t sus = 0;
-        if (g_isAppSuspended(&sus) == 0 && sus) {
+        int32_t rc = g_isAppSuspended();
+        // Solo rc > 0 = sospesa. Negativo = SCE error (01.39/01.40: 0x80A10009
+        // al boot → falso Close). Si logga l'errore una sola volta.
+        if (appSuspendedFromRc(rc)) {
             sample.appSus = 1;
-            xc_log_stamp("exit: IsAppSuspended 1");
+            char line[56];
+            std::snprintf(line, sizeof line, "exit: IsAppSuspended rc %d", static_cast<int>(rc));
+            xc_log_stamp(line);
+        } else if (rc < 0) {
+            static bool loggedErr = false;
+            if (!loggedErr) {
+                loggedErr = true;
+                char line[72];
+                std::snprintf(line, sizeof line, "exit: IsAppSuspended err 0x%08x (ignorato)",
+                              static_cast<unsigned>(rc));
+                xc_log_stamp(line);
+                XC_LOGW("%s", line);
+            }
         }
+    }
+
+    // Solo diagnostica: ShellUI in FG è normale nel menu PS (non è Chiudi).
+    if (g_isShellUiFg && (inMenu || st.exitArmed) && (g_pumpCount % 40 == 0)) {
+        int32_t shellFg = g_isShellUiFg();
+        // Negativo = errore SCE: log e basta, mai chiusura.
+        char line[64];
+        std::snprintf(line, sizeof line, "exit: ShellUiFg rc %d", static_cast<int>(shellFg));
+        xc_log_stamp(line);
     }
 
     // Solo diagnostica: il tasto PS non chiude (Pause via overlay).
@@ -448,6 +510,23 @@ void pumpLifecycle(bool fromMain) {
     sample.appMsg = pollAppMessaging();
 
     LifeResult step = lifeStep(st, sample);
+    // bg=1 >300 ms durante lo stream: rilascio VO/Audio/decoder (Chiudi OK).
+    if (sample.background != 0) {
+        if (!st.bgSinceMs) st.bgSinceMs = now;
+        bool streaming = false;
+        if (g_playerMutex.try_lock()) {
+            streaming = g_player && g_player->running();
+            g_playerMutex.unlock();
+        }
+        if (streaming && !st.streamReleased && now - st.bgSinceMs >= 300) {
+            step.releaseStream = true;
+            st.streamReleased = true;
+            XC_LOGI("exit: bg=1 da %llu ms → soft-release stream",
+                    static_cast<unsigned long long>(now - st.bgSinceMs));
+        }
+    } else if (!sample.overlay) {
+        st.bgSinceMs = 0;
+    }
     if (step.stopAll) {
         xc_log_stamp("exit: status dead");
         return;

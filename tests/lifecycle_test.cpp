@@ -2,6 +2,7 @@
 #include "app/lifecycle_decide.h"
 
 #include <cstdio>
+#include <ctime>
 
 static int g_fail;
 
@@ -15,6 +16,8 @@ int main() {
     using xc::app::LifeCmd;
     using xc::app::LifeSample;
     using xc::app::LifeState;
+    using xc::app::appSuspendedFromRc;
+    using xc::app::isCloseSignal;
     using xc::app::lifeStep;
     using xc::app::receiveEmpty;
     using xc::app::terminateEvent;
@@ -25,8 +28,16 @@ int main() {
     expect("coda vuota A10004", receiveEmpty(static_cast<int>(0x80A10004)));
     expect("zero non e vuoto", !receiveEmpty(0));
     expect("receive ko non vuoto", !receiveEmpty(static_cast<int>(0x80B20001)));
-    expect("terminate 0x10000010", terminateEvent(0x10000010));
+    expect("terminate 0x40010000 documentato", terminateEvent(0x40010000));
+    expect("JoinMatch non terminate", !terminateEvent(0x10000010));
     expect("resume non terminate", !terminateEvent(0x10000000));
+
+    // Bug 01.39/01.40: IsAppSuspended → 0x80A10009 (-2136932343) al boot.
+    expect("rc errore non sospeso", !appSuspendedFromRc(static_cast<int32_t>(0x80A10009)));
+    expect("rc -2136932343 non sospeso", !appSuspendedFromRc(-2136932343));
+    expect("rc 0 attivo", !appSuspendedFromRc(0));
+    expect("rc 1 sospeso", appSuspendedFromRc(1));
+    expect("rc positivo sospeso", appSuspendedFromRc(42));
 
     LifeState st;
     LifeSample s;
@@ -39,6 +50,18 @@ int main() {
     s.background = 0;
     r = lifeStep(st, s);
     expect("ritorno dal menu", r.cmd == LifeCmd::ResumeMenu && r.logResume && !st.exitArmed);
+
+    // Soft-release in bg: al ritorno si chiede resumeStream (VideoOut).
+    st = {};
+    s = {};
+    lifeStep(st, s);
+    s.background = 1;
+    r = lifeStep(st, s);
+    expect("bg arma pausa", r.cmd == LifeCmd::Pause);
+    st.streamReleased = true;
+    s.background = 0;
+    r = lifeStep(st, s);
+    expect("ritorno dopo soft-release", r.cmd == LifeCmd::ResumeMenu && r.resumeStream && !st.streamReleased);
 
     st = {};
     s = {};
@@ -61,21 +84,21 @@ int main() {
     r = lifeStep(st, s);
     expect("salto di tempo riprende", r.cmd == LifeCmd::ResumeRest && !st.wasSus);
 
-    // woke non maschera la chiusura.
+    // Nessun trigger di sistema chiude (01.41).
     st = {};
     s = {};
     lifeStep(st, s);
     s.woke = true;
     s.haveEvent = true;
-    s.eventType = 0x10000010;
+    s.eventType = 0x40010000;
     r = lifeStep(st, s);
-    expect("woke+terminate chiude", r.cmd == LifeCmd::Close && r.logClose);
+    expect("terminate documentato non chiude", r.cmd != LifeCmd::Close && !isCloseSignal(st, s));
 
     st = {};
     s = {};
     s.statusRc = static_cast<int>(0x80B20001);
     r = lifeStep(st, s);
-    expect("getstatus ko spegne", r.stopAll && st.statusDead && r.cmd == LifeCmd::None);
+    expect("getstatus ko spegne poll", r.stopAll && st.statusDead && r.cmd == LifeCmd::None);
     s.statusRc = 0;
     s.background = 1;
     r = lifeStep(st, s);
@@ -145,7 +168,7 @@ int main() {
     s.appSus = 1;
     s.sysSus = 0;
     r = lifeStep(st, s);
-    expect("appSus dal menu chiude", r.cmd == LifeCmd::Close && r.logClose);
+    expect("appSus dal menu non chiude", r.cmd != LifeCmd::Close && !isCloseSignal(st, s));
 
     st = {};
     s = {};
@@ -153,7 +176,8 @@ int main() {
     s.appSus = 1;
     s.sysSus = 0;
     r = lifeStep(st, s);
-    expect("appSus senza menu chiude", r.cmd == LifeCmd::Close && r.logClose);
+    // appSus positivo = sospensione leggera, non Close.
+    expect("appSus senza menu non chiude", r.cmd != LifeCmd::Close && r.logSuspend);
 
     st = {};
     s = {};
@@ -164,16 +188,15 @@ int main() {
     s.haveEvent = true;
     s.eventType = 0x20000000;
     r = lifeStep(st, s);
-    expect("evento non-resume chiude", r.cmd == LifeCmd::Close && r.logClose);
+    expect("evento non-resume non chiude", r.cmd != LifeCmd::Close);
 
     st = {};
     s = {};
     lifeStep(st, s);
     s.appMsg = true;
     r = lifeStep(st, s);
-    expect("AppMessaging chiude", r.cmd == LifeCmd::Close && r.logClose);
+    expect("AppMessaging non chiude", r.cmd != LifeCmd::Close && !isCloseSignal(st, s));
 
-    // Chiudi senza evento: GetStatus fallisce con menu/armato.
     st = {};
     s = {};
     lifeStep(st, s);
@@ -182,7 +205,34 @@ int main() {
     expect("arma per chiusura", r.cmd == LifeCmd::Pause && st.exitArmed);
     s.statusRc = static_cast<int>(0x80B20001);
     r = lifeStep(st, s);
-    expect("getstatus ko in menu chiude", r.cmd == LifeCmd::Close && r.logClose && r.stopAll);
+    expect("getstatus ko in menu spegne poll senza Close", r.cmd != LifeCmd::Close && r.stopAll);
+
+    // Smoke 60 s: stesso errore di 01.39/01.40 a ogni tick del monitor (~50 ms).
+    {
+        LifeState smoke;
+        LifeSample tick;
+        tick.statusRc = 0;
+        const int32_t kErr = -2136932343;  // 0x80A10009
+        expect("smoke: errore non è sospeso", !appSuspendedFromRc(kErr));
+        const std::time_t t0 = std::time(nullptr);
+        unsigned pumps = 0;
+        bool closed = false;
+        while (std::difftime(std::time(nullptr), t0) < 60.0) {
+            tick.appSus = appSuspendedFromRc(kErr) ? 1 : 0;
+            tick.appMsg = false;
+            tick.haveEvent = false;
+            tick.background = 0;
+            tick.overlay = 0;
+            auto step = lifeStep(smoke, tick);
+            ++pumps;
+            if (step.cmd == LifeCmd::Close || step.logClose || isCloseSignal(smoke, tick)) {
+                closed = true;
+                break;
+            }
+        }
+        expect("smoke 60s senza Close", !closed && pumps > 0);
+        std::printf("smoke: %u pump in 60s, no exit\n", pumps);
+    }
 
     if (g_fail) {
         std::fprintf(stderr, "%d falliti\n", g_fail);

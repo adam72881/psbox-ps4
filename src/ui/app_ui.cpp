@@ -594,14 +594,38 @@ void AppUi::prefsEvent(UiEvent& ev) const {
 }
 
 void AppUi::toggleHidden(const GameTile& tile, UiEvent& ev) {
-    // Caller holds mutex_.
+    // Caller holds mutex_. Solo Unhide diretto; Hide passa da askHideConfirm.
     if (tile.productId.empty()) return;
-    bool hide = !hidden_.count(tile.productId);
-    if (hide) hidden_.insert(tile.productId);
-    else hidden_.erase(tile.productId);
-    toast_ = tr(hide ? Str::HiddenToast : Str::UnhiddenToast);
+    if (!hidden_.count(tile.productId)) {
+        askHideConfirm(tile);
+        return;
+    }
+    hidden_.erase(tile.productId);
+    toast_ = tr(Str::UnhiddenToast);
     toastUntil_ = 0;
-    rebuild(true);  // the cursor stays put; the next game takes the place
+    rebuild(true);
+    prefsEvent(ev);
+}
+
+void AppUi::askHideConfirm(const GameTile& tile) {
+    if (tile.productId.empty()) return;
+    hidePromptTile_ = tile;
+    hidePrompt_ = true;
+    hidePromptFocus_ = 0;
+    dirty_ = true;
+}
+
+void AppUi::confirmHide(UiEvent& ev) {
+    if (!hidePrompt_ || hidePromptTile_.productId.empty()) {
+        hidePrompt_ = false;
+        return;
+    }
+    hidden_.insert(hidePromptTile_.productId);
+    toast_ = tr(Str::HiddenToast);
+    toastUntil_ = 0;
+    hidePrompt_ = false;
+    hidePromptTile_ = {};
+    rebuild(true);
     prefsEvent(ev);
 }
 
@@ -918,7 +942,9 @@ void AppUi::runSearch() {
     }
     for (const GameTile* tp : candidates) {
         const GameTile& t = *tp;
-        if (hidden_.count(t.productId)) continue;
+        // Nascosti esclusi dalla griglia/filtri; in ricerca testuale restano
+        // (con hint «Mostra») così si recuperano senza andare in Hidden.
+        if (hidden_.count(t.productId) && words.empty()) continue;
         if (filterConsole_ && t.platform != kConsoleCodes[filterConsole_]) continue;
         // Play mode and language need the full details: a game without them
         // yet comes in when they arrive.
@@ -1380,6 +1406,8 @@ std::vector<std::string> AppUi::settingOptions(int row) const {
         for (int v : kVolumes) out.push_back(std::to_string(v) + " %");
     } else if (row == 12) {
         // Invia log: Croce, nessuna lista.
+    } else if (row == 13) {
+        out = {tr(Str::Deactivated), tr(Str::SaveScreenshotsOn)};
     } else if (row == 8) {
         out.push_back(tr(Str::LoginCountryOff));
         for (const char* country : kLoginCountries) out.push_back(loginCountryName(country));
@@ -1416,6 +1444,7 @@ int AppUi::settingSelected(int row) const {
         return 3;  // 100 %
     }
     if (row == 12) return 0;
+    if (row == 13) return settings_.saveScreenshots ? 1 : 0;
     if (row == 8) {
         for (size_t i = 0; i < std::size(kLoginCountries); ++i)
             if (settings_.loginCountry == kLoginCountries[i]) return static_cast<int>(i) + 1;
@@ -1450,6 +1479,8 @@ void AppUi::applySetting(int row, int index) {
     } else if (row == 11) {
         settings_.gameVolume = kVolumes[index];
     } else if (row == 12) {
+    } else if (row == 13) {
+        settings_.saveScreenshots = index == 1;
     } else if (row == 8) {
         settings_.loginCountry = index == 0 ? std::string() : kLoginCountries[index - 1];
     } else {
@@ -1615,6 +1646,15 @@ void AppUi::handleHome(const NavInput& in, UiEvent& ev) {
             searchOnKeys_ = true;
             dirty_ = true;
             return;
+        }
+        if (in.square && resultFocus_ >= 0 && resultFocus_ < static_cast<int>(results_.size())) {
+            const GameTile& t = results_[static_cast<size_t>(resultFocus_)];
+            if (hidden_.count(t.productId)) {
+                toggleHidden(t, ev);  // Mostra (unhide diretto)
+                runSearch();
+                dirty_ = true;
+                return;
+            }
         }
         if (in.square && !query_.empty()) {  // delete without going back to the keys
             query_.pop_back();
@@ -2165,6 +2205,24 @@ UiEvent AppUi::handle(const NavInput& in) {
         if (in.accept || in.back) {
             ev.action = in.accept && promptFocus_ == 0 ? Action::UpdateNow : Action::UpdateLater;
             updatePrompt_ = false;
+            dirty_ = true;
+        }
+        return ev;
+    }
+    if (hidePrompt_) {
+        // Conferma Nascondi: □ non nasconde più al volo (evita L3/R3/□ accidentali).
+        if (in.left || in.right) hidePromptFocus_ = 1 - hidePromptFocus_, dirty_ = true;
+        if (in.accept) {
+            if (hidePromptFocus_ == 0) confirmHide(ev);
+            else {
+                hidePrompt_ = false;
+                hidePromptTile_ = {};
+                dirty_ = true;
+            }
+        }
+        if (in.back) {
+            hidePrompt_ = false;
+            hidePromptTile_ = {};
             dirty_ = true;
         }
         return ev;
@@ -2975,8 +3033,13 @@ void AppUi::drawSearch(Canvas& c, uint64_t nowMs) {
         drawHints(c, {{kIconCross, tr(Str::Select)}, {kIconCircle, tr(Str::Back)}});
     else if (searchOnKeys_)
         drawHints(c, {{kIconCross, tr(Str::KeyType)}, {kIconSquare, tr(Str::KeyDelete)}, {kIconCircle, tr(Str::Back)}});
-    else
-        drawHints(c, {{kIconCross, tr(Str::Select)}, {kIconSquare, tr(Str::KeyDelete)}, {kIconCircle, tr(Str::Back)}});
+    else {
+        bool focusHidden = resultFocus_ >= 0 && resultFocus_ < static_cast<int>(results_.size()) &&
+                           hidden_.count(results_[static_cast<size_t>(resultFocus_)].productId);
+        drawHints(c, {{kIconCross, tr(Str::Select)},
+                      {kIconSquare, tr(focusHidden ? Str::Unhide : Str::KeyDelete)},
+                      {kIconCircle, tr(Str::Back)}});
+    }
     drawToast(c, nowMs);
 }
 
@@ -3362,18 +3425,18 @@ void AppUi::drawSettings(Canvas& c) {
                                         tr(Str::Deadzone),      tr(Str::TriggerRumble), tr(Str::ConfirmButton),
                                         tr(Str::LightBar),      tr(Str::Updates),       tr(Str::LoginCountry),
                                         tr(Str::HighRefresh),   tr(Str::BitrateCap),    tr(Str::GameVolume),
-                                        tr(Str::SendLog)};
-    constexpr int kRowW = 1200, kRowH = 46, kGap = 4;
+                                        tr(Str::SendLog),       tr(Str::SaveScreenshots)};
+    constexpr int kRowW = 1200, kRowH = 42, kGap = 3;
     Rect rows[kSettingRows];
-    int y = 262;
+    int y = 250;
     for (int i = 0; i < kSettingRows; ++i) {
         Rect r{kMargin, y, kRowW, kRowH};
         rows[i] = r;
         bool focused = i == settingsRow_;
         c.fillRect(r, focused ? rgba(255, 255, 255, 36) : rgba(255, 255, 255, 14), 16);
         if (focused && !dropdownOpen_) c.strokeRect({r.x - 5, r.y - 5, r.w + 10, r.h + 10}, kWhite, 3, 20);
-        int ty = fonts_.semibold.centeredY(r.y, r.h, 30);
-        fonts_.semibold.draw(c, labels[i], r.x + 36, ty, 30, kWhite);
+        int ty = fonts_.semibold.centeredY(r.y, r.h, 28);
+        fonts_.semibold.draw(c, labels[i], r.x + 36, ty, 28, kWhite);
         if (i == 12) {
             y += kRowH + kGap;
             continue;
@@ -3534,16 +3597,20 @@ void AppUi::drawCountryPicker(Canvas& c) {
 
 void AppUi::drawUpdatePrompt(Canvas& c) {
     c.fillRect({0, 0, kW, kH}, rgba(0, 0, 0, 160));
-    constexpr int kPanelW = 960, kPanelH = 340, kButtonW = 360, kButtonH = 72;
+    constexpr int kPanelW = 960, kPanelH = 380, kButtonW = 360, kButtonH = 72;
     Rect panel{(kW - kPanelW) / 2, (kH - kPanelH) / 2 - 40, kPanelW, kPanelH};
     c.fillRect({panel.x + 8, panel.y + 12, panel.w, panel.h}, rgba(0, 0, 0, 120), 26);  // shadow
     c.fillRect(panel, kPanel, 24);
     c.strokeRect(panel, rgba(255, 255, 255, 50), 2, 24);
-    fonts_.bold.draw(c, trf(Str::UpdateAvailable, updateAvailable_), panel.x + 56, panel.y + 48, 44, kWhite);
+    // Titolo = domanda con versione (IT: «È disponibile l'aggiornamento X. Vuoi installarlo?»).
+    auto title = fonts_.bold.wrap(trf(Str::UpdateAvailable, updateAvailable_), 36, kPanelW - 112, 3);
+    for (size_t i = 0; i < title.size(); ++i)
+        fonts_.bold.draw(c, title[i], panel.x + 56, panel.y + 44 + static_cast<int>(i) * 44, 36, kWhite);
+    int bodyY = panel.y + 44 + static_cast<int>(title.size()) * 44 + 12;
     auto lines = fonts_.regular.wrap(tr(Str::UpdatePrompt), 26, kPanelW - 112, 2);
     for (size_t i = 0; i < lines.size(); ++i)
-        fonts_.regular.draw(c, lines[i], panel.x + 56, panel.y + 124 + static_cast<int>(i) * 36, 26, kGray);
-    const char* labels[2] = {tr(Str::UpdateNow), tr(Str::NotNow)};
+        fonts_.regular.draw(c, lines[i], panel.x + 56, bodyY + static_cast<int>(i) * 34, 26, kGray);
+    const char* labels[2] = {tr(Str::UpdateNow), tr(Str::NotNow)};  // Sì / No
     for (int i = 0; i < 2; ++i) {
         Rect b{panel.x + 56 + i * (kButtonW + 24), panel.y + panel.h - kButtonH - 44, kButtonW, kButtonH};
         bool on = i == promptFocus_;
@@ -3552,9 +3619,35 @@ void AppUi::drawUpdatePrompt(Canvas& c) {
         fonts_.semibold.draw(c, labels[i], b.x + (b.w - tw) / 2, fonts_.semibold.centeredY(b.y, b.h, 28), 28,
                              on ? kBg : kWhite);
     }
-    c.fillRect({0, kH - 80, kW, 80}, kBg);  // the home screen's hints, under the pop-up's
+    c.fillRect({0, kH - 80, kW, 80}, kBg);
     drawPads(c);
-    drawHints(c, {{kIconCross, tr(Str::Select)}, {kIconCircle, tr(Str::NotNow)}});
+    drawHints(c, {{kIconCross, tr(Str::UpdateNow)}, {kIconCircle, tr(Str::NotNow)}});
+}
+
+void AppUi::drawHidePrompt(Canvas& c) {
+    c.fillRect({0, 0, kW, kH}, rgba(0, 0, 0, 160));
+    constexpr int kPanelW = 880, kPanelH = 320, kButtonW = 320, kButtonH = 72;
+    Rect panel{(kW - kPanelW) / 2, (kH - kPanelH) / 2 - 20, kPanelW, kPanelH};
+    c.fillRect({panel.x + 8, panel.y + 12, panel.w, panel.h}, rgba(0, 0, 0, 120), 26);
+    c.fillRect(panel, kPanel, 24);
+    c.strokeRect(panel, rgba(255, 255, 255, 50), 2, 24);
+    fonts_.bold.draw(c, tr(Str::Hide), panel.x + 56, panel.y + 48, 40, kWhite);
+    auto name = hidePromptTile_.name.empty() ? hidePromptTile_.productId : hidePromptTile_.name;
+    auto lines = fonts_.regular.wrap(name, 28, kPanelW - 112, 2);
+    for (size_t i = 0; i < lines.size(); ++i)
+        fonts_.regular.draw(c, lines[i], panel.x + 56, panel.y + 110 + static_cast<int>(i) * 36, 28, kGray);
+    const char* labels[2] = {tr(Str::UpdateNow), tr(Str::NotNow)};  // Sì / No
+    for (int i = 0; i < 2; ++i) {
+        Rect b{panel.x + 56 + i * (kButtonW + 24), panel.y + panel.h - kButtonH - 40, kButtonW, kButtonH};
+        bool on = i == hidePromptFocus_;
+        c.fillRect(b, on ? kWhite : rgba(255, 255, 255, 30), 14);
+        int tw = fonts_.semibold.measure(labels[i], 28);
+        fonts_.semibold.draw(c, labels[i], b.x + (b.w - tw) / 2, fonts_.semibold.centeredY(b.y, b.h, 28), 28,
+                             on ? kBg : kWhite);
+    }
+    c.fillRect({0, kH - 80, kW, 80}, kBg);
+    drawPads(c);
+    drawHints(c, {{kIconCross, tr(Str::UpdateNow)}, {kIconCircle, tr(Str::NotNow)}});
 }
 
 Rect AppUi::drawModal(Canvas& c, int w, int h, const std::string& title) {
@@ -3906,6 +3999,7 @@ void AppUi::render(Canvas& c, uint64_t nowMs) {
         case Screen::Updating: drawUpdating(c, nowMs); break;
         case Screen::Streaming: break;
     }
+    if (hidePrompt_) drawHidePrompt(c);
     if (screen_ == Screen::Home && updatePrompt_) drawUpdatePrompt(c);
     if (screen_ == Screen::Error && countryPickerOpen_) drawCountryPicker(c);
     if (reportOpen_) drawReport(c);

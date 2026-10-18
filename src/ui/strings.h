@@ -253,6 +253,8 @@ enum class Str {
     FavoriteOn,         // toast
     FavoriteOff,
     NoUpdate,           // Settings: the local folder has nothing newer
+    SaveScreenshots,    // Settings: save PNGs under /data/psbox/screenshots/
+    SaveScreenshotsOn,  // ... its "on" choice
     Count
 };
 

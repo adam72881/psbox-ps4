@@ -136,7 +136,7 @@ constexpr Column kEnglish = {
     "Confirm button",                                // ConfirmButton
     "On",                                            // Activated
     "Off",                                           // Deactivated
-    "Version %s available",                          // UpdateAvailable
+    "Update %s is available. Install it?",           // UpdateAvailable
     "Controllers",                                   // Controllers
     "Controller %s connected",                       // PadConnected
     "Controller %s disconnected",                    // PadDisconnected
@@ -176,9 +176,9 @@ constexpr Column kEnglish = {
     "FSR + clean-up",                                // UpscalerFsrClean
     "AI + clean-up",                                 // UpscalerAiClean
     "Auto (%s)",                                     // DebandAuto
-    "Update now? The app restarts by itself when it's done.", // UpdatePrompt
-    "Update now",                                    // UpdateNow
-    "Not now",                                       // NotNow
+    "After install, reopen PSBox from the home screen.", // UpdatePrompt
+    "Yes",                                           // UpdateNow
+    "No",                                            // NotNow
     "Check for updates",                             // Updates
     "Up to date (%s)",                               // UpToDate
     "%s available: update",                          // UpdateReady
@@ -276,6 +276,8 @@ constexpr Column kEnglish = {
     "Added to favorites",
     "Removed from favorites",
     "No update",
+    "Save screenshots",
+    "On (hold L1+R1+□ 1s)",
 };
 
 constexpr Column kPortugueseBR = {
@@ -522,6 +524,8 @@ constexpr Column kPortugueseBR = {
     "Adicionado aos favoritos",
     "Removido dos favoritos",
     "Nenhuma atualização",
+    "Salvar capturas",
+    "Ativado (segure L1+R1+□ 1s)",
 };
 
 constexpr Column kSpanish = {
@@ -768,6 +772,8 @@ constexpr Column kSpanish = {
     "Añadido a favoritos",
     "Quitado de favoritos",
     "No hay actualización",
+    "Guardar capturas",
+    "Activado (mantén L1+R1+□ 1s)",
 };
 
 constexpr Column kFrench = {
@@ -1014,6 +1020,8 @@ constexpr Column kFrench = {
     "Ajouté aux favoris",
     "Retiré des favoris",
     "Aucune mise à jour",
+    "Enregistrer captures",
+    "Activé (maintenir L1+R1+□ 1s)",
 };
 
 constexpr Column kGerman = {
@@ -1260,6 +1268,8 @@ constexpr Column kGerman = {
     "Zu Favoriten hinzugefügt",
     "Aus Favoriten entfernt",
     "Kein Update",
+    "Screenshots speichern",
+    "An (L1+R1+□ 1s halten)",
 };
 
 constexpr Column kItalian = {
@@ -1366,7 +1376,7 @@ constexpr Column kItalian = {
     "Tasto di conferma",
     "Attivata",
     "Disattivata",
-    "Versione %s disponibile",
+    "È disponibile l'aggiornamento %s. Vuoi installarlo?",
     "Controller",
     "Controller %s connesso",
     "Controller %s disconnesso",
@@ -1406,9 +1416,9 @@ constexpr Column kItalian = {
     "FSR + pulizia",
     "IA + pulizia",
     "Auto (%s)",
-    "Aggiornare ora? L'app si riavvia da sola alla fine.",
-    "Aggiorna ora",
-    "Non ora",
+    "Dopo l'installazione riapri PSBox dalla home.",
+    "Sì",
+    "No",
     "Controlla aggiornamenti",
     "Aggiornato (%s)",
     "%s disponibile: aggiorna",
@@ -1506,6 +1516,8 @@ constexpr Column kItalian = {
     "Aggiunto ai preferiti",
     "Tolto dai preferiti",
     "Nessun aggiornamento",
+    "Salva screenshot",
+    "Attiva (tieni L1+R1+□ 1s)",
 };
 
 constexpr std::array<const Column*, kLangs> kTable = {&kEnglish, &kPortugueseBR, &kSpanish,

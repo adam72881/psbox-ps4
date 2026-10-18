@@ -6,6 +6,7 @@
 // ps5_main.cpp.
 #pragma once
 
+#include "app/local_update.h"
 #include "app/settings.h"
 #include "ui/app_ui.h"
 #include "ui/stream_menu.h"
@@ -39,6 +40,8 @@ extern ui::GameTile g_playTile;  // what kPlay plays
 void worker();
 // The update pop-up's "Not now": that release isn't offered again on start.
 void skipOfferedUpdate();
+// Dopo UI pronta: se all'avvio c'era un pkg più nuovo, mostra il dialogo Sì/No.
+void offerBootLocalUpdateIfAny(const LocalUpdateResult& found);
 
 // The running stream, for the input thread.
 extern std::mutex g_playerMutex;

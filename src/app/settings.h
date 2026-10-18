@@ -75,6 +75,7 @@ struct Settings {
     // Voice chat & Audio routing
     bool micEnabled = true;
     bool highRefresh = false;  // 119.88 Hz output (VRR where the console turns it on) while streaming
+    bool saveScreenshots = false;  // PNG in /data/psbox/screenshots/ (menu + 1° frame)
     int maxBitrateMbps = 0;    // the stream's bitrate cap: 0 automatic (the tier's), else 20, 15, 10 or 5
     int gameVolume = 100;      // percent: 25, 50, 75, 100 or 150
     int micGain = 1;        // 0: 50%, 1: 100%, 2: 150%

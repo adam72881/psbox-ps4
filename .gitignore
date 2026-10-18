@@ -16,3 +16,7 @@ uploads/
 
 /build-host/
 /agent-tools/
+
+# Ship latest pkg for GitHub landing
+!/releases/
+!/releases/*.pkg

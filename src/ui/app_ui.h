@@ -114,14 +114,14 @@ struct SettingsChoice {
     int deband = 3;
     int upscaler = 2;
     bool highRefresh = false;  // 120 Hz output while a game streams
+    bool saveScreenshots = false;
     int maxBitrateMbps = 0;    // 0 automatic, else 20 / 15 / 10 / 5
     int gameVolume = 100;      // percent: 25 / 50 / 75 / 100 / 150
 };
 
 // The largest stick dead zone Settings offers, in percent of the travel.
 constexpr int kMaxDeadzone = 30;
-constexpr int kSettingRows = 13;  // language, resolution, region, dead zone, triggers, confirm, light bar, updates,
-                                  // sign-in country, 120 Hz output, bitrate cap, game volume, send log
+constexpr int kSettingRows = 14;  // … send log, salva screenshot
 
 // The countries "Sign in as another country" offers (xcloud::loginCountryAddress).
 constexpr const char* kLoginCountries[] = {"br", "jp", "kr", "pl", "us"};
@@ -353,7 +353,11 @@ private:
     void rebuild(bool keepPosition = false);
     void setRowsLocked(std::vector<GameRow> rows);
     // Hides / shows a game; fills `ev` so the app saves it.
+    // Hide apre conferma; Unhide (Mostra) è immediato.
     void toggleHidden(const GameTile& tile, UiEvent& ev);
+    void askHideConfirm(const GameTile& tile);
+    void confirmHide(UiEvent& ev);
+    void drawHidePrompt(Canvas& c);
     void toggleFavorite(const GameTile& tile, UiEvent& ev);
     bool isFavorite(const GameTile& tile) const;
     void prefsEvent(UiEvent& ev) const;
@@ -490,6 +494,9 @@ private:
     std::string reportUrl_, reportHeading_;
     bool updatePrompt_ = false;  // the pop-up is up (on the home screen)
     int promptFocus_ = 0;        // 0 Update now, 1 Not now
+    bool hidePrompt_ = false;    // conferma Nascondi (non più un solo click)
+    int hidePromptFocus_ = 0;    // 0 Sì, 1 No
+    GameTile hidePromptTile_;
     std::string updatingTo_, updateStatus_;
     float updateFraction_ = -1;
     Tester tester_ = Tester::None;

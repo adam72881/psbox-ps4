@@ -172,7 +172,7 @@ std::string stream(xcloud::GssvClient& gssv) {
             auto st = player.stats();
             XC_LOGI("stream: %llu frames, %llu decoded, %llu skipped, %llu failed, %llu resets, %llu kf req, "
                     "%llu queued, %llu audio; rtp %llu pkts, %llu lost, %llu recovered, %llu nacks, "
-                    "%llu frames dropped; %llu kbps (remb %llu kbps); rtcp %llu twcc %llu; %llu rumble; %llu ack; "
+                    "%llu frames dropped; %llu kbps (recv %llu kbps); rtcp %llu twcc %llu; %llu rumble; %llu ack; "
                     "decode %.1f/%.1f ms, draw %.1f/%.1f ms, %llu late; "
                     "rtt %d ms; %dx%d; on screen %.1f/%.1f ms after arrival",
                     static_cast<unsigned long long>(st.videoFrames), static_cast<unsigned long long>(st.decodedFrames),
@@ -426,6 +426,65 @@ std::string g_xblAuth;
 std::mutex g_releaseMutex;
 Release g_release;
 
+// Pkg locale in /data/psbox/update/ (dialogo Sì/No; No non salva skip).
+std::mutex g_localMu;
+LocalUpdateResult g_localOffer;
+bool g_haveLocalOffer = false;
+
+void offerLocalUpdate(const LocalUpdateResult& found) {
+    if (found.status != LocalUpdateStatus::Available) return;
+    {
+        std::lock_guard<std::mutex> lock(g_localMu);
+        g_localOffer = found;
+        g_haveLocalOffer = true;
+    }
+    // Tag leggibile in UI (1.0.42 → 01.42 se possibile).
+    std::string shown = found.version;
+    g_ui->setUpdateState(XC_APP_VERSION, shown, false);
+    g_ui->offerUpdate();
+    XC_LOGI("[UPDATE] dialogo offerto per %s (%s)", shown.c_str(), found.path.c_str());
+}
+
+void checkLocalUpdate(bool fromSettings) {
+    g_ui->setUpdateState(XC_APP_VERSION, {}, true);
+    auto found = findLocalUpdate(XC_APP_VERSION);
+    if (found.status == LocalUpdateStatus::Available) {
+        offerLocalUpdate(found);
+        if (fromSettings) g_ui->showHome();
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_localMu);
+        g_haveLocalOffer = false;
+        g_localOffer = {};
+    }
+    g_ui->setUpdateState(XC_APP_VERSION, {}, false);
+    if (fromSettings) {
+        if (found.status == LocalUpdateStatus::Failed)
+            g_ui->showToast(found.detail.empty() ? std::string(ui::tr(ui::Str::UpdateFailed)) : found.detail);
+        else
+            g_ui->showToast(ui::tr(ui::Str::NoUpdate));
+    }
+}
+
+void runLocalInstall() {
+    LocalUpdateResult offer;
+    {
+        std::lock_guard<std::mutex> lock(g_localMu);
+        if (!g_haveLocalOffer) return;
+        offer = g_localOffer;
+    }
+    XC_LOGI("[UPDATE] scelta Sì → install %s", offer.version.c_str());
+    g_ui->showUpdating(offer.version);
+    g_ui->setUpdateStatus(ui::tr(ui::Str::UpdateInstalling), -1);
+    auto upd = installLocalUpdate(XC_APP_VERSION);
+    // installLocalUpdate non ritorna se ok (LoadExec/_exit).
+    XC_LOGE("[UPDATE] install fallita: %s", upd.detail.c_str());
+    g_ui->showHome(upd.detail.empty() ? ui::tr(ui::Str::UpdateFailed) : upd.detail);
+    std::lock_guard<std::mutex> lock(g_localMu);
+    g_haveLocalOffer = false;
+}
+
 // Asks for the latest release; a newer one with a signed package is offered
 // (the pop-up, unless the user said "Not now" to it) and shown in Settings.
 // Sulla PS4 non viene chiamata: lo zip è PPSA99810, la versione PS5.
@@ -493,7 +552,20 @@ void runUpdate() {
 
 }  // namespace
 
+void offerBootLocalUpdateIfAny(const LocalUpdateResult& found) {
+    if (found.status == LocalUpdateStatus::Available) offerLocalUpdate(found);
+}
+
 void skipOfferedUpdate() {
+    // Pkg locale: No lascia il file e riproporrà al prossimo avvio (niente skip salvato).
+    {
+        std::lock_guard<std::mutex> lock(g_localMu);
+        if (g_haveLocalOffer) {
+            XC_LOGI("[UPDATE] scelta No — lascio %s, riproporrò al prossimo avvio", g_localOffer.version.c_str());
+            g_haveLocalOffer = false;
+            return;
+        }
+    }
     std::string tag;
     {
         std::lock_guard<std::mutex> lock(g_releaseMutex);
@@ -775,19 +847,19 @@ void worker() {
                 loadConsoles(am, home);  // empty when the sign-in failed
                 break;
             case kConsoles: loadConsoles(am, home); break;
-            case kUpdate: runUpdate(); break;
+            case kUpdate: {
+                bool local = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_localMu);
+                    local = g_haveLocalOffer;
+                }
+                if (local) runLocalInstall();
+                else runUpdate();
+                break;
+            }
             case kCheckUpdate: {
                 g_checkUpdatePending = false;
-                auto upd = applyLocalUpdate(XC_APP_VERSION);
-                if (upd.status == LocalUpdateStatus::Installed) {
-                    g_restartWanted = true;
-                } else if (upd.status == LocalUpdateStatus::Failed) {
-                    g_ui->setUpdateState(XC_APP_VERSION, {}, false);
-                    g_ui->showToast(upd.detail.empty() ? std::string(ui::tr(ui::Str::UpdateFailed)) : upd.detail);
-                } else {
-                    g_ui->setUpdateState(XC_APP_VERSION, {}, false);
-                    g_ui->showToast(ui::tr(ui::Str::NoUpdate));
-                }
+                checkLocalUpdate(true);
                 break;
             }
             case kReloadLibrary: loadLibrary(gssv); break;  // e.g. after a language change

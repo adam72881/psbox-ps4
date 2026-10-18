@@ -6,16 +6,19 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <vector>
 
 namespace xc::stream {
 
 namespace {
 
-constexpr uint64_t kReportIntervalUs = 500000;  // 500 ms come PS5 REMB
-constexpr uint64_t kTwccIntervalUs = 100000;    // 100 ms
-constexpr uint64_t kPliQuietUs = 2000000;       // PLI se video fermo ≥2 s
-constexpr uint32_t kMinBitrate = 1500000;
+// TWCC ogni ~50 ms (browser/PS5); RR ogni 1 s senza REMB se c'è transport-cc.
+constexpr uint64_t kReportIntervalUs = 1000000;
+constexpr uint64_t kTwccIntervalUs = 50000;
+constexpr uint64_t kPliQuietUs = 2000000;
+constexpr int64_t kDeltaScaleUs = 250;   // draft-holmer
+constexpr int64_t kBaseScaleUs = 64000;  // 256 * 250 µs = 64 ms
 
 uint64_t nowUs() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -34,6 +37,9 @@ void put16(std::vector<uint8_t>& b, uint16_t v) {
 void put32(std::vector<uint8_t>& b, uint32_t v) {
     for (int s = 24; s >= 0; s -= 8) b.push_back(static_cast<uint8_t>(v >> s));
 }
+
+// extmap id negoziato nell'offerta (stream_session: id 3). One-byte e two-byte.
+constexpr uint8_t kTwccExtId = 3;
 
 bool readTwccSeq(const uint8_t* d, size_t n, uint16_t& out) {
     if (n < 12 || !(d[0] & 0x10)) return false;
@@ -54,9 +60,7 @@ bool readTwccSeq(const uint8_t* d, size_t n, uint16_t& out) {
             uint8_t len = (d[i] & 0x0f) + 1;
             ++i;
             if (i + len > end) break;
-            // Solo id 3: quello negoziato nell'offerta. Id 2/4 potevano
-            // matchare altre estensioni → seq spurie → "loss" TWCC → stop RTP.
-            if (id == 3 && len >= 2) {
+            if (id == kTwccExtId && len >= 2) {
                 out = get16(d + i);
                 return true;
             }
@@ -72,7 +76,7 @@ bool readTwccSeq(const uint8_t* d, size_t n, uint16_t& out) {
             uint8_t len = d[i + 1];
             i += 2;
             if (i + len > end) break;
-            if (id == 3 && len >= 2) {
+            if (id == kTwccExtId && len >= 2) {
                 out = get16(d + i);
                 return true;
             }
@@ -80,6 +84,17 @@ bool readTwccSeq(const uint8_t* d, size_t n, uint16_t& out) {
         }
     }
     return false;
+}
+
+void logTwccPacket(uint32_t n, const std::vector<uint8_t>& b, uint16_t base, int statusCount) {
+    XC_LOGI("[TWCC] size %zu base %u count %d n %u", b.size(), base, statusCount, n);
+    if (n > 5) return;
+    // Hex dump dei primi 5 feedback (byte-for-byte vs PS5/browser).
+    char hex[768];
+    size_t pos = 0;
+    for (size_t i = 0; i < b.size() && pos + 3 < sizeof hex; ++i)
+        pos += static_cast<size_t>(std::snprintf(hex + pos, sizeof hex - pos, "%02x", b[i]));
+    XC_LOGI("[TWCC] hex#%u %s", n, hex);
 }
 
 }  // namespace
@@ -167,10 +182,11 @@ void RtcpReporter::sendPli(const rtc::message_callback& send) {
     }
 }
 
-bool RtcpReporter::flushTwcc(uint64_t nowUs, const rtc::message_callback& send) {
+bool RtcpReporter::flushTwcc(uint64_t nowUsVal, const rtc::message_callback& send) {
     if (twccCount_ <= 0 || !send) return false;
 
-    // Copia senza svuotare: si azzera solo dopo send ok.
+    // Oldest-first: i hit più vecchi devono essere ACK (bug 01.38: newest-only
+    // → GCC spegneva a ~57 feedback / ~6–8 s).
     std::vector<TwccHit> hits;
     hits.reserve(static_cast<size_t>(twccCount_));
     for (int i = 0; i < twccCount_; ++i) hits.push_back(twccHits_[(twccHead_ + i) % kTwccCap]);
@@ -185,29 +201,45 @@ bool RtcpReporter::flushTwcc(uint64_t nowUs, const rtc::message_callback& send) 
         }
         hits.swap(uniq);
     }
-    if (hits.empty()) return false;
+    if (hits.empty()) {
+        XC_LOGW("[TWCC] skip: nessun hit dopo uniq (ring %d)", twccCount_);
+        twccHead_ = 0;
+        twccCount_ = 0;
+        return false;
+    }
 
-    // Cap per feedback: in 01.35 count 222/314 → UDP ~MTU e "loss" enorme.
-    // Max 40 hit (≥100 ms a ~400 pkt/s) resta sotto ~400 B con mtu 1200.
-    constexpr int kMaxHits = 40;
-    if (static_cast<int>(hits.size()) > kMaxHits)
-        hits.erase(hits.begin(), hits.end() - kMaxHits);
+    // Cap ragionevole per MTU: ~100 status (WebRTC max ~0xffff ma Orbis MTU 1200).
+    constexpr int kMaxHits = 80;
+    constexpr int kMaxSpan = 120;
+    size_t take = hits.size();
+    if (static_cast<int>(take) > kMaxHits) take = static_cast<size_t>(kMaxHits);
+    while (take > 1) {
+        int span = static_cast<int>(static_cast<uint16_t>(hits[take - 1].seq - hits[0].seq)) + 1;
+        if (span <= kMaxSpan) break;
+        --take;
+    }
+    if (take < hits.size()) {
+        static uint32_t trimLog = 0;
+        if (++trimLog <= 4 || trimLog % 50 == 0)
+            XC_LOGI("[TWCC] backlog %zu → invio %zu oldest (resto in coda)", hits.size(), take);
+        hits.resize(take);
+    }
 
     uint16_t base = hits.front().seq;
     uint16_t last = hits.back().seq;
     int statusCount = static_cast<int>(static_cast<uint16_t>(last - base)) + 1;
-    // Range troppo largo rispetto ai pacchetti ricevuti = buco fittizio da
-    // seq parse errato (ext id 2/4 in 01.35): il server spegne l'RTP.
-    if (statusCount > static_cast<int>(hits.size()) * 4 || statusCount > 80) {
-        TwccHit keep = hits.back();
-        hits.clear();
-        hits.push_back(keep);
-        base = keep.seq;
+    if (statusCount > kMaxSpan || statusCount > static_cast<int>(hits.size()) * 4) {
+        XC_LOGW("[TWCC] skip range: base %u last %u span %d hits %zu — invio solo il primo", base, last,
+                statusCount, hits.size());
+        hits.resize(1);
         last = base;
         statusCount = 1;
     }
     if (statusCount > 0x1FFF) statusCount = 0x1FFF;
-    if (statusCount <= 0) return false;
+    if (statusCount <= 0) {
+        XC_LOGW("[TWCC] skip: statusCount %d", statusCount);
+        return false;
+    }
 
     std::vector<uint64_t> arr(static_cast<size_t>(statusCount), 0);
     for (const auto& h : hits) {
@@ -215,37 +247,41 @@ bool RtcpReporter::flushTwcc(uint64_t nowUs, const rtc::message_callback& send) 
         if (idx >= 0 && idx < statusCount) arr[static_cast<size_t>(idx)] = h.us;
     }
 
-    // reference time: 24 bit × 64 ms, allineato al primo arrivo (delta≈0).
-    uint64_t firstUs = hits.front().us;
-    uint32_t refMs64 = static_cast<uint32_t>((firstUs / 1000u) / 64u) & 0x00FFFFFFu;
-    uint64_t prevUs = static_cast<uint64_t>(refMs64) * 64000ull;
+    // Reference time: multipli di 64 ms, 24 bit (come WebRTC). I delta interni
+    // usano il base a piena precisione — mai ref24*64000 (perde i bit alti).
+    const int64_t firstUs = static_cast<int64_t>(hits.front().us);
+    const int64_t baseTimeUs = (firstUs / kBaseScaleUs) * kBaseScaleUs;
+    const uint32_t ref24 = static_cast<uint32_t>((baseTimeUs / kBaseScaleUs) & 0x00FFFFFFu);
+    int64_t prevUs = baseTimeUs;
 
     std::vector<uint16_t> chunks;
     std::vector<uint8_t> deltas;
     int i = 0;
     while (i < statusCount) {
         bool recv = arr[static_cast<size_t>(i)] != 0;
-        int run = 1;
-        // Per i ricevuti non si usa un unico run se servono large delta misti:
-        // status 1 = small (1 byte), 2 = large (2 byte). Si spezza per tipo.
         if (!recv) {
+            int run = 1;
             while (i + run < statusCount && run < 0x1FFF && arr[static_cast<size_t>(i + run)] == 0) ++run;
-            chunks.push_back(static_cast<uint16_t>(run & 0x1FFF));  // T=0 S=0
+            // Run-length T=0 S=0: not received.
+            chunks.push_back(static_cast<uint16_t>(run & 0x1FFF));
             i += run;
             continue;
         }
-        // Un pacchetto alla volta per scegliere small/large correttamente.
-        uint64_t us = arr[static_cast<size_t>(i)];
-        int64_t dUs = static_cast<int64_t>(us) - static_cast<int64_t>(prevUs);
+        int64_t us = static_cast<int64_t>(arr[static_cast<size_t>(i)]);
+        int64_t dUs = us - prevUs;
         prevUs = us;
-        int64_t ticks = dUs / 250;
-        if (ticks >= -128 && ticks <= 127) {
-            chunks.push_back(static_cast<uint16_t>((1u << 13) | 1));  // S=1 run=1
-            deltas.push_back(static_cast<uint8_t>(static_cast<int8_t>(ticks)));
+        // Arrotonda a 250 µs come WebRTC (half-up verso lontano da zero).
+        int64_t ticks = dUs >= 0 ? (dUs + kDeltaScaleUs / 2) / kDeltaScaleUs
+                                 : (dUs - kDeltaScaleUs / 2) / kDeltaScaleUs;
+        // Symbol 1 = small delta: 8-bit UNSIGNED [0..255] (mai signed!).
+        // Symbol 2 = large/negative: 16-bit signed.
+        if (ticks >= 0 && ticks <= 255) {
+            chunks.push_back(static_cast<uint16_t>((1u << 13) | 1));
+            deltas.push_back(static_cast<uint8_t>(ticks));
         } else {
             if (ticks > 0x7FFF) ticks = 0x7FFF;
             if (ticks < -0x8000) ticks = -0x8000;
-            chunks.push_back(static_cast<uint16_t>((2u << 13) | 1));  // S=2 large
+            chunks.push_back(static_cast<uint16_t>((2u << 13) | 1));
             auto v = static_cast<uint16_t>(static_cast<int16_t>(ticks));
             deltas.push_back(static_cast<uint8_t>((v >> 8) & 0xff));
             deltas.push_back(static_cast<uint8_t>(v & 0xff));
@@ -255,16 +291,16 @@ bool RtcpReporter::flushTwcc(uint64_t nowUs, const rtc::message_callback& send) 
 
     std::vector<uint8_t> b;
     b.reserve(32 + chunks.size() * 2 + deltas.size() + 4);
-    b.push_back(0x8F);
-    b.push_back(205);
+    b.push_back(0x8F);  // V=2 P=0 FMT=15
+    b.push_back(205);   // PT=RTPFB
     put16(b, 0);
-    put32(b, kReceiverSsrc);
-    put32(b, mediaSsrc_);
+    put32(b, kReceiverSsrc);  // sender SSRC
+    put32(b, mediaSsrc_);     // media SSRC = video SSRC
     put16(b, base);
     put16(b, static_cast<uint16_t>(statusCount));
-    b.push_back(static_cast<uint8_t>((refMs64 >> 16) & 0xff));
-    b.push_back(static_cast<uint8_t>((refMs64 >> 8) & 0xff));
-    b.push_back(static_cast<uint8_t>(refMs64 & 0xff));
+    b.push_back(static_cast<uint8_t>((ref24 >> 16) & 0xff));
+    b.push_back(static_cast<uint8_t>((ref24 >> 8) & 0xff));
+    b.push_back(static_cast<uint8_t>(ref24 & 0xff));
     b.push_back(twccFbCount_);
     for (uint16_t c : chunks) put16(b, c);
     b.insert(b.end(), deltas.begin(), deltas.end());
@@ -277,17 +313,29 @@ bool RtcpReporter::flushTwcc(uint64_t nowUs, const rtc::message_callback& send) 
     try {
         send(rtc::make_message(p, p + b.size(), rtc::Message::Control));
     } catch (const std::exception& e) {
-        XC_LOGW("rtcp: twcc %s", e.what());
-        return false;  // ring intatto per il prossimo tentativo
+        XC_LOGW("[TWCC] send fallito: %s (ring intatto, count %d)", e.what(), twccCount_);
+        return false;
     }
-    // Send ok: svuota e avanza il contatore feedback.
-    twccHead_ = 0;
-    twccCount_ = 0;
+
+    {
+        std::vector<TwccHit> rest;
+        rest.reserve(static_cast<size_t>(twccCount_));
+        for (int j = 0; j < twccCount_; ++j) {
+            TwccHit h = twccHits_[(twccHead_ + j) % kTwccCap];
+            int d = static_cast<uint16_t>(h.seq - base);
+            if (d >= 0 && d < statusCount) continue;
+            rest.push_back(h);
+        }
+        twccHead_ = 0;
+        twccCount_ = static_cast<int>(rest.size());
+        if (twccCount_ > kTwccCap) twccCount_ = kTwccCap;
+        for (int j = 0; j < twccCount_; ++j) twccHits_[j] = rest[static_cast<size_t>(j)];
+    }
     ++twccFbCount_;
     uint32_t n = ++twccSent_;
-    lastTwccUs_ = nowUs;
-    if (n <= 8 || n % 20 == 0)
-        XC_LOGI("rtcp: TWCC base %u count %d chunks %zu n %u", base, statusCount, chunks.size(), n);
+    lastTwccUs_ = nowUsVal;
+    twccActive_ = true;
+    logTwccPacket(n, b, base, statusCount);
     return true;
 }
 
@@ -311,7 +359,7 @@ void RtcpReporter::report(uint64_t now, const rtc::message_callback& send) {
     if (lastSrArrivalUs_) dlsr = static_cast<uint32_t>((now - lastSrArrivalUs_) * 65536 / 1000000);
 
     std::vector<uint8_t> b;
-    b.reserve(64);
+    b.reserve(32);
     b.push_back(0x81);
     b.push_back(201);
     put16(b, 7);
@@ -323,36 +371,28 @@ void RtcpReporter::report(uint64_t now, const rtc::message_callback& send) {
     put32(b, lastSr_);
     put32(b, lastSr_ ? dlsr : 0);
 
-    if (maxBitrate_) {
-        uint32_t rate = intervalUs ? static_cast<uint32_t>(bytesSinceReport_ * 8 * 1000000 / intervalUs) : 0;
-        receiveRate_ = rate;
-        double loss = fraction / 256.0;
-        uint32_t est = estimate_;
-        if (loss > 0.10) {
-            if (++lossyReports_ >= 3)
-                est = std::max<uint32_t>(kMinBitrate, static_cast<uint32_t>(rate * (1.0 - 0.5 * loss)));
-        } else {
-            lossyReports_ = 0;
-            if (loss < 0.02)
-                est = std::min<uint32_t>(maxBitrate_, std::max<uint32_t>(est, kMinBitrate) + maxBitrate_ / 20);
-        }
-        estimate_ = est;
-        sendRemb(est, mediaSsrc_, b);
-        uint32_t n = ++reportsSent_;
-        if (n <= 4 || n % 5 == 0)
-            XC_LOGI("rtcp: RR+REMB %u bps (log %u kbps) ssrc %08x loss %u n %u twcc %u", est, est / 1000u, mediaSsrc_,
-                    static_cast<unsigned>(fraction), n, twccSent_.load());
-    } else {
-        ++reportsSent_;
-    }
+    // Con transport-cc attivo: solo RR (+ TWCC a parte). REMB a 25 Mbps
+    // insieme a TWCC confonde il GCC del server (PS5/browser: solo TWCC).
+    uint32_t rate = intervalUs ? static_cast<uint32_t>(bytesSinceReport_ * 8 * 1000000 / intervalUs) : 0;
+    receiveRate_ = rate;
+    estimate_ = rate ? rate : estimate_.load();
+    uint32_t n = ++reportsSent_;
+    if (n <= 4 || n % 5 == 0)
+        XC_LOGI("rtcp: RR %u kbps (recv) ssrc %08x loss %u n %u twcc %u (no REMB)", rate / 1000u, mediaSsrc_,
+                static_cast<unsigned>(fraction), n, twccSent_.load());
     bytesSinceReport_ = 0;
 
     auto* p = reinterpret_cast<const std::byte*>(b.data());
     send(rtc::make_message(p, p + b.size(), rtc::Message::Control));
-    if (now - lastTwccUs_ >= kTwccIntervalUs) flushTwcc(now, send);
+    if (twccCount_ > 0 && (now - lastTwccUs_ >= kTwccIntervalUs || twccCount_ >= 40)) {
+        for (int k = 0; k < 8 && twccCount_ > 0; ++k) {
+            if (!flushTwcc(now, send)) break;
+        }
+    }
 }
 
 void RtcpReporter::sendRemb(uint32_t bps, uint32_t mediaSsrc, std::vector<uint8_t>& b) {
+    // Tenuto per compat / test; il path stream con TWCC non lo chiama più.
     uint8_t exp = 0;
     uint32_t mantissa = bps;
     while (mantissa >= (1u << 18)) {
@@ -367,8 +407,6 @@ void RtcpReporter::sendRemb(uint32_t bps, uint32_t mediaSsrc, std::vector<uint8_
     b.insert(b.end(), {'R', 'E', 'M', 'B'});
     put32(b, (1u << 24) | (uint32_t(exp) << 18) | mantissa);
     put32(b, mediaSsrc);
-    if (reportsSent_.load() < 2)
-        XC_LOGI("rtcp: REMB mantissa %u exp %u = %u bps", mantissa, exp, mantissa << exp);
 }
 
 int RtcpReporter::secondsQuiet() const {
@@ -386,29 +424,23 @@ void RtcpReporter::pump() {
         if (!send_) return;
         send = send_;
         uint64_t now = nowUs();
-        if (twccCount_ > 0 && (!lastTwccUs_ || now - lastTwccUs_ >= kTwccIntervalUs)) flushTwcc(now, send);
-        // Video fermo: PLI RTCP (come 01.24) con backoff 2 s, non ogni RR.
+        bool due = twccCount_ > 0 && (!lastTwccUs_ || now - lastTwccUs_ >= kTwccIntervalUs || twccCount_ >= 40);
+        if (due) {
+            for (int n = 0; n < 8 && twccCount_ > 0; ++n) {
+                if (!flushTwcc(now, send)) break;
+                now = nowUs();
+            }
+        }
         if (started_ && maxBitrate_ && lastRtpUs_.load() && now - lastRtpUs_.load() >= kPliQuietUs &&
             (!lastPliUs_ || now - lastPliUs_ >= kPliQuietUs)) {
             sendPli(send);
             lastPliUs_ = now;
             XC_LOGI("rtcp: PLI video fermo");
         }
+        // Niente REMB iniziale: con TWCC il server rampa da solo.
         if (lastReportUs_ && now - lastReportUs_ < kReportIntervalUs) return;
         if (!started_) {
-            if (!maxBitrate_) return;
-            std::vector<uint8_t> b;
-            estimate_ = maxBitrate_;
-            sendRemb(maxBitrate_, 0, b);
             lastReportUs_ = now;
-            uint32_t n = ++reportsSent_;
-            XC_LOGI("rtcp: REMB iniziale %u bps n %u", maxBitrate_, n);
-            auto* p = reinterpret_cast<const std::byte*>(b.data());
-            try {
-                send(rtc::make_message(p, p + b.size(), rtc::Message::Control));
-            } catch (const std::exception& e) {
-                XC_LOGW("rtcp: invio %s", e.what());
-            }
             return;
         }
     }
@@ -425,22 +457,19 @@ void RtcpReporter::pump() {
 void RtcpReporter::incoming(rtc::message_vector& messages, const rtc::message_callback& send) {
     std::lock_guard<std::mutex> lock(mu_);
     send_ = send;
-    uint64_t now = nowUs();
     rtc::message_vector rtp;
     for (auto& message : messages) {
         const auto* d = reinterpret_cast<const uint8_t*>(message->data());
         size_t n = message->size();
         if (message->type == rtc::Message::Control) {
-            onRtcp(d, n, now);
+            onRtcp(d, n, nowUs());
         } else if (message->type == rtc::Message::Binary && n >= 12 && (d[0] >> 6) == 2) {
-            onRtp(d, n, now);
+            // Timestamp per pacchetto (orologio monotono): non un solo now per batch.
+            onRtp(d, n, nowUs());
             rtp.push_back(std::move(message));
         }
     }
     messages.swap(rtp);
-    // Solo accumulo qui: TWCC/REMB partono da pump() sul thread app.
-    // Mandare RTCP dal path RTP (con mu_ tenuto) su Orbis bloccava il recv
-    // DTLS/ICE e contribuiva a feedback di congestione spurii.
 }
 
 }  // namespace xc::stream

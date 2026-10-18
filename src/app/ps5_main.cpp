@@ -13,6 +13,7 @@
 #include "app/stream_player.h"
 #include "app/stream_screen.h"
 #include "app/local_update.h"
+#include "app/screenshot.h"
 #include "app/updater.h"
 #include "display/display.h"
 #include "display/gpu.h"
@@ -108,9 +109,11 @@ bool saveSettings(const ui::SettingsChoice& choice) {
         g_settings.deband = choice.deband;
         g_settings.upscaler = choice.upscaler;
         g_settings.highRefresh = choice.highRefresh;
+        g_settings.saveScreenshots = choice.saveScreenshots;
         g_settings.maxBitrateMbps = choice.maxBitrateMbps;
         g_settings.gameVolume = choice.gameVolume;
         g_settings.save(settingsPath());  // warns itself
+        shot::setEnabled(g_settings.saveScreenshots);
         XC_LOGI("settings saved: language %s, %s, region %s", code.c_str(), g_settings.resolution.c_str(),
                 g_settings.region.empty() ? "auto" : g_settings.region.c_str());
     }
@@ -211,16 +214,13 @@ int main(int argc, char** argv) {
         }
         XC_LOGI("favorites: %s", fav.empty() ? "(nessuno)" : fav.c_str());
     }
-    {
-        auto upd = applyLocalUpdate(XC_APP_VERSION);
-        if (upd.status == LocalUpdateStatus::Installed) {
-            platform::notify("Aggiornata, riapri", "update: riavvio non partito, chiusura");
-            platform::sleepMs(2000);
-            _exit(0);
-        } else if (upd.status == LocalUpdateStatus::Failed) {
-            XC_LOGW("update: avvio continuo (%s)", upd.detail.c_str());
-        }
-    }
+    // Solo scan all'avvio: il dialogo Sì/No parte dopo che la UI è pronta.
+    // Mai install automatica (01.41).
+    LocalUpdateResult bootLocalUpdate = findLocalUpdate(XC_APP_VERSION);
+    if (bootLocalUpdate.status == LocalUpdateStatus::Failed)
+        XC_LOGW("[UPDATE] scan avvio: %s", bootLocalUpdate.detail.c_str());
+    else if (bootLocalUpdate.status == LocalUpdateStatus::Available)
+        XC_LOGI("[UPDATE] avvio: trovato %s — dialogo dopo UI", bootLocalUpdate.version.c_str());
     sceSystemServiceHideSplashScreen();
     // 120 Hz output: param.json declares it (the console grants the mode only
     // then), and RADV asks for it when the param.json it reads says so. Off
@@ -273,11 +273,14 @@ int main(int argc, char** argv) {
         choice.deband = g_settings.deband;
         choice.upscaler = g_settings.upscaler;
         choice.highRefresh = g_settings.highRefresh;
+        choice.saveScreenshots = g_settings.saveScreenshots;
         choice.maxBitrateMbps = g_settings.maxBitrateMbps;
         choice.gameVolume = g_settings.gameVolume;
+        shot::setEnabled(g_settings.saveScreenshots);
         g_ui->setAllow1440(allow1440Locked());
         g_ui->setUpdateState(XC_APP_VERSION, {}, false);  // Settings shows this version before any check
         g_ui->setSettings(choice);
+        offerBootLocalUpdateIfAny(bootLocalUpdate);
         g_ui->setPerGameSettings(g_settings.perGame);
         applyControllerSettings();
         g_ui->setRegionLatency(g_settings.regionRtt);
@@ -477,6 +480,25 @@ int main(int argc, char** argv) {
 #endif
         prev = pad;
         autoplayNav(nav, menuCombo, now);
+        {
+            // Screenshot: L1+R1+□ 1 s (L3/R3 restano preferiti); auto-shot post-present.
+            ui::Screen sc = g_ui->screen();
+            const char* tag = "home";
+            bool streaming = sc == ui::Screen::Streaming;
+            switch (sc) {
+                case ui::Screen::Splash: tag = "loading"; break;
+                case ui::Screen::SignIn: tag = "signin"; break;
+                case ui::Screen::Home: tag = g_ui->updateOffered() ? "update" : "library"; break;
+                case ui::Screen::Details: tag = "details"; break;
+                case ui::Screen::Launching: tag = "connecting"; break;
+                case ui::Screen::Settings: tag = "settings"; break;
+                case ui::Screen::Streaming: tag = "stream"; break;
+                case ui::Screen::Error: tag = "loading"; break;
+                case ui::Screen::Updating: tag = "loading"; break;
+            }
+            bool inMenus = !streaming && !g_psMenu.load();
+            shot::pollMenu(pad.btnL1, pad.btnR1, pad.btnX, inMenus, streaming, tag);
+        }
         if (g_ui->screen() == ui::Screen::Streaming) {
             // Menu PS: niente update completo (il DC pieno poteva bloccare il
             // main). Restano heartbeat, pollLifecycle, pad neutro e RTCP —
@@ -627,6 +649,8 @@ int main(int argc, char** argv) {
                 if (lock.try_lock_for(std::chrono::milliseconds(4))) {
                     display::drawRgba(canvas.data());
                     display::present();
+                    // Copia sync del buffer flipato (UI+overlay), poi PNG async.
+                    shot::afterPresent();
                 }
             }
         } else {

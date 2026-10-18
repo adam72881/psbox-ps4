@@ -1,24 +1,34 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 RafaelNGP
 // Aggiornamento da /data/psbox/update/: un PSBox-PS4-*.pkg copiato via FTP.
-// Nessuna rete. Si controlla all'avvio e dal pulsante in Impostazioni.
+// Nessuna rete. All'avvio e da Impostazioni si propone un dialogo; l'install
+// parte solo con Sì. File I/O su /data/...; a BGFT si passa /user/data/...
+// (stesso file). Attesa fine task, poi exit. Mai UnInstall.
 #pragma once
 
 #include <string>
 
 namespace xc::app {
 
-enum class LocalUpdateStatus { None, Installed, Failed };
+enum class LocalUpdateStatus { None, Available, Installed, Failed };
 
 struct LocalUpdateResult {
     LocalUpdateStatus status = LocalUpdateStatus::None;
-    std::string version;  // la versione trovata, se c'è un pkg
-    std::string detail;   // riga già scritta nel log, per il toast
+    std::string version;   // versione del pkg (es. 1.0.44)
+    std::string path;      // path /data/... del pkg
+    std::string detail;    // toast / log
 };
 
-// `current` è XC_APP_VERSION ("1.0.29-ps4"). Se il pkg è più nuovo lo sposta
-// in /data/pkg, avvia BGFT (FORCE_UPDATE) o AppInstallPkg senza overwrite,
-// poi prova a riaprire. Non chiama PrepareOverwritePkg e non disinstalla.
-LocalUpdateResult applyLocalUpdate(const std::string& current);
+// Solo scan: nessuna installazione, nessun rename/unlink. Se c'è un pkg più
+// nuovo → Available (il chiamante mostra il dialogo Sì/No).
+LocalUpdateResult findLocalUpdate(const std::string& current);
+
+// Dopo Sì: BGFT FORCE_UPDATE con contentUrl /user/data/... sul file già in
+// /data/..., attende progress, unlink solo a OK, LoadExec("exit").
+LocalUpdateResult installLocalUpdate(const std::string& current);
+
+inline LocalUpdateResult applyLocalUpdate(const std::string& current) {
+    return installLocalUpdate(current);
+}
 
 }  // namespace xc::app

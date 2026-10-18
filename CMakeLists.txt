@@ -3,7 +3,7 @@
 # Port PS4: stesso nucleo di PSBox (auth, xCloud, WebRTC, UI). Il target
 # predefinito è OpenOrbis. cmake/openorbis.cmake imposta XCLOUD_PS4.
 cmake_minimum_required(VERSION 3.20)
-project(xcloud_ps4 VERSION 1.0.38 LANGUAGES C CXX)
+project(xcloud_ps4 VERSION 1.0.43 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -135,6 +135,7 @@ add_executable(psbox.elf
     src/app/ps5_main.cpp
     src/app/lifecycle.cpp
     src/app/local_update.cpp
+    src/app/screenshot.cpp
     src/app/crash_log.cpp
     src/app/worker.cpp
     src/app/stream_screen.cpp
@@ -156,7 +157,8 @@ add_executable(psbox.elf
 target_include_directories(psbox.elf PRIVATE
     third_party/moonlight-ps4/include
     third_party/moonlight-ps4/src
-    third_party/moonlight-ps4/src/audio)
+    third_party/moonlight-ps4/src/audio
+    extern/stb)
 target_compile_definitions(psbox.elf PRIVATE XCLOUD_PS4=1)
 target_compile_options(psbox.elf PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 # L'eboot deve restare nello stesso blocco da 64 KiB del pkg 01.21 (9764864).

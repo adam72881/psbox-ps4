@@ -2,7 +2,7 @@
 # Cancella solo i vecchi PSBox-PS4-*.pkg in /data/pkg (non tocca DiPlay_*).
 # Uso:
 #   powershell -ExecutionPolicy Bypass -File .\tools\ps4_deploy.ps1
-#   powershell -ExecutionPolicy Bypass -File .\tools\ps4_deploy.ps1 -Pkg .\dist\PSBox-PS4-01.38.pkg
+#   powershell -ExecutionPolicy Bypass -File .\tools\ps4_deploy.ps1 -Pkg .\dist\PSBox-PS4-01.30.pkg
 param(
     [string]$Ps4 = "192.168.1.19",
     [int]$Port = 2121,

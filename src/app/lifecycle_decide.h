@@ -36,6 +36,10 @@ struct LifeState {
     bool exitArmed = false;  // pausa PS: teardown pronto se arriva la chiusura
     bool statusDead = false;
     bool receiveDead = false;
+    // bg=1 continuo: dopo 300 ms in stream si rilasciano VideoOut/Audio
+    // (stile HB-Store) così Chiudi passa; bg=0 → resume.
+    uint64_t bgSinceMs = 0;
+    bool streamReleased = false;
 };
 
 struct LifeSample {
@@ -63,6 +67,8 @@ struct LifeResult {
     bool logClose = false;
     bool stopAll = false;
     bool stopReceive = false;
+    bool releaseStream = false;  // bg>300ms: stop decode + release VO/Audio
+    bool resumeStream = false;   // bg=0 dopo release
 };
 
 // Coda vuota: si continua a chiamare ReceiveEvent. 0x80A10004 = nessun
@@ -77,45 +83,29 @@ inline bool resumeEvent(int32_t t) {
 }
 inline bool shareEvent(int32_t t) { return t == static_cast<int32_t>(0x30000000); }
 
-// Terminazione SystemService / homebrew. Valori tipici; con menu su qualunque
-// evento non-resume/share è comunque Close (vedi sotto).
+// Enum Orbis SystemService: non esiste un evento «terminate/close».
+// 0x40010000* resta documentato per diagnostica; NON chiude l'app (01.39/01.40
+// su FW 11.52: IsAppSuspended torna 0x80A10009 e uccideva il processo al boot).
 inline bool terminateEvent(int32_t t) {
     auto u = static_cast<uint32_t>(t);
     if (u == 0x10000000u || u == 0x10000001u || u == 0x30000000u) return false;
-    if (u == 0x10000010u || u == 0x10000011u || u == 0x10000012u || u == 0x10000013u) return true;
-    if (u == 0x40010000u || u == 0x40010001u) return true;
+    if (u == 0x40010000u || u == 0x40010001u || u == 0x40010002u) return true;
     return false;
 }
 
-// Chiusura immediata da evento / messaggio / sospensione app.
-inline bool isCloseSignal(const LifeState& st, const LifeSample& s) {
-    if (s.appMsg) return true;
-    if (s.haveEvent && terminateEvent(s.eventType)) return true;
-    if (s.haveEvent && st.wasMenu && !resumeEvent(s.eventType) && !shareEvent(s.eventType)) return true;
-    if (s.appSus && !s.sysSus) return true;  // «Chiudi applicazione» senza overlay
-    // GetStatus fallisce mentre siamo nel menu PS: il sistema sta già
-    // smontando l'app (Chiudi senza evento in coda).
-    if (s.statusRc != 0 && (st.wasMenu || st.exitArmed)) return true;
-    return false;
-}
+// sceSystemServiceIsAppSuspended: solo un ritorno positivo = sospesa.
+// 0 = attiva. Negativo = SCE error (es. 0x80A10009 = -2136932343): ignorare.
+inline bool appSuspendedFromRc(int32_t rc) { return rc > 0; }
+
+// Nessun API SystemService/AppMessaging è un «Chiudi applicazione» affidabile.
+// Chiude solo Esci in-app o il kill del sistema (SIGKILL / soft-kill).
+inline bool isCloseSignal(const LifeState& /*st*/, const LifeSample& /*s*/) { return false; }
 
 inline LifeResult lifeStep(LifeState& st, const LifeSample& s) {
     LifeResult r;
     if (st.statusDead) return r;
 
-    // Prima la chiusura: un salto di tempo (≥5 s) non deve mascherare
-    // terminate/AppMessaging/appSus (bug: woke → ResumeRest).
-    if (isCloseSignal(st, s)) {
-        r.cmd = LifeCmd::Close;
-        r.logClose = true;
-        st.seen = true;
-        if (s.statusRc != 0) {
-            st.statusDead = true;
-            r.stopAll = true;
-        }
-        return r;
-    }
-
+    // GetStatus ko: spegne solo il polling status (niente dieNow).
     if (s.statusRc != 0) {
         st.statusDead = true;
         r.stopAll = true;
@@ -163,6 +153,11 @@ inline LifeResult lifeStep(LifeState& st, const LifeSample& s) {
         r.cmd = LifeCmd::ResumeMenu;
         r.logResume = true;
         st.exitArmed = false;
+        if (st.streamReleased) {
+            r.resumeStream = true;
+            st.streamReleased = false;
+        }
+        st.bgSinceMs = 0;
     }
     st.wasMenu = inMenu;
     st.seen = true;
