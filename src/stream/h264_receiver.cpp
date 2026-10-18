@@ -198,7 +198,7 @@ bool H264Receiver::resync(rtc::message_vector& out) {
         if (cur == packets_.end()) return false;  // the last frame isn't complete yet
         if (cur->first != s) {
             // A hole in this frame (lost for good, or not here yet): look on
-            from the hole for a later key frame instead of waiting for this
+            // from the hole for a later key frame instead of waiting for this
             // one, which was the freeze after a burst of loss.
             it = std::prev(cur);
             continue;

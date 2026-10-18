@@ -188,7 +188,7 @@ bool RtcpReporter::flushTwcc(uint64_t nowUs, const rtc::message_callback& send) 
     if (hits.empty()) return false;
 
     // Cap per feedback: in 01.35 count 222/314 → UDP ~MTU e "loss" enorme.
-    // Max 40 hit (≤100 ms a ~400 pkt/s) resta sotto ~400 B con mtu 1200.
+    // Max 40 hit (≥100 ms a ~400 pkt/s) resta sotto ~400 B con mtu 1200.
     constexpr int kMaxHits = 40;
     if (static_cast<int>(hits.size()) > kMaxHits)
         hits.erase(hits.begin(), hits.end() - kMaxHits);

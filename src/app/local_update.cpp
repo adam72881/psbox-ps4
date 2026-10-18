@@ -886,7 +886,7 @@ LocalUpdateResult applyLocalUpdate(const std::string& current) {
     // Non svuotare /data/pkg: se l'app muore a metà, il pkg resta per un
     // nuovo tentativo o per l'installazione a mano. Solo la cartella update.
     clearUpdateDir();
-    XC_LOGI("update: task avviato per %s, chiudo e riapre", pkgVerText(best).c_str());
+    XC_LOGI("update: task avviato per %s, chiudo e riapro", pkgVerText(best).c_str());
     platform::notify("Installazione in corso", "update: ShellCore installa, riapertura");
     platform::sleepMs(800);
     stampEnter("relaunch");

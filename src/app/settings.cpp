@@ -44,7 +44,7 @@ bool Settings::load(const std::string& path) {
     // "triggerRumble" (on/off) until the strength could be chosen.
     triggerStrength = (*j)["triggerRumble"].asBool(true) ? 2 : 0;
     triggerStrength = static_cast<int>(std::clamp<int64_t>((*j)["triggerStrength"].asInt(triggerStrength), 0, 4));
-    triggerHz = static_cast<int>(std::clamp<int64_t>((*j)["triggerHz"].asInt(triggerStrength), 0, 2));
+    triggerHz = static_cast<int>(std::clamp<int64_t>((*j)["triggerHz"].asInt(triggerHz), 0, 2));
     triggerResistance = static_cast<int>(std::clamp<int64_t>((*j)["triggerResistance"].asInt(0), 0, 3));
     triggerPulses = (*j)["triggerPulses"].asBool(false);
     circleConfirms = (*j)["circleConfirms"].asBool(circleConfirms);
