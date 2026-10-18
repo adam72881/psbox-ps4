@@ -24,7 +24,7 @@ Color playerColor(int index);
 // One pad, a DualSense `w` wide with its number `index + 1` below
 // (padIconHeight(w) in all): in the player's colour when connected, dim
 // when not. Its buttons are cut out in `background`, the colour behind it.
-void drawPadIcon(Canvas& c, the Font& font, int x, int y, int w, int index, bool connected, Color background);
+void drawPadIcon(Canvas& c, const Font& font, int x, int y, int w, int index, bool connected, Color background);
 int padIconHeight(int w);
 
 // The four side by side, `gap` apart; returns the width taken.
