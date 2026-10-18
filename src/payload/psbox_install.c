@@ -12,9 +12,10 @@
  *   - solo sceKernelLoadStartModule (dlsym, syscall 591)
  *   - buffer di notifica statico (niente 0xC30 sullo stack del binloader)
  *   - attesa che XCLD00001 non sia più in esecuzione
- *   - BGFT FORCE_UPDATE, poi sceAppInstUtilAppInstallPkg
+ *   - BGFT con l'utente in primo piano e i parametri di Itemzflow
  *   - _start non torna: nanosleep per sempre
  */
+#include "install_plan.h"
 typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
@@ -53,9 +54,6 @@ typedef long i64;
 #define NOTE_SIZE 0xC30
 #define NOTE_MSG 0x2d
 
-#define OPT_FORCE_UPDATE 0x8
-#define OPT_DISABLE_CDN 0x10000
-
 typedef i32 (*fn_dlsym)(i32, const char*, void*);
 typedef i32 (*fn_load)(const char*, u64, const void*, u32, void*, i32*);
 typedef i32 (*fn_notify)(i32, void*, u64, i32);
@@ -69,30 +67,14 @@ typedef i32 (*fn_prog)(i32, void*);
 typedef i32 (*fn_appid)(const char*);
 typedef i32 (*fn_user_init)(void*);
 typedef i32 (*fn_user)(i32*);
+typedef i32 (*fn_user_list)(void*);
+typedef i32 (*fn_prep)(const char*);
 typedef i32 (*fn_usleep)(u32);
 typedef i64 (*fn_lseek)(i32, i64, i32);
 
 typedef struct {
-    i32 userId;
-    i32 entitlementType;
-    const char* id;
-    const char* contentUrl;
-    const char* contentExUrl;
-    const char* contentName;
-    const char* iconPath;
-    const char* skuId;
-    i32 option;
-    const char* playgoScenarioId;
-    const char* releaseDate;
-    const char* packageType;
-    const char* packageSubType;
-    u64 packageSize;
-} BgftParam;
-
-typedef struct {
-    BgftParam param;
-    u32 slot;
-} BgftParamEx;
+    i32 priority;
+} UserInitParam;
 
 typedef struct {
     void* heap;
@@ -346,8 +328,93 @@ static u64 file_size(fn_lseek lseek_fn, const char* path) {
     return (u64)n;
 }
 
-static int bgft_install(fn_notify note, i32 bgft, i32 appinst, fn_void app_init, const char* pkg, u64 size,
-                        i32 user_id) {
+typedef struct {
+    fn_reg reg;
+    fn_i32 start;
+    fn_i32 start_int;
+    fn_prog prog;
+    fn_prep prep;
+    fn_usleep usleep;
+    fn_notify note;
+    int logged;
+} PayCtx;
+
+static i32 load_i32(const u8* p) {
+    return (i32)((u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24));
+}
+
+static u64 load_u64(const u8* p) {
+    u64 v = 0;
+    int i;
+    for (i = 0; i < 8; i++) v |= (u64)p[i] << (8 * i);
+    return v;
+}
+
+static int pay_reg(void* ctx, const XcBgftParamEx* ex, int* task) {
+    PayCtx* c = (PayCtx*)ctx;
+    i32 id = -1;
+    i32 rc;
+    *task = -1;
+    if (!c->reg || !ex) return -1;
+    rc = c->reg((void*)ex, &id);
+    *task = id;
+    step_rc(c->note, "PSBox: BGFT register", rc);
+    return rc;
+}
+
+static int pay_start(void* ctx, int task) {
+    PayCtx* c = (PayCtx*)ctx;
+    i32 rc = -1;
+    if (c->start) {
+        rc = c->start(task);
+        step_rc(c->note, "PSBox: BGFT start", rc);
+    }
+    if (rc != 0 && c->start_int) {
+        rc = c->start_int(task);
+        step_rc(c->note, "PSBox: BGFT start int", rc);
+    }
+    return rc;
+}
+
+static int pay_prog(void* ctx, int task, int* error_result, unsigned long* length, unsigned long* transferred) {
+    PayCtx* c = (PayCtx*)ctx;
+    u8 raw[128];
+    i32 pr;
+    zmem(raw, sizeof raw);
+    *error_result = 0;
+    *length = 0;
+    *transferred = 0;
+    if (!c->prog) return -1;
+    pr = c->prog(task, raw);
+    *error_result = load_i32(raw + 4);
+    *length = load_u64(raw + 8);
+    *transferred = load_u64(raw + 16);
+    c->logged++;
+    if ((c->logged % 4) == 1) step_rc(c->note, "PSBox: BGFT progress", pr);
+    if (*error_result != 0) step_rc(c->note, "PSBox: BGFT errore task", *error_result);
+    return pr;
+}
+
+static int pay_prep(void* ctx, const char* path) {
+    PayCtx* c = (PayCtx*)ctx;
+    i32 rc;
+    if (!c->prep) {
+        step(c->note, "PSBox: PrepareOverwrite assente, ritento il register");
+        return -1;
+    }
+    rc = c->prep(path);
+    step_rc(c->note, "PSBox: PrepareOverwrite", rc);
+    return rc;
+}
+
+static void pay_sleep(void* ctx, int ms) {
+    PayCtx* c = (PayCtx*)ctx;
+    if (ms < 0) ms = 0;
+    pause_ms(c->usleep, (u32)ms);
+}
+
+static int bgft_install(fn_notify note, i32 bgft, fn_void app_init, fn_prep prep, fn_usleep usleep, const char* pkg,
+                        u64 size, i32 user_id) {
     fn_initp bgft_init = 0;
     fn_initp bgft_init_int = 0;
     fn_reg reg = 0;
@@ -355,13 +422,14 @@ static int bgft_install(fn_notify note, i32 bgft, i32 appinst, fn_void app_init,
     fn_i32 start_int = 0;
     fn_prog prog = 0;
     BgftInit ip;
-    BgftParamEx ex;
-    char url_user[192];
-    char url_data[192];
+    PayCtx ctx;
+    XcDriveHooks hooks;
     void* heap;
-    i32 task = -1;
     i32 rc;
-    int i;
+    if (user_id <= 0) {
+        step(note, "PSBox: utente assente, BGFT non chiamato");
+        return XC_DRIVE_NO_USER;
+    }
     kdlsym(bgft, "sceBgftServiceInit", &bgft_init);
     kdlsym(bgft, "sceBgftServiceIntInit", &bgft_init_int);
     kdlsym(bgft, "sceBgftServiceIntDownloadRegisterTaskByStorageEx", &reg);
@@ -386,67 +454,35 @@ static int bgft_install(fn_notify note, i32 bgft, i32 appinst, fn_void app_init,
     rc = -1;
     if (bgft_init) rc = bgft_init(&ip);
     step_rc(note, "PSBox: BGFT init", rc);
-    if (rc != 0 && bgft_init_int) {
+    /* 0x80990001 = già inizializzato, come 0. */
+    if (rc != 0 && (u32)rc != 0x80990001u && bgft_init_int) {
         rc = bgft_init_int(&ip);
         step_rc(note, "PSBox: BGFT int init", rc);
     }
-    scopy(url_user, "/user", sizeof url_user);
-    {
-        u64 n = slen(url_user);
-        scopy(url_user + n, pkg, sizeof url_user - n);
+    if (rc != 0 && (u32)rc != 0x80990001u) {
+        step(note, "PSBox: BGFT init rifiutato");
+        return -1;
     }
-    scopy(url_data, pkg, sizeof url_data);
-    zmem(&ex, sizeof ex);
-    ex.param.userId = user_id;
-    ex.param.entitlementType = 5;
-    ex.param.id = CONTENT_ID;
-    ex.param.contentUrl = url_user;
-    ex.param.contentName = "PSCloud";
-    ex.param.option = OPT_DISABLE_CDN | OPT_FORCE_UPDATE;
-    ex.param.packageSize = size;
-    ex.slot = 0;
-    plog(url_user);
-    rc = reg(&ex, &task);
-    step_rc(note, "PSBox: BGFT register /user", rc);
-    if (rc != 0) {
-        ex.param.contentUrl = url_data;
-        plog(url_data);
-        rc = reg(&ex, &task);
-        step_rc(note, "PSBox: BGFT register /data", rc);
-    }
-    if (rc != 0 || task < 0) return -1;
-    if (start) {
-        rc = start(task);
-        step_rc(note, "PSBox: BGFT start", rc);
-    } else {
-        rc = -1;
-    }
-    if (rc != 0 && start_int) {
-        rc = start_int(task);
-        step_rc(note, "PSBox: BGFT start int", rc);
-    }
-    if (rc != 0) return -1;
-    for (i = 0; i < 120; i++) {
-        u8 raw[128];
-        i32 pr;
-        u64 transferred = 0;
-        u64 length = 0;
-        zmem(raw, sizeof raw);
-        pr = prog ? prog(task, raw) : -1;
-        if (prog) {
-            transferred = *(u64*)(raw + 16);
-            length = *(u64*)(raw + 8);
-        }
-        if ((i % 4) == 0) step_rc(note, "PSBox: BGFT progress", pr);
-        if (length > 0 && transferred >= length) {
-            step(note, "PSBox: BGFT completo");
-            return 0;
-        }
-        pause_ms(0, 1000);
-    }
-    step(note, "PSBox: BGFT timeout");
-    (void)appinst;
-    return -1;
+    zmem(&ctx, sizeof ctx);
+    ctx.reg = reg;
+    ctx.start = start;
+    ctx.start_int = start_int;
+    ctx.prog = prog;
+    ctx.prep = prep;
+    ctx.usleep = usleep;
+    ctx.note = note;
+    zmem(&hooks, sizeof hooks);
+    hooks.reg = pay_reg;
+    hooks.start = pay_start;
+    hooks.prog = pay_prog;
+    hooks.prep = pay_prep;
+    hooks.sleep_ms = pay_sleep;
+    hooks.ctx = &ctx;
+    hooks.max_polls = 600;
+    plog(pkg);
+    rc = xc_drive_install(&hooks, user_id, pkg, (unsigned long)size);
+    if (rc == 0) step(note, "PSBox: BGFT completo");
+    return rc;
 }
 
 __attribute__((section(".text.start"), used)) void _start(u64 arg) {
@@ -454,20 +490,29 @@ __attribute__((section(".text.start"), used)) void _start(u64 arg) {
     fn_load load = 0;
     fn_void app_init = 0;
     fn_exists exists = 0;
-    fn_install install = 0;
+    fn_prep prep = 0;
     fn_appid get_app = 0;
     fn_user_init user_init = 0;
-    fn_user user_get = 0;
+    fn_user get_fg = 0;
+    fn_user get_ini = 0;
+    fn_user_list get_list = 0;
     fn_usleep usleep = 0;
     fn_lseek lseek_fn = 0;
     i32 appinst = -1;
     i32 bgft = -1;
     i32 lnc = -1;
     i32 user = -1;
-    i32 user_id = 0;
+    i32 user_id = -1;
+    i32 fg_id = -1;
+    i32 ini_id = -1;
+    i32 fg_rc = -1;
+    i32 ini_rc = -1;
+    i32 list_rc = -1;
+    i32 login_id[4];
     i32 rc;
     i64 lockfd;
     char pkg[160];
+    char url_user[192];
     char ver[16];
     char done[64];
     u64 size;
@@ -512,7 +557,7 @@ __attribute__((section(".text.start"), used)) void _start(u64 arg) {
     if (appinst > 0) {
         kdlsym(appinst, "sceAppInstUtilInitialize", &app_init);
         kdlsym(appinst, "sceAppInstUtilAppExists", &exists);
-        kdlsym(appinst, "sceAppInstUtilAppInstallPkg", &install);
+        kdlsym(appinst, "sceAppInstUtilAppPrepareOverwritePkg", &prep);
     }
     if (lnc > 0) kdlsym(lnc, "sceLncUtilGetAppId", &get_app);
 
@@ -548,28 +593,52 @@ __attribute__((section(".text.start"), used)) void _start(u64 arg) {
                     "/system/priv/lib/libSceUserService.sprx");
     if (user > 0) {
         kdlsym(user, "sceUserServiceInitialize", &user_init);
-        kdlsym(user, "sceUserServiceGetInitialUser", &user_get);
+        kdlsym(user, "sceUserServiceGetForegroundUser", &get_fg);
+        kdlsym(user, "sceUserServiceGetInitialUser", &get_ini);
+        kdlsym(user, "sceUserServiceGetLoginUserIdList", &get_list);
     }
-    if (user_init) step_rc(notify_fn, "PSBox: user init", user_init(0));
-    if (user_get) {
-        user_get(&user_id);
-        step_rc(notify_fn, "PSBox: user", user_id);
+    if (user_init) {
+        UserInitParam up;
+        up.priority = 700;
+        rc = user_init(&up);
+        step_rc(notify_fn, "PSBox: user init", rc);
+        /* 0x80960003 = già inizializzato: si legge lo stesso l'utente. */
+        (void)xc_user_init_ok(rc);
     }
+    zmem(login_id, sizeof login_id);
+    if (get_fg) {
+        fg_rc = get_fg(&fg_id);
+        step_rc(notify_fn, "PSBox: foreground rc", fg_rc);
+        step_rc(notify_fn, "PSBox: foreground", fg_id);
+    }
+    if (get_ini) {
+        ini_rc = get_ini(&ini_id);
+        step_rc(notify_fn, "PSBox: initial rc", ini_rc);
+        step_rc(notify_fn, "PSBox: initial", ini_id);
+    }
+    if (get_list) {
+        list_rc = get_list(login_id);
+        step_rc(notify_fn, "PSBox: login rc", list_rc);
+    }
+    user_id = xc_pick_user(fg_rc, fg_id, ini_rc, ini_id, login_id, 4);
+    step_rc(notify_fn, "PSBox: user", user_id);
 
     rc = -1;
-    if (bgft > 0) rc = bgft_install(notify_fn, bgft, appinst, app_init, pkg, size, user_id);
-    if (rc != 0 && install) {
-        int attempt;
-        step(notify_fn, "PSBox: fallback AppInstallPkg");
-        for (attempt = 0; attempt < 8; attempt++) {
-            rc = install(pkg, 0);
-            step_rc(notify_fn, "PSBox: AppInstallPkg", rc);
-            if (rc == 0) break;
-            pause_ms(usleep, 2000);
+    if (bgft > 0 && user_id > 0) {
+        rc = bgft_install(notify_fn, bgft, app_init, prep, usleep, pkg, size, user_id);
+        if (rc != 0 && rc != XC_DRIVE_NO_USER && rc != XC_DRIVE_STARTED_FAIL && rc != XC_DRIVE_TIMEOUT) {
+            scopy(url_user, "/user", sizeof url_user);
+            {
+                u64 n = slen(url_user);
+                scopy(url_user + n, pkg, sizeof url_user - n);
+            }
+            step(notify_fn, "PSBox: ritento BGFT sul path /user");
+            rc = bgft_install(notify_fn, bgft, app_init, prep, usleep, url_user, size, user_id);
         }
     }
     if (rc != 0) {
-        step(notify_fn, "PSBox: installazione rifiutata, usa Package Installer");
+        if (rc == XC_DRIVE_TIMEOUT) step(notify_fn, "PSBox: BGFT timeout, pkg lasciato in /data/pkg");
+        else step(notify_fn, "PSBox: BGFT non installato, pkg lasciato in /data/pkg");
         sc(SYS_unlink, (i64)LOCK_PATH, 0, 0, 0, 0, 0);
         park(usleep);
     }

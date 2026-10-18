@@ -190,13 +190,17 @@ bool acquireBuffer(bool wait = true) {
 }
 }  // namespace
 
-void present() {
-    if (gpu::ready()) return gpu::present();
-    if (g_videoHandle < 0 || !g_mappedMemory) return;
+bool present() {
+    if (gpu::ready()) {
+        gpu::present();
+        return true;
+    }
+    if (g_videoHandle < 0 || !g_mappedMemory) return false;
     uint8_t* base = static_cast<uint8_t*>(g_mappedMemory) + (g_currentBuffer * kFrameBytes);
     flushRange(base, kUsedBytes);
     g_bufferMarker[g_currentBuffer] = ++g_flipMarker;
     sceVideoOutSubmitFlip(g_videoHandle, g_currentBuffer, 1, g_flipMarker);
+    return true;
 }
 
 namespace {

@@ -3,7 +3,7 @@
 # Port PS4: stesso nucleo di PSBox (auth, xCloud, WebRTC, UI). Il target
 # predefinito è OpenOrbis. cmake/openorbis.cmake imposta XCLOUD_PS4.
 cmake_minimum_required(VERSION 3.20)
-project(xcloud_ps4 VERSION 1.0.47 LANGUAGES C CXX)
+project(xcloud_ps4 VERSION 1.0.49 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -137,6 +137,7 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
     COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/embed_payload.sh ${XC_PAYLOAD_H}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/payload/psbox_install.c
+            ${CMAKE_SOURCE_DIR}/src/payload/install_plan.h
             ${CMAKE_SOURCE_DIR}/src/payload/payload.ld
             ${CMAKE_SOURCE_DIR}/scripts/embed_payload.sh
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}

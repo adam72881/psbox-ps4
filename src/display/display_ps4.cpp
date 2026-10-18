@@ -7,6 +7,7 @@
 // di Moonlight-ps4, nv12_to_bgra). Lo stub OpenOrbis di sceGnmFlushGarlic è
 // un jmp infinito: il simbolo si prende dallo SPRX, come AddBufferYccPrivilege.
 #include "display/display.h"
+#include "display/flip_sched.h"
 #include "display/gpu.h"
 #include "platform/platform.h"
 #include "util/log.h"
@@ -66,6 +67,21 @@ bool g_bound = false;
 bool g_yccFailed = true;
 int g_flipMode = 1;  // VSYNC; si prova anche HSYNC/0 al primo present
 bool g_flipProbed = false;
+// Ultimi indici dati a SubmitFlip, il più recente in [0]. La coda ne tiene 2:
+// currentBuffer == -1 non basta a sapere quali sono ancora in volo.
+int g_submitHist[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+int g_submitCount = 0;
+
+void noteSubmit(int idx) {
+    for (int i = 7; i > 0; --i) g_submitHist[i] = g_submitHist[i - 1];
+    g_submitHist[0] = idx;
+    if (g_submitCount < 8) ++g_submitCount;
+}
+
+void clearSubmitHist() {
+    g_submitCount = 0;
+    for (int i = 0; i < 8; ++i) g_submitHist[i] = -1;
+}
 
 struct Dmem {
     void* base = nullptr;
@@ -158,13 +174,10 @@ bool pickFree(bool block) {
         OrbisVideoOutFlipStatus st{};
         if (sceVideoOutGetFlipStatus(g_video, &st) != 0) return true;
         g_shownArg = st.flipArg;
-        const int shown = st.currentBuffer;
-        for (int n = 0; n < g_bufCount; ++n) {
-            int i = (g_index + n) % g_bufCount;
-            if (i != shown || st.numFlipPending == 0) {
-                g_index = i;
-                return true;
-            }
+        int idx = flipPick(g_bufCount, g_index, st.currentBuffer, st.numFlipPending, g_submitHist, g_submitCount);
+        if (idx >= 0) {
+            g_index = idx;
+            return true;
         }
         if (!block) return false;
         sceKernelUsleep(2000);
@@ -212,6 +225,7 @@ bool reopenVideo() {
     }
     sceVideoOutSetFlipRate(g_video, ORBIS_VIDEO_OUT_FLIP_60HZ);
     g_bound = false;
+    clearSubmitHist();
     XC_LOGI("video: porta nuova handle %d", g_video);
     return true;
 }
@@ -799,11 +813,11 @@ std::timed_mutex& frameMutex() {
 
 bool streamOwnsDisplay() { return g_scan == Scan::Ycc || g_scan == Scan::Bgra; }
 
-void present() {
-    if (g_holdFlips.load(std::memory_order_relaxed) || xc::app::g_psMenu.load(std::memory_order_relaxed)) return;
-    if (g_video < 0 || xc::app::g_appStopping.load(std::memory_order_relaxed)) return;
+bool present() {
+    if (g_holdFlips.load(std::memory_order_relaxed) || xc::app::g_psMenu.load(std::memory_order_relaxed)) return false;
+    if (g_video < 0 || xc::app::g_appStopping.load(std::memory_order_relaxed)) return false;
     flushScanout();
-    if (g_video < 0 || xc::app::g_appStopping.load(std::memory_order_relaxed)) return;
+    if (g_video < 0 || xc::app::g_appStopping.load(std::memory_order_relaxed)) return false;
     ++g_presentId;
     const int flipIdx = g_index;
     auto flip = [&](int mode) {
@@ -827,20 +841,26 @@ void present() {
             }
         }
         if (!g_flipProbed) {
-            XC_LOGE("video: SubmitFlip fallito su tutti i mode");
-            g_video = -1;
-            return;
+            XC_LOGE("video: SubmitFlip fallito su tutti i mode, porta tenuta");
+            return false;
         }
     } else {
         rc = flip(g_flipMode);
-        if (rc < 0) {
-            g_video = -1;
-            return;
+        int alive = 1;
+        if (!flipOnSubmit(rc, &alive)) {
+            static int logged = 0;
+            if (logged < 4) {
+                ++logged;
+                XC_LOGE("video: SubmitFlip 0x%08x, porta tenuta", static_cast<unsigned>(rc));
+            }
+            return false;
         }
     }
+    noteSubmit(flipIdx);
     g_lastFlipped = flipIdx;
     g_shownArg = static_cast<int64_t>(g_presentId);
     g_index = (g_index + 1) % g_bufCount;
+    return true;
 }
 
 void drawRgba(const uint32_t* pixels) {

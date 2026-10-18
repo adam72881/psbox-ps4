@@ -391,20 +391,10 @@ struct StreamPlayer::Impl {
             }
             ++decodedFrames;
             pictureSize = (static_cast<uint32_t>(w) << 16) | static_cast<uint32_t>(h);
-            // Come 01.35: ack subito dopo decode (coda → pumpFast), prima del
-            // blit: il report non aspetta il present.
-            {
-                stream::FrameMetadata meta;
-                meta.serverDataKey = frame.rtpTimestamp;
-                meta.firstPacketArrivalMs = frame.arrivalMs ? frame.arrivalMs : submittedMs;
-                meta.submittedMs = submittedMs;
-                meta.decodedMs = decodedMs;
-                meta.renderedMs = stream::clockMs();
-                if (auto s = current()) s->reportFrame(meta);
-            }
             const bool pausePresent = g_psMenu.load() || g_appStopping.load();
             uint64_t tDraw0 = platform::nowUs();
             bool drawn = false;
+            bool shown = false;
             if (!pausePresent) {
                 std::unique_lock<std::timed_mutex> lock(display::frameMutex(), std::defer_lock);
                 if (lock.try_lock_for(std::chrono::milliseconds(4))) {
@@ -426,8 +416,17 @@ struct StreamPlayer::Impl {
                         loggedBlit = true;
                         XC_LOGI("video: primo blit %s", drawn ? "ok" : "fallito");
                     }
-                    if (drawn) {
-                        display::present();
+                    if (drawn) shown = display::present();
+                    // Ack solo del frame che è entrato in coda, con l'ora del
+                    // present. Un flip rifiutato non è un frame visto.
+                    if (shown) {
+                        stream::FrameMetadata meta;
+                        meta.serverDataKey = frame.rtpTimestamp;
+                        meta.firstPacketArrivalMs = frame.arrivalMs ? frame.arrivalMs : submittedMs;
+                        meta.submittedMs = submittedMs;
+                        meta.decodedMs = decodedMs;
+                        meta.renderedMs = stream::clockMs();
+                        if (auto s = current()) s->reportFrame(meta);
                         if (decodedFrames == 1) {
                             XC_LOGI("primo frame Videodec2 presentato %dx%d", w, h);
                             if (shot::enabled()) {
@@ -436,17 +435,14 @@ struct StreamPlayer::Impl {
                             }
                         }
                     }
-                } else {
-                    ++lateFrames;
-                    ++lateAtSec;
                 }
             }
             uint64_t tDraw1 = platform::nowUs();
             const uint64_t presentUs = tDraw1 - tDraw0;
             // Scanout BGRA720: dst fissa; src è la res xCloud (1080HQ).
             constexpr int kDstW = 1280, kDstH = 720;
-            trace::notePresent(decodedFrames, w, h, kDstW, kDstH, presentUs, drawn && !pausePresent);
-            if (drawn) {
+            trace::notePresent(decodedFrames, w, h, kDstW, kDstH, presentUs, shown && !pausePresent);
+            if (shown) {
                 drawUs += presentUs;
                 ++drawCalls;
                 ++presentedAtSec;
@@ -638,7 +634,10 @@ struct StreamPlayer::Impl {
                 ++lateFrames;
                 continue;
             }
-            display::present();
+            if (!display::present()) {
+                ++lateFrames;
+                continue;
+            }
             uint64_t t3 = platform::nowUs();
             // Display latency: network arrival to the TV, once the GPU says
             // the frame is on the screen (a frame or so later).

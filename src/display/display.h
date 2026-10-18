@@ -30,7 +30,9 @@ void resumeAfterRest();
 // timed_mutex: il main non deve mai bloccarsi in attesa del video
 // (ICE/STUN e heartbeat restano vivi anche se un flip è lento).
 std::timed_mutex& frameMutex();
-void present();
+// False se il flip non è entrato in coda (menu, coda piena, porta chiusa).
+// La porta resta aperta: il chiamante non manda l'ack di un frame non visto.
+bool present();
 // Vero se lo stream ha preso la porta VideoOut (YCbCr o BGRA): la UI
 // non deve riaprire RGBA sopra.
 bool streamOwnsDisplay();
