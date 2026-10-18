@@ -24,6 +24,6 @@ void drawAppIcon(Canvas& c, const Fonts& fonts);
 // `launch` false: pic0, the selected-app background (mark on the right, the
 // left kept dark for the Shell's title and Play button);
 // `launch` true: pic1, the launch transition (mark and name centred).
-void drawHomeArt(Canvas& c, the Fonts& fonts, bool launch);
+void drawHomeArt(Canvas& c, const Fonts& fonts, bool launch);
 
 }  // namespace xc::ui
