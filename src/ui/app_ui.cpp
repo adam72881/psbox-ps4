@@ -3,6 +3,7 @@
 #include "ui/app_ui.h"
 
 #include "input/tuning.h"
+#include "ui/search_match.h"
 #include "xcloud/catalog.h"
 #include "ui/accent_color.h"
 
@@ -928,17 +929,43 @@ void AppUi::runSearch() {
     std::vector<const GameTile*> candidates;
     std::set<std::string> seenId;
     auto pushPool = [&](const std::vector<GameTile>& pool) {
-        for (const auto& t : pool)
-            if (seenId.insert(t.productId).second) candidates.push_back(&t);
+        for (const auto& t : pool) {
+            // Product id vuoto non deve far collassare tutti i giochi senza id.
+            std::string key = !t.productId.empty() ? t.productId : t.titleId + "\n" + t.name;
+            if (key.empty()) continue;
+            if (seenId.insert(key).second) candidates.push_back(&t);
+        }
     };
     pushPool(tab_ == Tab::GamePass ? gamePassPool_ : libraryPool_);
-    // A typed name is looked up on both tabs and on the rows (the free row
-    // included). Filters with no words stay on this tab.
+    // A typed name is looked up on both tabs, on the rows, and on the grids
+    // (Your games / to buy / hidden). Filters with no words stay on this tab.
+    // Le griglie vanno prima dei pool: il nome vero di Fortnite batte un pack.
     if (!words.empty()) {
+        std::vector<const GameTile*> typedFirst;
+        auto takeFirst = [&](const std::vector<GameTile>& pool) {
+            for (const auto& t : pool) typedFirst.push_back(&t);
+        };
+        // Ricostruisce i candidati mettendo le griglie davanti ai pool già inseriti.
+        std::vector<const GameTile*> pools = std::move(candidates);
+        candidates.clear();
+        seenId.clear();
+        takeFirst(owned_);
+        takeFirst(purchasable_);
+        takeFirst(hiddenTiles_);
+        for (const GameTile* t : typedFirst) {
+            std::string key = !t->productId.empty() ? t->productId : t->titleId + "\n" + t->name;
+            if (!key.empty() && seenId.insert(key).second) candidates.push_back(t);
+        }
+        for (const GameTile* t : pools) {
+            std::string key = !t->productId.empty() ? t->productId : t->titleId + "\n" + t->name;
+            if (!key.empty() && seenId.insert(key).second) candidates.push_back(t);
+        }
         pushPool(tab_ == Tab::GamePass ? libraryPool_ : gamePassPool_);
         for (const auto& row : rows_)
-            for (const auto& t : row.tiles)
-                if (seenId.insert(t.productId).second) candidates.push_back(&t);
+            for (const auto& t : row.tiles) {
+                std::string key = !t.productId.empty() ? t.productId : t.titleId + "\n" + t.name;
+                if (!key.empty() && seenId.insert(key).second) candidates.push_back(&t);
+            }
     }
     for (const GameTile* tp : candidates) {
         const GameTile& t = *tp;
@@ -973,15 +1000,10 @@ void AppUi::runSearch() {
             if (filterCheapest_ && !t.purchasable) continue;
         }
         std::string name = fold(t.name);
-        std::string idFold = fold(t.titleId);
+        std::string hay = searchHaystack(t.name, t.titleId, t.productId);
         int score = 0;
         if (!words.empty()) {
-            bool all = true;
-            for (const auto& w : words)
-                if (name.find(w) == std::string::npos && idFold.find(w) == std::string::npos) all = false;
-            bool compactHit = withoutSpaces(name).find(compact) != std::string::npos ||
-                              withoutSpaces(idFold).find(compact) != std::string::npos;
-            if (!all && !compactHit) continue;
+            if (!searchMatches(hay, words, compact)) continue;
             // Starts with the query, then a word starting with it, then the rest.
             score = name.rfind(words[0], 0) == 0 ? 0 : name.find(" " + words[0]) != std::string::npos ? 1 : 2;
         }
@@ -1002,7 +1024,17 @@ void AppUi::runSearch() {
         return fold(a.tile->name) < fold(b.tile->name);
     });
     size_t max = words.empty() ? kMaxFilterResults : kMaxResults;
-    for (size_t i = 0; i < hits.size() && i < max; ++i) results_.push_back(*hits[i].tile);
+    for (size_t i = 0; i < hits.size() && i < max; ++i) {
+        GameTile shown = *hits[i].tile;
+        // Un pack più corto con title id FORTNITE resta cercabile come Fortnite.
+        if (isFortniteTile(shown.titleId, shown.productId, fold(shown.name)) &&
+            fold(shown.name).find("fortnite") == std::string::npos) {
+            shown.name = "Fortnite";
+            if (shown.titleId.empty()) shown.titleId = "FORTNITE";
+            if (shown.productId.empty()) shown.productId = "BT5P2X999VH2";
+        }
+        results_.push_back(std::move(shown));
+    }
 }
 
 void AppUi::showHome(const std::string& toast) {
@@ -3602,7 +3634,7 @@ void AppUi::drawUpdatePrompt(Canvas& c) {
     c.fillRect({panel.x + 8, panel.y + 12, panel.w, panel.h}, rgba(0, 0, 0, 120), 26);  // shadow
     c.fillRect(panel, kPanel, 24);
     c.strokeRect(panel, rgba(255, 255, 255, 50), 2, 24);
-    // Titolo = domanda con versione (IT: «È disponibile l'aggiornamento X. Vuoi installarlo?»).
+    // Titolo = «C'è un aggiornamento, vuoi installarlo?» (IT). Sì / No, mai da solo.
     auto title = fonts_.bold.wrap(trf(Str::UpdateAvailable, updateAvailable_), 36, kPanelW - 112, 3);
     for (size_t i = 0; i < title.size(); ++i)
         fonts_.bold.draw(c, title[i], panel.x + 56, panel.y + 44 + static_cast<int>(i) * 44, 36, kWhite);

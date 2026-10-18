@@ -385,6 +385,9 @@ void shutdown() {
     for (int i = 0; i < kMaxPads; ++i) closePad(g_pads[i], i);
 }
 
+void suspendForHome() {}
+void resumeFromHome() {}
+
 bool poll(ControllerState& out) { return pollPad(0, out); }
 
 bool pollPad(int index, ControllerState& out) {

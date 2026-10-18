@@ -39,7 +39,6 @@ typedef long i64;
 #define PKG_DIR "/data/pkg"
 #define DATA_DIR "/data/psbox"
 #define LOG_PATH "/data/psbox/payload.log"
-#define AUTOSTART_PATH "/data/psbox/autostart.txt"
 
 #define NOTE_SIZE 0xC30
 #define NOTE_MSG 0x2d
@@ -50,7 +49,6 @@ typedef i32 (*fn_sysmod)(u32);
 typedef i32 (*fn_notify)(i32, void*, u64, i32);
 typedef i32 (*fn_void)(void);
 typedef i32 (*fn_exists)(const char*, i32*);
-typedef i32 (*fn_title)(const char*);
 typedef i32 (*fn_install)(const char*, void*);
 typedef i32 (*fn_progress)(const char*, u32*);
 typedef i32 (*fn_user_init)(void*);
@@ -278,7 +276,6 @@ __attribute__((section(".text.start"), used)) void _start(u64 arg) {
     fn_sysmod sysmod = 0;
     fn_void app_init = 0;
     fn_exists exists = 0;
-    fn_title uninstall = 0;
     fn_install install = 0;
     fn_progress progress = 0;
     fn_void lnc_init = 0;
@@ -324,12 +321,11 @@ __attribute__((section(".text.start"), used)) void _start(u64 arg) {
 
     kdlsym(appinst, "sceAppInstUtilInitialize", &app_init);
     kdlsym(appinst, "sceAppInstUtilAppExists", &exists);
-    kdlsym(appinst, "sceAppInstUtilAppUnInstall", &uninstall);
     kdlsym(appinst, "sceAppInstUtilAppInstallPkg", &install);
     kdlsym(appinst, "sceAppInstUtilGetInstallProgress", &progress);
     kdlsym(lnc, "sceLncUtilInitialize", &lnc_init);
     kdlsym(lnc, "sceLncUtilLaunchApp", &launch);
-    if (!app_init || !exists || !uninstall || !install || !launch) {
+    if (!app_init || !exists || !install || !launch) {
         step(notify_fn, "PSBox: simboli mancanti");
         return;
     }
@@ -338,29 +334,11 @@ __attribute__((section(".text.start"), used)) void _start(u64 arg) {
     step_rc(notify_fn, "PSBox: init install", rc);
     if (lnc_init) step_rc(notify_fn, "PSBox: init lancio", lnc_init());
 
-    if (app_exists(exists, TITLE_ID) == 1) {
-        step(notify_fn, "PSBox: disinstallo");
-        rc = uninstall(TITLE_ID);
-        step_rc(notify_fn, "PSBox: uninstall", rc);
-        {
-            int i;
-            int gone = 0;
-            for (i = 0; i < 60; i++) {
-                if (app_exists(exists, TITLE_ID) == 0) {
-                    gone = 1;
-                    break;
-                }
-                pause_ms(usleep, 500);
-            }
-            if (!gone) {
-                step(notify_fn, "PSBox: disinstallazione incompleta");
-                return;
-            }
-        }
-        step(notify_fn, "PSBox: titolo assente");
-    } else {
-        step(notify_fn, "PSBox: nessuna versione installata");
-    }
+    /* AppInstallPkg mentre PSBox è ancora in esecuzione (01.43) ha tornato
+       0x80020012 e ha danneggiato l'app. Si aspetta l'uscita, poi si installa
+       il pkg già in /data/pkg. Niente uninstall e niente autostart. */
+    step(notify_fn, "PSBox: attendo la chiusura dell'app");
+    pause_ms(usleep, 8000);
 
     if (newest_pkg(notify_fn, pkg, sizeof pkg) != 0) {
         step(notify_fn, "PSBox: pkg assente in /data/pkg");
@@ -368,8 +346,16 @@ __attribute__((section(".text.start"), used)) void _start(u64 arg) {
     }
     plog(pkg);
     step(notify_fn, "PSBox: installo il pkg");
-    rc = install(pkg, 0);
-    step_rc(notify_fn, "PSBox: install", rc);
+    rc = -1;
+    {
+        int attempt;
+        for (attempt = 0; attempt < 12; attempt++) {
+            rc = install(pkg, 0);
+            step_rc(notify_fn, "PSBox: install", rc);
+            if (rc == 0) break;
+            pause_ms(usleep, 2000);
+        }
+    }
     if (rc != 0) {
         step(notify_fn, "PSBox: installazione rifiutata");
         return;
@@ -399,19 +385,6 @@ __attribute__((section(".text.start"), used)) void _start(u64 arg) {
         }
     }
     step(notify_fn, "PSBox: pkg installato");
-
-    {
-        i64 fd = sc(SYS_open, (i64)AUTOSTART_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0666, 0, 0, 0);
-        static const char game[] = "Fortnite\n";
-        if (fd >= 0) {
-            sc(SYS_write, fd, (i64)game, (i64)(sizeof game - 1), 0, 0, 0);
-            sc(SYS_fsync, fd, 0, 0, 0, 0, 0);
-            sc(SYS_close, fd, 0, 0, 0, 0, 0);
-            step(notify_fn, "PSBox: autostart Fortnite");
-        } else {
-            step_rc(notify_fn, "PSBox: autostart", fd);
-        }
-    }
 
     {
         i32 user = load_mod(notify_fn, load, sysmod, "libSceUserService.sprx",

@@ -3,7 +3,7 @@
 # Port PS4: stesso nucleo di PSBox (auth, xCloud, WebRTC, UI). Il target
 # predefinito è OpenOrbis. cmake/openorbis.cmake imposta XCLOUD_PS4.
 cmake_minimum_required(VERSION 3.20)
-project(xcloud_ps4 VERSION 1.0.43 LANGUAGES C CXX)
+project(xcloud_ps4 VERSION 1.0.45 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -131,7 +131,22 @@ add_library(GoldHEN_Hook STATIC third_party/goldhen_sdk/sdk_jailbreak.c)
 target_include_directories(GoldHEN_Hook PUBLIC third_party/goldhen_sdk)
 set_target_properties(GoldHEN_Hook PROPERTIES OUTPUT_NAME GoldHEN_Hook)
 
+set(XC_PAYLOAD_H "${CMAKE_BINARY_DIR}/generated/psbox_install_bin.h")
+add_custom_command(
+    OUTPUT ${XC_PAYLOAD_H}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/embed_payload.sh ${XC_PAYLOAD_H}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/payload/psbox_install.c
+            ${CMAKE_SOURCE_DIR}/src/payload/payload.ld
+            ${CMAKE_SOURCE_DIR}/scripts/embed_payload.sh
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Incorporo lo shellcode BinLoader"
+    VERBATIM
+)
+set_source_files_properties(${XC_PAYLOAD_H} PROPERTIES HEADER_FILE_ONLY TRUE GENERATED TRUE)
+
 add_executable(psbox.elf
+    ${XC_PAYLOAD_H}
     src/app/ps5_main.cpp
     src/app/lifecycle.cpp
     src/app/local_update.cpp
@@ -155,6 +170,7 @@ add_executable(psbox.elf
     third_party/moonlight-ps4/src/video/nv12_blit.c
 )
 target_include_directories(psbox.elf PRIVATE
+    ${CMAKE_BINARY_DIR}/generated
     third_party/moonlight-ps4/include
     third_party/moonlight-ps4/src
     third_party/moonlight-ps4/src/audio

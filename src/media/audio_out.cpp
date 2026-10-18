@@ -170,6 +170,36 @@ void audioAbortForExit() {
     // il processo fa _exit subito dopo.
 }
 
+namespace {
+bool g_audioHome = false;
+}
+
+void audioSuspendForHome() {
+#if defined(XCLOUD_PS5) || defined(XCLOUD_PS4)
+    if (!g_running.load() || g_audioHome) return;
+    int h = g_handle;
+    g_running = false;
+    g_handle = -1;
+    g_audioHome = true;
+    // Close sblocca sceAudioOutOutput (un grain, ~5 ms). Non si fa join qui:
+    // se il kill arriva durante la chiusura, il segnale fa _exit.
+    if (h >= 0) sceAudioOutClose(h);
+    XC_LOGI("audio: sospeso (menu PS)");
+#else
+    (void)g_audioHome;
+#endif
+}
+
+void audioResumeFromHome() {
+#if defined(XCLOUD_PS5) || defined(XCLOUD_PS4)
+    if (!g_audioHome) return;
+    g_audioHome = false;
+    if (g_thread.joinable()) g_thread.join();
+    XC_LOGI("audio: riapro dopo il menu PS");
+    audioStart();
+#endif
+}
+
 void audioPush(const float* interleaved, size_t frames) {
     if (!g_running) return;
     std::lock_guard<std::mutex> lock(g_mutex);

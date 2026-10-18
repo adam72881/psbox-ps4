@@ -537,6 +537,9 @@ bool streamOwnsDisplay() { return false; }
 bool init(bool) { return true; }
 void shutdown() {}
 void releaseForExit() {}
+void holdFlips(bool) {}
+void suspendForHome() {}
+void resumeFromHome() {}
 void resumeAfterRest() {}
 void present() {}
 bool drawYuv420(const uint8_t*, const uint8_t*, const uint8_t*, int, int, int, int, int, bool) { return true; }

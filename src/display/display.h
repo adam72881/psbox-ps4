@@ -18,6 +18,11 @@ bool init(bool preferGpu = true);
 void shutdown();
 // Chiusura dell'app: chiude VideoOut senza join sui thread di blit.
 void releaseForExit();
+// Menu PS (bg=1): niente SubmitFlip. Chiude la porta solo dal thread main,
+// così «Chiudi applicazione» non resta su un flip. Al ritorno si riapre.
+void holdFlips(bool on);
+void suspendForHome();
+void resumeFromHome();
 // Dopo il rest mode: chiude e riapre VideoOut sugli stessi buffer, senza
 // un'altra allocazione di memoria diretta.
 void resumeAfterRest();

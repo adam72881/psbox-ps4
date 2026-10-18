@@ -117,6 +117,30 @@ void shutdown() {
     for (auto& p : g_pads) closePad(p);
 }
 
+namespace {
+int32_t g_savedUser[kMaxPads];
+bool g_padsHome = false;
+}
+
+void suspendForHome() {
+    if (g_padsHome) return;
+    g_padsHome = true;
+    for (int i = 0; i < kMaxPads; ++i) {
+        g_savedUser[i] = g_pads[i].userId;
+        closePad(g_pads[i]);
+    }
+    XC_LOGI("pad: rilasciati (menu PS)");
+}
+
+void resumeFromHome() {
+    if (!g_padsHome) return;
+    g_padsHome = false;
+    for (int i = 0; i < kMaxPads; ++i) {
+        if (g_savedUser[i] >= 0) openPad(g_pads[i], g_savedUser[i]);
+    }
+    XC_LOGI("pad: riaperti");
+}
+
 void refreshPads() {
     OrbisUserServiceLoginUserIdList list{};
     for (auto& u : list.userId) u = ORBIS_USER_SERVICE_USER_ID_INVALID;

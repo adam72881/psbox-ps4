@@ -40,6 +40,7 @@ struct LifeState {
     // (stile HB-Store) così Chiudi passa; bg=0 → resume.
     uint64_t bgSinceMs = 0;
     bool streamReleased = false;
+    bool homeSuspended = false;  // bg=1: VideoOut/audio/pad già rilasciati
 };
 
 struct LifeSample {
@@ -69,6 +70,8 @@ struct LifeResult {
     bool stopReceive = false;
     bool releaseStream = false;  // bg>300ms: stop decode + release VO/Audio
     bool resumeStream = false;   // bg=0 dopo release
+    bool homeSuspend = false;    // bg=1: chiudi VideoOut/audio/pad, niente flip
+    bool homeResume = false;     // bg=0: riapri e riprendi
 };
 
 // Coda vuota: si continua a chiamare ReceiveEvent. 0x80A10004 = nessun

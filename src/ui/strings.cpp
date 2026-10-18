@@ -1376,7 +1376,7 @@ constexpr Column kItalian = {
     "Tasto di conferma",
     "Attivata",
     "Disattivata",
-    "È disponibile l'aggiornamento %s. Vuoi installarlo?",
+    "C'è un aggiornamento, vuoi installarlo?",
     "Controller",
     "Controller %s connesso",
     "Controller %s disconnesso",

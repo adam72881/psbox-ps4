@@ -17,6 +17,9 @@ bool audioStart();
 void audioStop();
 // Chiusura di sistema: chiude la porta senza join (evita hang → CE-34878-0).
 void audioAbortForExit();
+// Menu PS: chiude la porta senza restare nel kill. Al ritorno si riapre se era aperta.
+void audioSuspendForHome();
+void audioResumeFromHome();
 void audioSetRoute(AudioRoute route);
 AudioRoute audioRoute();
 // The game's volume: 1 as it comes, up to 2 (louder, clipped at full scale).

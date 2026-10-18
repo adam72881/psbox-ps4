@@ -328,6 +328,13 @@ int main(int argc, char** argv) {
     for (;;) {
         pollLifecycle();
         crash::heartbeat();
+        // Menu PS: niente pad, niente flip. pollLifecycle ha già sospeso o
+        // riaperto VideoOut/audio/pad. Il tasto PS non esce; si esce solo
+        // con Chiudi (il segnale fa _exit, senza join).
+        if (g_psMenu.load() && !g_appStopping.load()) {
+            platform::sleepMs(40);
+            continue;
+        }
         if (ui::Screen sc = g_ui->screen(); sc != stageScreen) {
             // What the app is doing, for a crash marker (the worker names
             // the stream itself).

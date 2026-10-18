@@ -106,6 +106,17 @@ int pairVersion(const xcloud::Product& p) {
 // Editions of one game ("Forza Horizon 5", "... Standard Edition") are
 // separate products that start the same cloud title: keep one, the shortest
 // name, where the first one was.
+bool preferTile(const ui::GameTile& cur, const ui::GameTile& nxt) {
+    // Fortnite: il product id del gioco batte un pack più corto con lo stesso
+    // title id (altrimenti la ricerca tiene "OG" e perde "Fortnite").
+    auto canon = [](const ui::GameTile& t) {
+        return t.productId == "BT5P2X999VH2" || t.name == "Fortnite" || t.name == "fortnite";
+    };
+    bool cc = canon(cur), nc = canon(nxt);
+    if (nc != cc) return nc;
+    return nxt.name.size() < cur.name.size();
+}
+
 void dedupeByTitle(std::vector<ui::GameTile>& tiles) {
     std::map<std::string, size_t> first;
     std::vector<ui::GameTile> out;
@@ -114,7 +125,7 @@ void dedupeByTitle(std::vector<ui::GameTile>& tiles) {
         if (it == first.end()) {
             first[t.titleId] = out.size();
             out.push_back(std::move(t));
-        } else if (t.name.size() < out[it->second].name.size()) {
+        } else if (preferTile(out[it->second], t)) {
             out[it->second] = std::move(t);
         }
     }
@@ -143,7 +154,7 @@ ui::GameTile Library::tile(const std::string& productId, const std::string& titl
     auto it = products_.find(productId);
     if (it == products_.end()) return t;
     const xcloud::Product& p = it->second;
-    t.productId = p.productId;
+    t.productId = p.productId.empty() ? productId : p.productId;
     t.titleId = titleId.empty() ? p.xcloudTitleId : titleId;
     if (t.titleId.empty()) t.titleId = cloudId(productId, &p);
     t.name = p.title.empty() ? t.titleId : p.title;

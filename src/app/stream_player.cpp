@@ -293,6 +293,11 @@ struct StreamPlayer::Impl {
             if (g_appStopping.load()) break;
             if (g_psMenu.load()) {
                 crash::videoHeartbeat();
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    frames.clear();
+                }
+                platform::sleepMs(40);
                 continue;
             }
             // Dopo Reset: niente Decode finché non arriva un IDR (evita 0x811d0303).

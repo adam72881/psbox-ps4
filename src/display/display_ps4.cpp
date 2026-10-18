@@ -16,6 +16,7 @@
 
 namespace xc::app {
 extern std::atomic<bool> g_appStopping;
+extern std::atomic<bool> g_psMenu;
 }
 #include <chrono>
 #include <condition_variable>
@@ -30,6 +31,9 @@ extern std::atomic<bool> g_appStopping;
 #include <orbis/libkernel.h>
 
 namespace xc::display {
+
+std::atomic<bool> g_holdFlips{false};
+bool g_homeSuspended = false;
 
 namespace {
 // 4 buffer come AJ-GFN: con 2, pending+shown lasciava un solo slot libero e
@@ -742,10 +746,43 @@ void releaseForExit() {
     // Niente mutex bloccante, niente sceVideoOutClose: in chiusura di
     // sistema Close resta appeso → CE-34878-0. Si invalida l'handle; i
     // draw vedono g_video < 0. Il kernel ripulisce al _exit.
+    g_holdFlips.store(true);
     g_blitStop = true;
     g_blitCv.notify_all();
     g_video = -1;
     g_bound = false;
+}
+
+void holdFlips(bool on) { g_holdFlips.store(on); }
+
+void suspendForHome() {
+    // Dal thread main, dopo che present() ha visto il flag e non è più in
+    // SubmitFlip. Close qui (menu PS, non il kill) libera il bus: il sistema
+    // può sospendere e poi chiudere senza marcare l'app danneggiata.
+    g_holdFlips.store(true);
+    if (g_homeSuspended || xc::app::g_appStopping.load()) return;
+    g_homeSuspended = true;
+    drainFlips();
+    if (g_video >= 0) {
+        sceVideoOutUnregisterBuffers(g_video, 0);
+        int rc = sceVideoOutClose(g_video);
+        XC_LOGI("video: porta chiusa per il menu PS 0x%08x", static_cast<unsigned>(rc));
+        g_video = -1;
+    }
+    g_bound = false;
+}
+
+void resumeFromHome() {
+    if (!g_homeSuspended && g_video >= 0) {
+        g_holdFlips.store(false);
+        return;
+    }
+    g_homeSuspended = false;
+    g_holdFlips.store(false);
+    Scan keep = (g_scan == Scan::Ycc || g_scan == Scan::Bgra) ? g_scan : Scan::Ui;
+    XC_LOGI("video: riapro dopo il menu PS");
+    if (!bindScan(keep)) XC_LOGE("video: ripresa dal menu PS fallita");
+    else XC_LOGI("video: ripreso dopo il menu PS");
 }
 
 void resumeAfterRest() {
@@ -763,6 +800,7 @@ std::timed_mutex& frameMutex() {
 bool streamOwnsDisplay() { return g_scan == Scan::Ycc || g_scan == Scan::Bgra; }
 
 void present() {
+    if (g_holdFlips.load(std::memory_order_relaxed) || xc::app::g_psMenu.load(std::memory_order_relaxed)) return;
     if (g_video < 0 || xc::app::g_appStopping.load(std::memory_order_relaxed)) return;
     flushScanout();
     if (g_video < 0 || xc::app::g_appStopping.load(std::memory_order_relaxed)) return;
@@ -806,6 +844,7 @@ void present() {
 }
 
 void drawRgba(const uint32_t* pixels) {
+    if (g_holdFlips.load(std::memory_order_relaxed) || xc::app::g_psMenu.load(std::memory_order_relaxed)) return;
     if (!pixels || !g_fb[0] || xc::app::g_appStopping.load(std::memory_order_relaxed)) return;
     // Lo stream ha la porta: non si riapre RGBA (era la doppia open / steal).
     if (streamOwnsDisplay()) return;
@@ -819,6 +858,7 @@ void drawRgba(const uint32_t* pixels) {
 bool drawYuv420(const uint8_t*, const uint8_t*, const uint8_t*, int, int, int, int, int, bool) { return false; }
 
 bool drawNv12(const uint8_t* nv12, int pitch, int width, int height, bool wait) {
+    if (g_holdFlips.load(std::memory_order_relaxed) || xc::app::g_psMenu.load(std::memory_order_relaxed)) return false;
     if (!nv12 || width < 2 || height < 2 || pitch < width || !g_fb[0]) return false;
     if (xc::app::g_appStopping.load(std::memory_order_relaxed) || g_video < 0) return false;
     if (g_scan != Scan::Ycc && g_scan != Scan::Bgra) {

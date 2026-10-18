@@ -304,6 +304,26 @@ void applyLifeResult(const LifeResult& step) {
         XC_LOGI("exit: chiusura chiesta");
     }
     if (step.stopReceive) XC_LOGE("exit: receive disattivato");
+    if (step.homeSuspend) {
+        // Main thread: present() ha già visto g_psMenu e non è in SubmitFlip.
+        display::suspendForHome();
+        media::audioSuspendForHome();
+        input::suspendForHome();
+        xc_log_stamp("exit: bg=1 risorse rilasciate");
+        XC_LOGI("exit: bg=1 VideoOut/audio/pad rilasciati, flip fermi, app sospesa");
+    }
+    if (step.homeResume) {
+        input::resumeFromHome();
+        media::audioResumeFromHome();
+        display::resumeFromHome();
+        g_psMenu.store(false);
+        if (g_playerMutex.try_lock()) {
+            if (g_player) g_player->requestKeyframe();
+            g_playerMutex.unlock();
+        }
+        xc_log_stamp("exit: ripresa dal menu PS");
+        XC_LOGI("exit: ripresa dal menu PS (video, audio, pad)");
+    }
     if (step.releaseStream) softReleaseStreamResources("bg>300ms");
     if (step.resumeStream) {
         XC_LOGI("exit: ripresa dopo soft-release (VideoOut)");
@@ -366,7 +386,9 @@ void pumpLifecycle(bool fromMain) {
     g_lastPumpMs = now;
     bool inMenu = g_psMenu.load() || st.wasMenu;
     ++g_pumpCount;
-    bool trace = g_pumpCount <= 3 || (inMenu && g_pumpCount % 25 == 0);
+    // Niente stamp periodico in menu: l'fsync a raffica teneva il processo
+    // occupato e il sistema non riusciva a chiuderlo (app «danneggiata»).
+    bool trace = g_pumpCount <= 3;
 
     LifeSample sample;
     sample.woke = woke;
@@ -397,7 +419,7 @@ void pumpLifecycle(bool fromMain) {
         bool changed = !shown || bg != fields.isInBackgroundExecution || overlay != fields.isSystemUiOverlaid ||
                        cpu7 != fields.isCpuMode7CpuNormal || stream != fields.isGameLiveStreamingOnAir ||
                        evn != fields.eventNum;
-        if (changed || (inMenu && g_pumpCount % 30 == 0)) {
+        if (changed) {
             char line[160];
             std::snprintf(line, sizeof line, "exit: status bg %d ov %d cpu7 %d live %d ev %d main %d",
                           fields.isInBackgroundExecution, fields.isSystemUiOverlaid,
@@ -488,44 +510,61 @@ void pumpLifecycle(bool fromMain) {
         }
     }
 
-    // Solo diagnostica: ShellUI in FG è normale nel menu PS (non è Chiudi).
-    if (g_isShellUiFg && (inMenu || st.exitArmed) && (g_pumpCount % 40 == 0)) {
+    // Solo diagnostica, una volta per valore: ShellUI in FG è il menu PS, non Chiudi.
+    if (g_isShellUiFg && (inMenu || st.exitArmed)) {
         int32_t shellFg = g_isShellUiFg();
-        // Negativo = errore SCE: log e basta, mai chiusura.
-        char line[64];
-        std::snprintf(line, sizeof line, "exit: ShellUiFg rc %d", static_cast<int>(shellFg));
-        xc_log_stamp(line);
+        static int32_t lastShell = 0x7fffffff;
+        if (shellFg != lastShell) {
+            lastShell = shellFg;
+            char line[64];
+            std::snprintf(line, sizeof line, "exit: ShellUiFg rc %d", static_cast<int>(shellFg));
+            xc_log_stamp(line);
+        }
     }
 
     // Solo diagnostica: il tasto PS non chiude (Pause via overlay).
     if (g_getPsButton && inMenu) {
         int32_t ps = 0;
-        if (g_getPsButton(&ps) == 0 && ps) {
-            char line[48];
-            std::snprintf(line, sizeof line, "exit: PSButton %d (no close)", static_cast<int>(ps));
-            xc_log_stamp(line);
+        static int32_t lastPs = 0;
+        if (g_getPsButton(&ps) == 0) {
+            if (ps && !lastPs) {
+                char line[48];
+                std::snprintf(line, sizeof line, "exit: PSButton %d (no close)", static_cast<int>(ps));
+                xc_log_stamp(line);
+            }
+            lastPs = ps;
         }
     }
 
     sample.appMsg = pollAppMessaging();
 
     LifeResult step = lifeStep(st, sample);
-    // bg=1 >300 ms durante lo stream: rilascio VO/Audio/decoder (Chiudi OK).
-    if (sample.background != 0) {
+    // Un buco di 5 s col menu PS aperto non è un risveglio dal rest: ResumeRest
+    // azzererebbe g_psMenu e il main tornerebbe a fare flip mentre ShellUI è in FG.
+    if ((sample.background != 0 || sample.overlay != 0) && step.cmd == LifeCmd::ResumeRest) {
+        step.cmd = LifeCmd::None;
+        step.logResume = false;
+    }
+    // bg=1: stop flip subito (anche dal monitor). Il main chiude VideoOut,
+    // audio e pad una volta sola. Lo stream resta in pausa e riprende al
+    // ritorno: niente requestStop, il tasto PS non chiude l'app.
+    if (sample.background != 0 || sample.overlay != 0) {
+        g_psMenu.store(true);
+        display::holdFlips(true);
         if (!st.bgSinceMs) st.bgSinceMs = now;
-        bool streaming = false;
-        if (g_playerMutex.try_lock()) {
-            streaming = g_player && g_player->running();
-            g_playerMutex.unlock();
+    }
+    if (sample.background != 0) {
+        if (fromMain && !st.homeSuspended) {
+            st.homeSuspended = true;
+            step.homeSuspend = true;
         }
-        if (streaming && !st.streamReleased && now - st.bgSinceMs >= 300) {
-            step.releaseStream = true;
-            st.streamReleased = true;
-            XC_LOGI("exit: bg=1 da %llu ms → soft-release stream",
-                    static_cast<unsigned long long>(now - st.bgSinceMs));
-        }
+    } else if (fromMain && st.homeSuspended && sample.overlay == 0) {
+        st.homeSuspended = false;
+        st.bgSinceMs = 0;
+        step.homeResume = true;
     } else if (!sample.overlay) {
         st.bgSinceMs = 0;
+        if (fromMain && !st.homeSuspended) display::holdFlips(false);
     }
     if (step.stopAll) {
         xc_log_stamp("exit: status dead");
@@ -542,7 +581,9 @@ void monitorLoop() {
         pumpLifecycle(false);
         // In menu/overlay: poll più stretto — Chiudi spesso non manda eventi
         // e bisogna _exit prima che il sistema revochi Videodec2/Audio/VideoOut.
-        platform::sleepMs(g_psMenu.load() || g_life.wasMenu || g_life.exitArmed ? 10 : 50);
+        // In menu non si gira a 10 ms: il poll stretto più gli fsync tenevano
+        // il processo sveglio e «Chiudi applicazione» non passava.
+        platform::sleepMs(g_psMenu.load() || g_life.wasMenu || g_life.exitArmed ? 100 : 50);
     }
     xc_log_stamp("exit: monitor fermo");
     XC_LOGI("exit: monitor fermo");

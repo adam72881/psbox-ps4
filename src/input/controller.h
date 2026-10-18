@@ -56,6 +56,9 @@ constexpr int kMaxPads = 4;
 
 bool init();
 void shutdown();
+// Menu PS: chiude gli handle (il sistema riprende il pad). Al ritorno si riaprono.
+void suspendForHome();
+void resumeFromHome();
 // Pad 0 (the menus).
 bool poll(ControllerState& out);
 // Any pad; false (and `out` cleared) when there is none at `index`.

@@ -13,6 +13,7 @@
 #include <orbis/UserService.h>
 #include <orbis/libkernel.h>
 
+#include <atomic>
 #include <cstdarg>
 #include <cerrno>
 #include <cstddef>
@@ -23,9 +24,16 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <string>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <poll.h>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
+
+#include "psbox_install_bin.h"
 
 namespace xc::app {
 namespace {
@@ -34,14 +42,14 @@ namespace {
 // vuole la stringa /user/data/... sullo stesso inode (FPKGi #31). Mai mkdir/
 // open/copy sotto /user — in sandbox errno 2 (01.41).
 constexpr const char* kUpdateDir = "/data/psbox/update";
-constexpr const char* kPkgDirLegacy = "/data/pkg";  // solo scan residui
-constexpr const char* kTitleId = "XCLD00001";
-constexpr const char* kContentId = "IV0000-XCLD00001_00-PSBOXCLOUD000001";
+constexpr const char* kPkgDirLegacy = "/data/pkg";
+[[maybe_unused]] constexpr const char* kTitleId = "XCLD00001";
+[[maybe_unused]] constexpr const char* kContentId = "IV0000-XCLD00001_00-PSBOXCLOUD000001";
 constexpr const char* kPendingPath = "/data/psbox/update.pending";
 constexpr const char* kManualInstall = "Installa a mano con Package Installer";
 
-// Solo per contentUrl BGFT: /data/foo → /user/data/foo. Non usarlo per I/O.
-std::string toBgftUrl(const std::string& dataPath) {
+// Solo per contentUrl BGFT (codice disattivato). Non usarlo per I/O.
+[[maybe_unused]] std::string toBgftUrl(const std::string& dataPath) {
     if (dataPath.rfind("/user/", 0) == 0) return dataPath;
     if (dataPath.rfind("/data/", 0) == 0) return "/user" + dataPath;
     return dataPath;
@@ -414,7 +422,7 @@ int32_t loadModule(const char* label, const char* const* paths, int npath, uint3
 // Azzera gli uid, punta rootdir e jaildir alla root vera e mette authid e
 // caps di sistema. Senza, /system non si vede (ENOENT) e AppInst è ENOEXEC.
 // Niente syscall 11 e niente 594.
-bool tryRaiseCreds() {
+[[maybe_unused]] bool tryRaiseCreds() {
     jailbreak_backup saved{};
     errno = 0;
     int jr = sys_sdk_jailbreak(&saved);
@@ -489,6 +497,9 @@ bool resolveSym(int32_t handle, const char* name, T* out) {
 using AppInit = int32_t (*)();
 using AppInstall = int32_t (*)(const char*, void*);
 
+// 01.43: sceAppInstUtilAppInstallPkg ha tornato 0x80020012 e ha DANNEGGIATO
+// l'app installata. BGFT ha tornato 0x80990088. Non si chiamano più da qui.
+#if 0
 // Come Itemzflow e il payload: solo InstallPkg. Mai PrepareOverwritePkg: sulla
 // 01.23 ha disinstallato la versione in esecuzione e l'icona è sparita senza
 // installare la nuova. Mai AppUnInstall della versione corrente.
@@ -818,6 +829,7 @@ bool installWithBgft(const char* dataPath, uint32_t size) {
     stampLeave("waitBgftTask", done ? 0 : -1);
     return done;
 }
+#endif  // AppInst/BGFT disattivati in 01.45
 
 using LoadExecFn = int32_t (*)(const char*, const char**);
 
@@ -933,6 +945,297 @@ LocalUpdateResult findLocalUpdate(const std::string& current) {
     return r;
 }
 
+// --- GoldHEN: RPI :12800 oppure BinLoader :9090. Mai AppInst/BGFT. --------
+
+bool setNonblock(int fd) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0) return false;
+    return fcntl(fd, F_SETFL, fl | O_NONBLOCK) == 0;
+}
+
+// connect con timeout. fd chiuso se fallisce.
+bool tcpOpen(uint32_t addrHost, int port, int timeoutMs, int& fdOut) {
+    fdOut = -1;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        updWarn("socket errno %d", errno);
+        return false;
+    }
+    setNonblock(fd);
+    sockaddr_in addr{};
+    addr.sin_len = sizeof addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    addr.sin_addr.s_addr = htonl(addrHost);
+    int rc = connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr);
+    if (rc != 0 && errno != EINPROGRESS && errno != EALREADY) {
+        updWarn("connect 127.0.0.1:%d errno %d", port, errno);
+        close(fd);
+        return false;
+    }
+    if (rc != 0) {
+        pollfd p{fd, POLLOUT, 0};
+        int pr = poll(&p, 1, timeoutMs);
+        if (pr <= 0) {
+            updWarn("connect 127.0.0.1:%d timeout", port);
+            close(fd);
+            return false;
+        }
+        int err = 0;
+        socklen_t el = sizeof err;
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
+        if (err != 0) {
+            updWarn("connect 127.0.0.1:%d so_error %d", port, err);
+            close(fd);
+            return false;
+        }
+    }
+    fdOut = fd;
+    return true;
+}
+
+bool sendAll(int fd, const char* data, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = send(fd, data + off, n - off, 0);
+        if (w < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                pollfd p{fd, POLLOUT, 0};
+                if (poll(&p, 1, 2000) <= 0) return false;
+                continue;
+            }
+            return false;
+        }
+        if (w == 0) return false;
+        off += static_cast<size_t>(w);
+    }
+    return true;
+}
+
+bool readSome(int fd, std::string& out, int timeoutMs, size_t cap) {
+    char buf[2048];
+    int waited = 0;
+    while (out.size() < cap && waited < timeoutMs) {
+        pollfd p{fd, POLLIN, 0};
+        int pr = poll(&p, 1, 200);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (pr == 0) {
+            waited += 200;
+            if (!out.empty()) break;
+            continue;
+        }
+        ssize_t n = recv(fd, buf, sizeof buf, 0);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            return !out.empty();
+        }
+        if (n == 0) break;
+        out.append(buf, static_cast<size_t>(n));
+    }
+    return !out.empty();
+}
+
+bool httpExchange(int port, const std::string& req, std::string& resp) {
+    int fd = -1;
+    if (!tcpOpen(0x7f000001u, port, 800, fd)) return false;
+    bool ok = sendAll(fd, req.data(), req.size()) && readSome(fd, resp, 4000, 8192);
+    close(fd);
+    return ok;
+}
+
+// Server HTTP locale: un GET qualunque riceve il pkg. Gira finché stop.
+void servePkg(int listenFd, const std::string& path, std::atomic<bool>& stop) {
+    while (!stop.load()) {
+        pollfd p{listenFd, POLLIN, 0};
+        if (poll(&p, 1, 200) <= 0) continue;
+        int c = accept(listenFd, nullptr, nullptr);
+        if (c < 0) continue;
+        std::string req;
+        readSome(c, req, 1500, 2048);
+        std::string line = req.substr(0, req.find('\n'));
+        if (line.size() > 120) line.resize(120);
+        updLog("HTTP richiesta %s", line.c_str());
+        FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) {
+            const char* err = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
+            sendAll(c, err, std::strlen(err));
+            close(c);
+            continue;
+        }
+        std::fseek(f, 0, SEEK_END);
+        long sz = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        char hdr[160];
+        int hn = std::snprintf(hdr, sizeof hdr,
+                               "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+                               "Content-Length: %ld\r\nConnection: close\r\n\r\n",
+                               sz);
+        bool ok = hn > 0 && sendAll(c, hdr, static_cast<size_t>(hn));
+        char buf[1 << 16];
+        long sent = 0;
+        while (ok && sent < sz) {
+            size_t n = std::fread(buf, 1, sizeof buf, f);
+            if (!n) {
+                ok = false;
+                break;
+            }
+            ok = sendAll(c, buf, n);
+            sent += static_cast<long>(n);
+        }
+        std::fclose(f);
+        close(c);
+        updLog("HTTP serviti %ld/%ld byte ok %d", sent, sz, ok ? 1 : 0);
+    }
+}
+
+int listenLocal(int& portOut) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    sockaddr_in addr{};
+    addr.sin_len = sizeof addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = 0;
+    addr.sin_addr.s_addr = htonl(0x7f000001u);
+    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0 || listen(fd, 2) != 0) {
+        updWarn("HTTP bind/listen errno %d", errno);
+        close(fd);
+        return -1;
+    }
+    socklen_t al = sizeof addr;
+    if (getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &al) != 0) {
+        close(fd);
+        return -1;
+    }
+    portOut = ntohs(addr.sin_port);
+    setNonblock(fd);
+    return fd;
+}
+
+int jsonIntAfter(const std::string& body, const char* key) {
+    auto at = body.find(key);
+    if (at == std::string::npos) return -1;
+    at = body.find_first_of("-0123456789", at + std::strlen(key));
+    if (at == std::string::npos) return -1;
+    return std::atoi(body.c_str() + at);
+}
+
+bool jsonStatusFail(const std::string& body) {
+    if (body.find("\"fail\"") != std::string::npos) return true;
+    bool hasError = body.find("\"error\"") != std::string::npos;
+    bool errorNull = body.find("\"error\":null") != std::string::npos || body.find("\"error\": null") != std::string::npos;
+    return hasError && !errorNull;
+}
+
+// true = GoldHEN ha scaricato il pkg (o sta installando). Poi si chiude l'app.
+bool installViaGoldhenRpi(const std::string& pkgPath, const std::string& fileName) {
+    updLog("RPI probe 127.0.0.1:12800");
+    int probe = -1;
+    if (!tcpOpen(0x7f000001u, 12800, 800, probe)) {
+        updWarn("RPI non raggiungibile");
+        return false;
+    }
+    close(probe);
+    updLog("RPI in ascolto");
+
+    int port = 0;
+    int lfd = listenLocal(port);
+    if (lfd < 0) {
+        updWarn("HTTP locale non partito");
+        return false;
+    }
+    updLog("HTTP locale 127.0.0.1:%d serve %s", port, fileName.c_str());
+    std::atomic<bool> stop{false};
+    std::thread server(servePkg, lfd, pkgPath, std::ref(stop));
+
+    char url[160];
+    std::snprintf(url, sizeof url, "http://127.0.0.1:%d/%s", port, fileName.c_str());
+    char json[256];
+    int jn = std::snprintf(json, sizeof json, "{\"type\":\"direct\",\"packages\":[\"%s\"]}", url);
+    char req[512];
+    int rn = std::snprintf(req, sizeof req,
+                           "POST /api/install HTTP/1.1\r\nHost: 127.0.0.1:12800\r\n"
+                           "Content-Type: application/json\r\nContent-Length: %d\r\n"
+                           "Connection: close\r\n\r\n%s",
+                           jn, json);
+    updLog("RPI POST /api/install %s", url);
+    std::string resp;
+    bool posted = rn > 0 && httpExchange(12800, std::string(req, static_cast<size_t>(rn)), resp);
+    updLog("RPI risposta %s", resp.substr(0, 180).c_str());
+    int task = jsonIntAfter(resp, "task_id");
+    if (!posted || task < 0 || jsonStatusFail(resp)) {
+        updWarn("RPI install rifiutato task %d", task);
+        stop = true;
+        shutdown(lfd, SHUT_RDWR);
+        close(lfd);
+        if (server.joinable()) server.join();
+        return false;
+    }
+    updLog("RPI task %d, attendo il download", task);
+    bool done = false;
+    for (int i = 0; i < 180 && !done; ++i) {
+        platform::sleepMs(1000);
+        char preq[256];
+        int pn = std::snprintf(preq, sizeof preq,
+                               "GET /api/get_task_progress?task_id=%d HTTP/1.1\r\nHost: 127.0.0.1:12800\r\n"
+                               "Connection: close\r\n\r\n",
+                               task);
+        std::string prog;
+        if (pn <= 0 || !httpExchange(12800, std::string(preq, static_cast<size_t>(pn)), prog)) {
+            updWarn("RPI progress assente (giro %d)", i);
+            continue;
+        }
+        int transferred = jsonIntAfter(prog, "transferred");
+        int length = jsonIntAfter(prog, "length");
+        int prep = jsonIntAfter(prog, "preparing_percent");
+        int copy = jsonIntAfter(prog, "local_copy_percent");
+        if (i % 2 == 0)
+            updLog("RPI progress transferred %d length %d prep %d copy %d", transferred, length, prep, copy);
+        if (jsonStatusFail(prog) && transferred <= 0 && i > 2) {
+            updWarn("RPI progress in errore");
+            break;
+        }
+        bool downloaded = length > 0 && transferred >= length;
+        bool copied = copy >= 100 && transferred > 0 && (length <= 0 || transferred >= length);
+        if (downloaded || copied) {
+            updLog("RPI download completo (transferred %d/%d prep %d copy %d)", transferred, length, prep, copy);
+            done = true;
+        }
+    }
+    stop = true;
+    shutdown(lfd, SHUT_RDWR);
+    close(lfd);
+    if (server.joinable()) server.join();
+    return done;
+}
+
+bool sendBinloaderPayload() {
+    updLog("BinLoader probe 127.0.0.1:9090 (%u byte)", kPsboxInstallBinLen);
+    int fd = -1;
+    if (!tcpOpen(0x7f000001u, 9090, 800, fd)) {
+        updWarn("BinLoader non raggiungibile");
+        return false;
+    }
+    bool ok = sendAll(fd, reinterpret_cast<const char*>(kPsboxInstallBin), kPsboxInstallBinLen);
+    shutdown(fd, SHUT_WR);
+    close(fd);
+    if (!ok) updWarn("BinLoader invio incompleto");
+    else updLog("payload consegnato a BinLoader, attende l'uscita dell'app e installa da /data/pkg");
+    return ok;
+}
+
+bool fsyncPath(const std::string& path) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    int rc = fsync(fd);
+    close(fd);
+    return rc == 0;
+}
+
 LocalUpdateResult installLocalUpdate(const std::string& current) {
     LocalUpdateResult r;
     updLog("install richiesto (Sì) corrente %s", current.c_str());
@@ -947,47 +1250,79 @@ LocalUpdateResult installLocalUpdate(const std::string& current) {
     }
     r.version = ver;
     r.path = src;
-    updLog("install %s versione %s da %s (niente copia, BGFT url %s)", name.c_str(), ver.c_str(), src.c_str(),
-           toBgftUrl(src).c_str());
+    updLog("install %s versione %s da %s", name.c_str(), ver.c_str(), src.c_str());
 
-    // Pkg resta dove è (/data/...). Solo stringa /user/data/... a BGFT.
     Measured placed{};
     if (!waitStableSize(src, placed) || placed.lseekBytes < 1024 || !placed.magic) {
         r.status = LocalUpdateStatus::Failed;
         r.detail = "pkg non valido";
-        updWarn("pkg invalido %s", src.c_str());
+        updWarn("pkg invalido %s magic %d size %lld", src.c_str(), placed.magic ? 1 : 0, placed.lseekBytes);
         return r;
     }
-    uint32_t pkgSize = placed.lseekBytes > 0xffffffffll ? 0xffffffffu : static_cast<uint32_t>(placed.lseekBytes);
-    writePending(ver);
-
-    stampEnter("install BGFT");
-    bool ok = installWithBgft(src.c_str(), pkgSize);
-    stampLeave("install BGFT", ok ? 0 : -1);
-    if (!ok) {
-        updWarn("BGFT fallito, provo AppInstallPkg su %s (niente UnInstall)", src.c_str());
-        stampEnter("install AppInst");
-        ok = installWithAppInst(src.c_str());
-        stampLeave("install AppInst", ok ? 0 : -1);
-    }
-    if (!ok) {
-        clearPending();
+    std::string sfoBytes;
+    std::string sfoVer;
+    if (!readAll(src, sfoBytes) || (sfoVer = appVerFromPkg(sfoBytes)).empty()) {
         r.status = LocalUpdateStatus::Failed;
-        r.detail = kManualInstall;
-        updWarn("%s (%s)", kManualInstall, src.c_str());
-        platform::notify(kManualInstall, std::string("[UPDATE] ") + kManualInstall);
+        r.detail = "SFO illeggibile";
+        updWarn("SFO illeggibile %s", src.c_str());
+        return r;
+    }
+    PkgVer got = parsePkgVer(sfoVer);
+    PkgVer cur = parsePkgVer(current);
+    updLog("SFO %s corrente %s", sfoVer.c_str(), current.c_str());
+    if (!got.ok || (cur.ok && cmpPkgVer(got, cur) <= 0)) {
+        r.status = LocalUpdateStatus::Failed;
+        r.detail = "versione non più nuova";
+        updWarn("versione SFO %s non più nuova di %s", sfoVer.c_str(), current.c_str());
         return r;
     }
 
-    // Solo dopo BGFT/AppInst OK: unlink su path /data.
-    if (unlink(src.c_str()) == 0) updLog("rimosso pkg %s", src.c_str());
-    else updWarn("pkg non rimosso %s (%d)", src.c_str(), errno);
-    clearUpdateDir();
-    unlinkOthers(kPkgDirLegacy, "");
+    if (!ensureDir(kPkgDirLegacy)) updWarn("mkdir %s non riuscito, provo la copia lo stesso", kPkgDirLegacy);
+    std::string dest = std::string(kPkgDirLegacy) + "/" + name;
+    if (src != dest) {
+        updLog("copio %s → %s (%lld byte)", src.c_str(), dest.c_str(), placed.lseekBytes);
+        if (!copyFile(src, dest) || !fsyncPath(dest)) {
+            r.status = LocalUpdateStatus::Failed;
+            r.detail = "copia in /data/pkg fallita";
+            updWarn("copia fallita %s", dest.c_str());
+            return r;
+        }
+        Measured copied{};
+        if (!waitStableSize(dest, copied) || !copied.magic || copied.lseekBytes != placed.lseekBytes) {
+            r.status = LocalUpdateStatus::Failed;
+            r.detail = "copia non verificata";
+            updWarn("copia non verificata %s magic %d size %lld (attesi %lld)", dest.c_str(), copied.magic ? 1 : 0,
+                    copied.lseekBytes, placed.lseekBytes);
+            return r;
+        }
+        if (unlink(src.c_str()) == 0) updLog("rimosso sorgente %s", src.c_str());
+        else updWarn("sorgente non rimossa %s (%d)", src.c_str(), errno);
+    } else {
+        updLog("pkg già in /data/pkg: %s", dest.c_str());
+    }
+    unlinkOthers(kPkgDirLegacy, name);
+    r.path = dest;
 
-    updLog("install completa %s — LoadExec exit", ver.c_str());
-    platform::notify("Aggiornamento in corso, riapri PSBox tra poco", "[UPDATE] install ok");
-    platform::sleepMs(800);
+    bool handed = false;
+    if (installViaGoldhenRpi(dest, name)) {
+        handed = true;
+        updLog("RPI ha preso il pkg");
+    } else if (sendBinloaderPayload()) {
+        handed = true;
+        updLog("BinLoader ha preso il payload");
+    }
+    if (!handed) {
+        r.status = LocalUpdateStatus::Failed;
+        r.detail = std::string(kManualInstall) + " (" + dest + ")";
+        updWarn("%s", r.detail.c_str());
+        platform::notify(kManualInstall, std::string("[UPDATE] ") + r.detail);
+        return r;
+    }
+
+    writePending(ver);
+    updLog("install affidata a GoldHEN %s — chiudo l'app", ver.c_str());
+    platform::notify("Aggiornamento in corso, riapri PSBox tra poco", "[UPDATE] goldhen ok");
+    platform::sleepMs(400);
     r.status = LocalUpdateStatus::Installed;
     stampEnter("exitAfterUpdate");
     (void)exitAfterUpdate();
