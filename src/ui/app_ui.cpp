@@ -1,1 +1,1 @@
-__LOAD_FROM_FILE__:/workspace/src/ui/app_ui.cpp
+@file:///home/ubuntu/.cursor/projects/workspace/agent-tools/upload_app_ui.cpp
