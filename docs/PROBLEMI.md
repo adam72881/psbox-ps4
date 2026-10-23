@@ -84,3 +84,36 @@ Se qualcosa muore: manda `last_stage.txt` + coda del CSV + coda di `xcloud.log`.
 
 - [PSBox PS5](https://github.com/RafaelNGP/xbox-cloud-gaming-ps5) — protocollo e UI
 - [AJ-GeforceNow-PS4](https://github.com/AJfiles/AJ-GeforceNow-PS4) — diagnostica present, buffer VideoOut, ICE/DTLS (stack libpeer / GFN, non copiare SDP NVIDIA)
+
+
+## Audit codice main 01.49 — 2026-10-23
+
+Questa sezione descrive lo stato verificato del codice, non certifica che i problemi siano risolti su ogni PS4.
+
+### Stato attuale verificato nel sorgente
+
+- `src/app/stream_player.cpp`: il thread di rete copia le access unit H.264 in una coda protetta da mutex; la coda video ha limite 30. Quando è piena elimina i frame più vecchi fino a lasciarne 4 e marca la necessità di chiedere un keyframe. La decodifica PS4 passa da Videodec2; il present resta su BGRA 1280×720.
+- La stessa classe misura tempi di decode e present, frame scartati, fallimenti di decode, reset della coda e latenza arrivo-display. Questi valori vanno letti insieme a `trace_stream.csv`, `trace_stream.txt`, `last_stage.txt` e `xcloud.log`: il solo FPS non distingue rete, decoder e present.
+- `src/display/display_ps4.cpp`: il percorso attuale usa quattro buffer VideoOut e sceglie un buffer libero; prima di chiudere/riaprire la porta prova a drenare i flip pendenti.
+- `src/app/lifecycle.cpp` e `src/app/crash_guard.cpp`: la chiusura di sistema evita intenzionalmente il teardown pesante e registra l'ultimo stadio prima di uscire. Non rimuovere questa disciplina senza una prova specifica su PS4.
+- `src/app/updater.cpp`: l'aggiornamento remoto verifica la firma del pacchetto, controlla la versione contenuta e usa journal/rollback per il cambio dei file. `src/app/local_update.cpp` gestisce invece il percorso d'installazione locale PKG; sono due percorsi diversi e vanno testati separatamente.
+
+### Confronto con XCloud4 / Nexo X4: cosa non copiare alla cieca
+
+Le ottimizzazioni sperimentali di Nexo X4 documentano un miglioramento misurato del solo stadio di copia immagine; non dimostrano automaticamente un aumento equivalente degli FPS su PSBox. Il percorso video e le API native devono essere confrontati con la nostra implementazione prima di trasferire codice. La coda RTP, il riordino, il decoder e il present sono componenti collegati: cambiare solo la dimensione della coda può ridurre o aumentare la latenza a seconda del carico.
+
+### Protocollo minimo prima di dichiarare un fix
+
+1. Salvare una baseline sulla stessa console, rete e scena: `xcloud.log`, `last_stage.txt`, coda di `trace_stream.csv` e `trace_stream.txt`.
+2. Annotare firmware PS4, build PSBox, risoluzione/qualità scelta, tipo di collegamento (Ethernet o Wi‑Fi) e sintomo osservato.
+3. Separare almeno tre casi: scatti durante gioco, perdita/freeze della sessione, chiusura dal menu PS4.
+4. Per ogni modifica: compilazione OpenOrbis, controlli statici/test disponibili, PKG distinto e prova sulla console. Se non è stata eseguita la prova hardware, indicare il fix come non verificato.
+5. Non cambiare UI, Title ID o percorso d'installazione come parte di un intervento sullo streaming.
+
+### Priorità d'indagine
+
+- **Streaming:** correlare età della coda e tempo di decode/present prima di cambiare la politica di drop; verificare se i frame scartati sono seguiti da un keyframe valido.
+- **Chiusura:** usare l'ultimo stadio registrato per distinguere il percorso di uscita richiesto dal sistema da un crash durante la sessione.
+- **Update:** provare in modo indipendente aggiornamento remoto firmato, rollback dopo interruzione e installazione PKG locale; non eliminare il journal se il ripristino non è completo.
+
+Questa audit non modifica il comportamento dell'applicazione: serve a fissare una baseline tecnica e a evitare di confondere misure dichiarate da altri progetti con risultati già dimostrati su PSBox.
