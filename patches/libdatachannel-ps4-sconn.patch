@@ -8,7 +8,7 @@
  #include <chrono>
  #include <cstdarg>
  #include <cstdio>
-@@ -343,14 +344,16 @@
+@@ -343,7 +344,15 @@
  }
  
  struct sockaddr_conn SctpTransport::getSockAddrConn(uint16_t port) {
@@ -39,7 +39,7 @@
  	usrsctp_conninput(this, message->data(), message->size(), 0);
  }
  
-@@ -769,6 +776,13 @@
+@@ -769,8 +776,10 @@
  		std::unique_lock lock(mWriteMutex);
  		PLOG_VERBOSE << "Handle write, len=" << len;
  
@@ -56,7 +56,7 @@
  
 --- a/deps/usrsctp/usrsctplib/usrsctp.h
 +++ b/deps/usrsctp/usrsctplib/usrsctp.h
-@@ -120,8 +120,9 @@
+@@ -120,8 +120,10 @@
   * tune with other sockaddr_* structures.
   */
  #if defined(__APPLE__) || defined(__Bitrig__) || defined(__DragonFly__) || \
