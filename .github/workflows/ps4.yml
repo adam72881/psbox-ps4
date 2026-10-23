@@ -1,9 +1,11 @@
 name: PS4
 
-# Solo manuale: i push frequenti (import sorgente) spamavano e-mail di failure.
-# Avvia da Actions → PS4 → Run workflow quando serve una build CI.
+# Build automatica solo sul branch di recupero; main resta invariato.
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - chatgpt/pkg-build-recovery
 
 jobs:
   pkg:
