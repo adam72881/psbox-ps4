@@ -2,7 +2,7 @@
 
 | File | Note |
 | --- | --- |
-| `PSBox-PS4-01.51.pkg` | Build corrente. Lo SHA-256 è quello dell'artifact CI, non un valore scritto a mano. |
+| `PSBox-PS4-01.51.pkg` | Build CI. SHA-256 `f920d717b3589dcabb840a431bd45b5a620aaa1cfc9b9bc42205cbbad5133d19`, 9961472 byte, magic `7f434e54`. |
 
 ## Contenuto 01.51
 
