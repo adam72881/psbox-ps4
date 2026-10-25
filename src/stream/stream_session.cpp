@@ -5,6 +5,7 @@
 #include "stream/connect_plan.h"
 #include "stream/input_plan.h"
 #include "stream/keyframe_limit.h"
+#include "stream/offer_plan.h"
 #include "stream/stream_dims.h"
 
 #include "stream/h264_receiver.h"
@@ -184,6 +185,7 @@ struct StreamSession::Impl {
     uint64_t lastKeyframeMs = 0;
     VideoReceiveStats videoStats;
     std::shared_ptr<RtcpReporter> videoReporter;
+    std::shared_ptr<RtcpReporter> audioReporter;
     // The video receiver (a media handler, which libdatachannel may still be
     // running after the session is gone) reaches the session through this.
     struct Guard {
@@ -361,24 +363,13 @@ struct StreamSession::Impl {
     }
 
     void sendResolution(const std::string& alias) {
-        // The HQ tiers and 1440 need Game Pass Ultimate in a market where
-        // they're enabled; elsewhere the service ignores them and keeps what
-        // it had (1080 at the start). The plain tier first, then: measured,
-        // "720" switches in a few seconds, "720HQ" is ignored in Brazil.
-        // 1440 alone, as the xbox.com client sends it (never 1080 before it).
-        std::string base = alias;
-        if (base.size() > 2 && base.compare(base.size() - 2, 2, "HQ") == 0) base.resize(base.size() - 2);
-        // The user's own Xbox offers every tier on any plan: just the one asked for.
-        if (gssv.isHome()) base = alias;
-        auto send = [this](const std::string& a) {
-            json::Value res = json::Value::object();
-            res.set("message", "userRequestedResolutionUpdate");
-            res.set("resolutionAlias", a);
-            sendText(control, res.dump());
-            XC_LOGI("requested stream resolution %s", a.c_str());
-        };
-        send(base);
-        if (alias != base) send(alias);
+        // XCloud4: un solo alias (es. 720HQ), non base+HQ in sequenza.
+        if (alias.empty()) return;
+        json::Value res = json::Value::object();
+        res.set("message", "userRequestedResolutionUpdate");
+        res.set("resolutionAlias", alias);
+        sendText(control, res.dump());
+        XC_LOGI("requested stream resolution %s", alias.c_str());
     }
 
     void sendClientConfig() {
@@ -452,11 +443,9 @@ struct StreamSession::Impl {
         if (!control || !control->isOpen()) return;
         if (!padKindLogged) {
             padKindLogged = true;
-            // Il wire protocol xCloud è la bitmask Xbox; sul pad fisico è DS4.
             XC_LOGI("input: pad DS4 (protocollo Xbox bitmask)");
         }
-        sendGamepadChanged(0, true);
-        sendGamepadChanged(0, false);
+        /* XCloud4: un solo gamepadChanged true (non true/false/true). */
         sendGamepadChanged(0, true);
         padAnnounceSent = true;
         XC_LOGI("input: pad connesso");
@@ -464,27 +453,17 @@ struct StreamSession::Impl {
 
     void onHandshakeAck() {
         XC_LOGI("message channel handshake complete");
+        /* Sequenza control XCloud4: auth → un gamepadChanged → config → un alias. */
         json::Value auth = json::Value::object();
         auth.set("message", "authorizationRequest");
         auth.set("accessKey", kControlAccessKey);
         sendText(control, auth.dump());
-        // Il protocollo input 1.0 (xbox-xcloud-player e il PSBox PS5 fino a
-        // main) non ha un tipo di controller: il frame è la bitmask Xbox e
-        // gamepadChanged porta solo indice e wasAdded. Niente vendor 054c.
-        // L'annuncio all'apertura di control può arrivare prima
-        // dell'authorizationRequest: il server lo ignora e Fortnite mostra
-        // il controller. Si riannuncia sempre dopo l'ack dell'handshake.
         announceGamepad();
-        // 1440 once the picture is running (the first video frame), as the
-        // xbox.com client sends it; the other tiers right away.
+        sendClientConfig();
         if (opt.resolutionAlias == "1440" && !gssv.isHome())
             resolutionPending = true;
         else if (!opt.resolutionAlias.empty())
             sendResolution(opt.resolutionAlias);
-
-
-        /* ClientMetadata parte all'open del canale input (XCloud4), non qui. */
-        sendClientConfig();
         {
             std::lock_guard<std::mutex> lock(mutex);
             handshakeDone = true;
@@ -597,13 +576,16 @@ struct StreamSession::Impl {
             if (content)
                 XC_LOGW("server dialog: %s / %s", (*content)["TitleText"].str().c_str(),
                         (*content)["ContentText"].str().c_str());
-            json::Value result = json::Value::object();
-            result.set("Result", 0);
-            completeTransaction(id, result);
+            /* XCloud4: nessun TransactionComplete automatico su systemUi. */
             return;
         }
 
-        // ShowGameTimeNotification, touchcontrols/showtitledefault, ecc.
+        /* systemUi: come XCloud4, niente auto-complete (solo tastiera sopra). */
+        if (target.find("/streaming/systemUi/") == 0) {
+            XC_LOGI("message: systemUi senza auto-complete %s", target.c_str());
+            return;
+        }
+
         if (!id.empty()) {
             XC_LOGI("message: transazione %s chiusa", target.c_str());
             completeTransaction(id, json::Value::object());
@@ -714,8 +696,8 @@ struct StreamSession::Impl {
         chat->onMessage([](rtc::message_variant m) { XC_LOGI("chat channel: %s", asText(m).c_str()); });
         control = makeChannel("control", "controlV1");
         control->onOpen([this] {
+            /* Pad solo dopo authorizationRequest (onHandshakeAck), non qui. */
             XC_LOGI("data channel control open");
-            announceGamepad();
         });
         input = makeChannel("input", "1.0", true);
         input->onOpen([this] {
@@ -755,20 +737,14 @@ struct StreamSession::Impl {
             }
         });
 
-        // Audio: sendrecv like the browser (the send side carries chat).
-        rtc::Description::Audio a("0", rtc::Description::Direction::SendRecv);
+        /* Audio RecvOnly come XCloud4: niente SSRC mittente, niente packetizer.
+         * RR RTCP sulla traccia (rtc_transport.c) — reporter pompato in pumpFast. */
+        rtc::Description::Audio a("0", rtc::Description::Direction::RecvOnly);
         a.addOpusCodec(111, "minptime=10;useinbandfec=1;stereo=1");
-        a.addSSRC(1, "audio");
         audio = pc->addTrack(a);
-
         auto audioDepacketizer = std::make_shared<rtc::OpusRtpDepacketizer>();
-        audioDepacketizer->addToChain(std::make_shared<RtcpReporter>(48000, 0));
-
-        auto rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(
-            1, "audio", 111, rtc::OpusRtpPacketizer::DefaultClockRate);
-        auto audioPacketizer = std::make_shared<rtc::OpusRtpPacketizer>(rtpConfig);
-        audioDepacketizer->addToChain(audioPacketizer);
-
+        audioReporter = std::make_shared<RtcpReporter>(48000, 0);
+        audioDepacketizer->addToChain(audioReporter);
         audio->setMediaHandler(audioDepacketizer);
         audio->onFrame([this](rtc::binary data, rtc::FrameInfo info) {
             static int once = 0;
@@ -776,36 +752,21 @@ struct StreamSession::Impl {
             if (cb.audio) cb.audio(reinterpret_cast<const uint8_t*>(data.data()), data.size(), info.timestamp);
         });
 
-        // Video: H.264 only, Main before Constrained Baseline / Baseline.
+        /* Video: solo PT 102 Constrained Baseline + goog-remb. Niente TWCC
+         * (01.52: stallo a ~109 feedback / ~5,5 s indipendente dal bitrate). */
         rtc::Description::Video v("1", rtc::Description::Direction::RecvOnly);
-        // Constrained Baseline prima (come XCloud4): 42e020 a 720, 42e02a a 1080.
-        // Poi Main 4d0033 come fallback per 1440 dove serve.
         const char* fmtp = streamH264Fmtp(opt.resolutionAlias.c_str());
-        v.addH264Codec(102, fmtp);
-        v.addH264Codec(104, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d0033");
-        v.addH264Codec(106, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f");
-        // Come PS5 v0.9.8 e 01.35: transport-cc nell'offerta (ext id 3).
-        // REMB (goog-remb) resta il tetto ABR anche con TWCC (01.52).
-        v.addExtMap(rtc::Description::Entry::ExtMap(
-            3, "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"));
-        for (int pt : {102, 104, 106}) {
-            if (auto* m = v.rtpMap(pt)) {
-                m->addFeedback("transport-cc");
-                m->addFeedback("goog-remb");
-            }
-        }
+        v.addH264Codec(kOfferVideoPt, fmtp);
+        if (auto* m = v.rtpMap(kOfferVideoPt)) m->addFeedback("goog-remb");
         v.setBitrate(static_cast<int>(opt.maxBitrate / 1000u));
         v.addSSRC(kReceiverSsrc, "video");
         StreamDims offerDim = streamDimsForAlias(opt.resolutionAlias.c_str());
-        XC_LOGI("video: offro %u kbps %dx%d fmtp %s, ssrc rtcp %08x, transport-cc+remb",
+        XC_LOGI("video: offro %u kbps %dx%d fmtp %s, ssrc rtcp %08x, remb (no TWCC)",
                 opt.maxBitrate / 1000u, offerDim.w, offerDim.h, fmtp, kReceiverSsrc);
         video = pc->addTrack(v);
-        // Our jitter buffer (NACK, whole frames only) in place of
-        // H264RtpDepacketizer, which hands over frames with holes in them.
         guard->self = this;
         auto videoReceiver = std::make_shared<H264Receiver>(
             [g = guard] {
-                // Solo flag: DataChannel::send dal path RTP → deadlock SCTP/DTLS.
                 std::lock_guard<std::mutex> lock(g->mutex);
                 if (!g->self || !g->self->open) return;
                 g->self->keyframeJsonWanted = true;
@@ -899,6 +860,7 @@ struct StreamSession::Impl {
         audio.reset();
         video.reset();
         videoReporter.reset();
+        audioReporter.reset();
         {
             std::lock_guard<std::mutex> lock(mutex);
             localCandidates.clear();
@@ -916,7 +878,9 @@ struct StreamSession::Impl {
     // Una negoziazione ICE+SDP. Dopo ICE connected si attende l'handshake
     // fino a connectTimeoutMs (niente chiusura PC a 3 s).
     bool negotiateOnce(std::string& err) {
-        negKaMs = platform::nowMs();
+        /* Keepalive già partito subito dopo /play; qui si ripete ogni 30 s. */
+        negKaMs = 0;
+        negotiateKeepalive();
         createPeer();
         if (!pc) {
             err = "PeerConnection nulla";
@@ -941,6 +905,10 @@ struct StreamSession::Impl {
             return false;
         }
         std::string offer = std::string(*local);
+        if (!offerSdpOk(offer.c_str()))
+            XC_LOGW("offerta SDP fuori politica 01.54 (TWCC/PT extra/audio send?)");
+        else
+            XC_LOGI("offerta SDP: PT102 Baseline, remb, audio recvonly, no TWCC");
         XC_LOGD("local offer:\n%s", offer.c_str());
         logSdpLine("offer", offer, "a=setup:");
         logSdpLine("offer", offer, "a=fingerprint:");
@@ -1219,6 +1187,7 @@ struct StreamSession::Impl {
     void pumpFast() {
         if (g_streamStop.load()) return;
         if (videoReporter) videoReporter->pump();
+        if (audioReporter) audioReporter->pump();
         flushOutbound();
         sendPadIfDue();
         if (videoReporter && videoReporter->secondsQuiet() >= 2) {
@@ -1237,7 +1206,7 @@ struct StreamSession::Impl {
         if (control && control->isOpen() && (!padAnnounceSent || padsStale.exchange(false))) announceGamepad();
         if (!open) return;
         uint64_t now = platform::nowMs();
-        if (now - lastKeepaliveMs >= 10000) {
+        if (now - lastKeepaliveMs >= static_cast<uint64_t>(kKeepaliveIntervalMs)) {
             lastKeepaliveMs = now;
             std::string err;
             if (!gssv.keepalive(err)) XC_LOGW("%s", err.c_str());

@@ -1,14 +1,21 @@
-# Release 01.53 (v1.0.53)
+# Release 01.54 (v1.0.54)
 
 | File | Note |
 | --- | --- |
-| `PSBox-PS4-01.53.pkg` | Build CI. SHA-256 dall'artifact `PSBox-PS4`. |
+| `PSBox-PS4-01.54.pkg` | Build CI. SHA-256 dall'artifact `PSBox-PS4`. |
 
-## Contenuto 01.53
+## Contenuto 01.54
 
-Fix radice sul FAIL console 01.52 (server in pausa con 0 loss: HOL sul canale input + frame-ack Metadata + ABR su recv statico).
+Allineamento XCloud4 (008f4ab) / Nexo (ce73289) dopo FAIL 01.52/01.53: stallo a ~109 TWCC / ~5,5 s indipendente dalla banda.
 
-- **Input SCTP:** canale `input` unordered + `maxRetransmits=0` (XCloud4 `rtc_transport.c`).
-- **Input reports:** solo `ClientMetadata` (type 8) all'apertura; poi gamepad type 2 a 60 Hz; skip se `bufferedAmount>0`; niente Metadata type1 di default (`sendFrameAcks=false`).
-- **ABR:** taglio su loss / local_dropped / stale_ingress; niente taglio sul solo receive rate; warmup 5 s senza tagli.
-- Resta dalla 01.52: dims 720HQ, REMB+TWCC, waitIdr, limiter KF, Baseline, depth 1 @720, LoadExec exit. UI invariata.
+1. **TWCC fuori:** niente extmap/rtcp-fb transport-cc né feedback TWCC; solo RR + REMB (+ PLI).
+2. **Keepalive HTTP:** subito dopo `/play`, poi ogni 30 s; gestisce 410.
+3. **RR audio:** reporter attivo e pompato; traccia audio RecvOnly.
+4. **Audio:** niente `addSSRC(1)` / packetizer.
+5. **H.264:** solo PT 102 Constrained Baseline (niente 104/106).
+6. **/sdp body:** `reliableinput` / `unreliableinput` `{minVersion:9,maxVersion:9}`.
+7. **systemUi:** nessun TransactionComplete automatico (tastiera come Nexo).
+8. **control:** auth → un `gamepadChanged true` → config → un solo alias risoluzione.
+9. **Identità /play:** timezone locale; osName come XCloud4; `b=AS` dal tetto ABR.
+
+UI invariata.

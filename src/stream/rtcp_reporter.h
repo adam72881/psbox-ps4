@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 RafaelNGP
-// RTCP: RR (RFC 3550), REMB, transport-cc (draft-holmer) ogni ~100 ms,
-// PLI se il video tace (senza spam all'avvio).
+// RTCP come XCloud4/Nexo: RR (RFC 3550) + REMB + PLI. Niente transport-cc /
+// TWCC (01.38/01.52: lo stream si fermava a ~5–8 s / ~109 feedback).
 #pragma once
 
 #include "stream/abr_plan.h"
@@ -29,7 +29,7 @@ public:
     uint32_t estimate() const { return estimate_; }
     uint32_t receiveRate() const { return receiveRate_; }
     uint32_t reportsSent() const { return reportsSent_.load(); }
-    uint32_t twccSent() const { return twccSent_.load(); }
+    uint32_t twccSent() const { return 0; }
     bool demoteWanted() const { return demoteWanted_.load(std::memory_order_relaxed) != 0; }
     bool promoteWanted() const { return promoteWanted_.load(std::memory_order_relaxed) != 0; }
     void clearTierHints() {
@@ -43,7 +43,6 @@ private:
     void report(uint64_t nowUs, const rtc::message_callback& send);
     void sendRemb(uint32_t bps, uint32_t mediaSsrc, std::vector<uint8_t>& out);
     void sendPli(const rtc::message_callback& send);
-    bool flushTwcc(uint64_t nowUs, const rtc::message_callback& send);
 
     const uint32_t clockRate_, maxBitrate_;
     uint32_t mediaSsrc_ = 0;
@@ -58,27 +57,14 @@ private:
     uint32_t lastSr_ = 0;
     uint64_t lastSrArrivalUs_ = 0;
     uint64_t lastReportUs_ = 0;
-    uint64_t lastTwccUs_ = 0;
     uint64_t lastPliUs_ = 0;
     uint64_t bytesSinceReport_ = 0;
     std::atomic<uint64_t> lastRtpUs_{0};
-    int lossyReports_ = 0;
     BitratePlan abr_{};
     std::atomic<int> pliArmed_{0};
     std::atomic<int> demoteWanted_{0};
     std::atomic<int> promoteWanted_{0};
-    std::atomic<uint32_t> estimate_{0}, receiveRate_{0}, reportsSent_{0}, twccSent_{0};
-
-    static constexpr int kTwccCap = 512;
-    struct TwccHit {
-        uint16_t seq = 0;
-        uint64_t us = 0;
-    };
-    TwccHit twccHits_[kTwccCap]{};
-    int twccHead_ = 0;
-    int twccCount_ = 0;
-    uint8_t twccFbCount_ = 0;
-    bool twccActive_ = false;  // dopo il 1° TWCC: niente REMB (solo RR+TWCC)
+    std::atomic<uint32_t> estimate_{0}, receiveRate_{0}, reportsSent_{0};
 
     rtc::message_callback send_;
     std::mutex mu_;

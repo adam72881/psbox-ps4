@@ -13,6 +13,7 @@
 #include "stream/input_plan.h"
 #include "stream/keyframe_limit.h"
 #include "stream/nack_plan.h"
+#include "stream/offer_plan.h"
 #include "stream/stream_dims.h"
 
 #include <atomic>
@@ -147,7 +148,10 @@ int main() {
     killer.join();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     expect("attesa negoziazione interrotta entro 600 ms", stop.load() == 1 && ms < 600);
-    expect("keepalive sotto i 10 s", kNegotiateKeepaliveMs <= 10000 && keepaliveDue(8000, 0));
+    expect("keepalive a 30 s", kNegotiateKeepaliveMs == 30000 && kKeepaliveIntervalMs == 30000);
+    expect("keepalive subito (t=0)", keepaliveDue(0, 0) == 1);
+    expect("keepalive non dovuto a 10 s", keepaliveDue(10000, 1) == 0);
+    expect("keepalive dovuto a 30 s", keepaliveDue(30001, 1) == 1);
 
     uint8_t idr[] = {0, 0, 0, 1, 0x65, 0x88};
     uint8_t p[] = {0, 0, 0, 1, 0x41, 0x9a};
@@ -314,6 +318,30 @@ int main() {
     expect("goog-remb in offerta", slurp("src/stream/stream_session.cpp").find("goog-remb") != std::string::npos);
     expect("ABR senza recv_low", slurp("src/stream/abr_plan.h").find("recv_low") == std::string::npos &&
                                      slurp("src/stream/abr_plan.h").find("kAbrWarmupMs") != std::string::npos);
+    expect("niente TWCC in offerta", sess.find("transport-cc") == std::string::npos &&
+                                         sess.find("draft-holmer") == std::string::npos);
+    expect("solo PT102", sess.find("addH264Codec(104") == std::string::npos &&
+                             sess.find("addH264Codec(106") == std::string::npos &&
+                             sess.find("kOfferVideoPt") != std::string::npos);
+    expect("audio RecvOnly", sess.find("Direction::RecvOnly") != std::string::npos &&
+                                 sess.find("OpusRtpPacketizer") == std::string::npos &&
+                                 sess.find("addSSRC(1") == std::string::npos);
+    expect("RR audio pompato", sess.find("audioReporter") != std::string::npos);
+    expect("un solo gamepadChanged", sess.find("sendGamepadChanged(0, false)") == std::string::npos);
+    expect("reliableinput in /sdp", slurp("src/xcloud/gssv.cpp").find("reliableinput") != std::string::npos &&
+                                        slurp("src/xcloud/gssv.cpp").find("unreliableinput") != std::string::npos);
+    expect("keepalive subito dopo /play", slurp("src/xcloud/gssv.cpp").find("keepalive subito dopo /play") !=
+                                              std::string::npos);
+    expect("systemUi senza auto-complete", sess.find("systemUi senza auto-complete") != std::string::npos);
+    expect("niente flushTwcc", slurp("src/stream/rtcp_reporter.cpp").find("flushTwcc") == std::string::npos);
+
+    const char* badTwcc =
+        "m=video 9 UDP/TLS/RTP/SAVPF 102\r\na=rtpmap:102 H264/90000\r\na=rtcp-fb:102 transport-cc\r\n";
+    const char* good =
+        "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=recvonly\r\na=rtpmap:111 opus/48000/2\r\n"
+        "m=video 9 UDP/TLS/RTP/SAVPF 102\r\na=rtpmap:102 H264/90000\r\na=rtcp-fb:102 goog-remb\r\n";
+    expect("offerSdpOk rifiuta TWCC", !offerSdpOk(badTwcc));
+    expect("offerSdpOk accetta PT102+remb+recvonly", offerSdpOk(good));
     expect("depth 1 a 720", slurp("src/media/hw_decoder_ps4.cpp").find("kDepth720") != std::string::npos);
     expect("niente offerta a 30 Mb/s", player.find("30000000") == std::string::npos);
     std::string hw = slurp("src/media/hw_decoder_ps4.cpp");

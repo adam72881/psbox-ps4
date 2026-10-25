@@ -9,7 +9,7 @@
 
 static const int kReconnectDtlsBudgetMs = 20000;
 static const int kNegotiateSliceMs = 200;
-static const int kNegotiateKeepaliveMs = 8000;
+static const int kNegotiateKeepaliveMs = 30000; /* XCloud4/Nexo: ogni 30 s */
 static const int kDtlsReinjectMs = 3000;
 static const int kDtlsReinjectAgainMs = 8000;
 

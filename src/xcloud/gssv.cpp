@@ -439,8 +439,21 @@ bool GssvClient::startSession(const std::string& titleId, const std::string& loc
     settings.set("highContrast", 0);
     settings.set("locale", locale);
     settings.set("useIceConnection", false);
-    settings.set("timezoneOffsetMinutes", 0);
+    /* Offset locale come XCloud4 (non 0 fisso). */
+    int tzMin = 0;
+    {
+        std::time_t t = std::time(nullptr);
+        std::tm lt{};
+#if defined(_WIN32)
+        localtime_s(&lt, &t);
+#else
+        localtime_r(&t, &lt);
+#endif
+        tzMin = static_cast<int>(lt.tm_gmtoff / 60);
+    }
+    settings.set("timezoneOffsetMinutes", tzMin);
     settings.set("sdkType", "web");
+    /* Identità come XCloud4 / deviceInfo: android@720, tizen@1080HQ, windows altrimenti. */
     settings.set("osName", resolution_ == Resolution::P720       ? "android"
                            : resolution_ == Resolution::P1080HQ ? "tizen"
                                                                 : "windows");
@@ -473,6 +486,10 @@ bool GssvClient::startSession(const std::string& titleId, const std::string& loc
     }
     sessionPath_ = (*j)["sessionPath"].str();
     XC_LOGI("session created");  // not its id
+    /* XCloud4 xbox_live.c: keepalive SUBITO dopo /play, anche prima dell'SDP. */
+    std::string ka;
+    if (!keepalive(ka)) XC_LOGW("keepalive subito dopo /play: %s", ka.c_str());
+    else XC_LOGI("keepalive subito dopo /play ok");
     return true;
 }
 
@@ -538,6 +555,9 @@ bool GssvClient::sendSdpOffer(const std::string& sdp, std::string& err) {
     cfg.set("chat", ver(1, 1));
     cfg.set("control", ver(1, 3));
     cfg.set("input", ver(1, 9));
+    /* XCloud4 xbox_live.c: canali reliableinput / unreliableinput v9. */
+    cfg.set("reliableinput", ver(9, 9));
+    cfg.set("unreliableinput", ver(9, 9));
     cfg.set("message", ver(1, 1));
 
     json::Value body = json::Value::object();
@@ -614,7 +634,16 @@ bool GssvClient::pollIceCandidates(std::vector<IceCandidate>& out, std::string& 
 }
 
 bool GssvClient::keepalive(std::string& err) {
+    if (sessionPath_.empty()) {
+        err = "keepalive: nessuna sessione";
+        return false;
+    }
     auto r = net::perform(authed(resolution_, login_, "POST", sessionUrl("/keepalive")));
+    /* Nexo/XCloud4: 410 = sessione scaduta. */
+    if (r.status == 410) {
+        err = "keepalive 410: sessione scaduta";
+        return false;
+    }
     if (!r.ok()) {
         err = "keepalive failed: " + describe(r);
         return false;
