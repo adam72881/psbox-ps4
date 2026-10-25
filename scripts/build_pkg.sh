@@ -5,10 +5,33 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-if ! command -v ld.lld >/dev/null 2>&1 && ! command -v ld.lld-18 >/dev/null 2>&1; then
+# XCloud4 Makefile calls bare `ld.lld` / `objdump`. Ubuntu CI ships versioned
+# llvm packages (ld.lld-18, llvm-objdump-18); mirror them into the XCloud4 bin
+# dir documented in BUILDING.md so make does not need sudo update-alternatives.
+X4_BIN="${X4_HOST_BIN:-$HOME/.local/share/xcloud4/bin}"
+mkdir -p "$X4_BIN"
+ensure_tool() {
+    local name="$1"
+    shift
+    if command -v "$name" >/dev/null 2>&1; then
+        return 0
+    fi
+    local cand
+    for cand in "$@"; do
+        if command -v "$cand" >/dev/null 2>&1; then
+            ln -sfn "$(command -v "$cand")" "$X4_BIN/$name"
+            return 0
+        fi
+    done
+    return 1
+}
+export PATH="$X4_BIN:$PATH"
+if ! ensure_tool ld.lld ld.lld-18 ld.lld-17 ld.lld-16; then
     echo "manca ld.lld: sudo apt-get install -y clang lld-18 llvm-18 ninja-build cmake" >&2
     exit 1
 fi
+# Stream/probe ELF audits invoke `objdump` (llvm-objdump preferred).
+ensure_tool objdump llvm-objdump-18 llvm-objdump-17 llvm-objdump objdump || true
 if [[ ! -e /usr/lib/x86_64-linux-gnu/libssl.so.1.1 && ! -e /lib/x86_64-linux-gnu/libssl.so.1.1 ]]; then
     echo "manca libssl.so.1.1 (PkgTool)" >&2
     exit 1
