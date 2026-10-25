@@ -74,8 +74,9 @@ static int xc_fallback_poll(unsigned char* output, size_t len, size_t* olen) {
     return 0;
 }
 
-int mbedtls_hardware_poll(void* data, unsigned char* output, size_t len, size_t* olen) {
-    (void)data;
+/* XCloud4 already exports mbedtls_hardware_poll (rtc_native.c). Keep only
+ * ps4_random_bytes for PSBox platform::randomBytes / TLS entropy callbacks. */
+static int xc_random_poll(unsigned char* output, size_t len, size_t* olen) {
     if (!output || !olen || len == 0) return -1;
 
     xc_find_random();
@@ -92,7 +93,7 @@ int mbedtls_hardware_poll(void* data, unsigned char* output, size_t len, size_t*
 
 int ps4_random_bytes(void* out, size_t len) {
     size_t got = 0;
-    return mbedtls_hardware_poll(NULL, (unsigned char*)out, len, &got) == 0 && got == len;
+    return xc_random_poll((unsigned char*)out, len, &got) == 0 && got == len;
 }
 
 // Contatore DTLS in ingresso (byte 20-63 su ICE). Usato per ripartire se
