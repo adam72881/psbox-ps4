@@ -37,12 +37,22 @@ alignas(16) char g_alt[64 * 1024];
 
 extern "C" void xc_log_stamp(const char* msg);
 
+/* Linux/musl ucontext uses gregset REG_RIP/REG_RBP; Orbis/FreeBSD does not. */
+#if defined(__linux__) && defined(REG_RIP) && defined(REG_RBP)
 constexpr size_t kMuslRip = offsetof(ucontext_t, uc_mcontext) + sizeof(greg_t) * REG_RIP;
 constexpr size_t kMuslRbp = offsetof(ucontext_t, uc_mcontext) + sizeof(greg_t) * REG_RBP;
+static_assert(kMuslRip + 8 <= 24 * 8, "musl RIP outside the dumped ucontext");
+#else
+constexpr size_t kMuslRip = 0;
+constexpr size_t kMuslRbp = 0;
+#endif
 constexpr size_t kFbsdRip = 16 + 160;
 constexpr size_t kFbsdRbp = 16 + 72;
-static_assert(kMuslRip + 8 <= 24 * 8, "musl RIP outside the dumped ucontext");
 static_assert(kFbsdRip + 8 <= 24 * 8, "freebsd RIP outside the dumped ucontext");
+#if !defined(__linux__)
+/* Silence unused on Orbis (FreeBSD dump path uses kFbsdRip only). */
+static_assert(kMuslRbp == 0 && kFbsdRbp > 0, "orbis crash offsets");
+#endif
 
 void append(char* b, int* n, int cap, const char* s) {
     while (s && *s && *n + 1 < cap) b[(*n)++] = *s++;
