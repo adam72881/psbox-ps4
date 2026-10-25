@@ -277,7 +277,13 @@ bool initTls(const std::string& caBundlePath) {
     int rc = mbedtls_ctr_drbg_seed(&g.drbg, mbedtls_entropy_func, &g.entropy,
                                    reinterpret_cast<const unsigned char*>(pers), std::strlen(pers));
     if (rc != 0) return fail("random generator (system random source?): " + tlsError(rc));
-    rc = mbedtls_x509_crt_parse_file(&g.ca, caBundlePath.c_str());
+    // XCloud4 mbedTLS is built without MBEDTLS_FS_IO; load PEM via readFile.
+    std::string pem;
+    if (platform::readFile(caBundlePath, pem) && !pem.empty()) {
+        rc = mbedtls_x509_crt_parse(&g.ca, reinterpret_cast<const unsigned char*>(pem.data()), pem.size() + 1);
+    } else {
+        rc = -1;
+    }
     if (rc < 0) {
         // The file is missing or unreadable: the same bundle, built in. The
         // install stays broken (other files may be missing too): logged.
@@ -297,7 +303,12 @@ bool initTls(const std::string& caBundlePath) {
 bool addTrustedCa(const std::string& pemPath) {
     std::lock_guard<std::mutex> lock(g.mutex);
     if (!g.ready) return false;
-    int rc = mbedtls_x509_crt_parse_file(&g.ca, pemPath.c_str());
+    std::string pem;
+    if (!platform::readFile(pemPath, pem) || pem.empty()) {
+        XC_LOGI("extra CA %s: unreadable", pemPath.c_str());
+        return false;
+    }
+    int rc = mbedtls_x509_crt_parse(&g.ca, reinterpret_cast<const unsigned char*>(pem.data()), pem.size() + 1);
     XC_LOGI("extra CA %s: %s", pemPath.c_str(), rc == 0 ? "trusted" : tlsError(rc).c_str());
     return rc == 0;
 }
