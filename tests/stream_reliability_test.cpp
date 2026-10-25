@@ -274,14 +274,16 @@ int main() {
 
     std::string why;
     for (const char* patch : {"patches/libdatachannel-ps4-initlog.patch", "patches/libdatachannel-ps4-sconn.patch",
-                              "patches/libdatachannel-ps4-srtp.patch", "patches/libdatachannel-ps4-dtls-log.patch",
-                              "patches/libdatachannel-ps4-ice-halt.patch"}) {
+                              "patches/libdatachannel-ps4-srtp.patch", "patches/libdatachannel-ps4-ice-halt.patch"}) {
         std::string text = slurp(patch);
         std::string err;
         bool ok = patchOk(text, err);
         expect(patch, ok);
         if (!ok) std::printf("  %s\n", err.c_str());
     }
+    /* 0.24.6: log DTLS fusi in initlog; stub dtls-log senza hunks. */
+    expect("dtls-log fuso in initlog",
+           slurp("patches/libdatachannel-ps4-initlog.patch").find("dtls: recv in coda") != std::string::npos);
     std::string badPatch = "@@ -1,1 +1,1 @@\nnot a prefix\n";
     expect("il controllo vede una patch malformata", !patchOk(badPatch, why));
 
@@ -315,7 +317,20 @@ int main() {
     expect("gamepadReport senza Metadata", sess.find("gamepadReport") != std::string::npos);
     expect("niente frame-ack di default", sess.find("sendFrameAcks") != std::string::npos &&
                                               sess.find("kInputPadIntervalMs") != std::string::npos);
-    expect("goog-remb in offerta", slurp("src/stream/stream_session.cpp").find("goog-remb") != std::string::npos);
+    expect("niente goog-remb duplicato",
+           slurp("src/stream/stream_session.cpp").find("addFeedback(\"goog-remb\")") == std::string::npos);
+    expect("niente addSSRC video",
+           slurp("src/stream/stream_session.cpp").find("addSSRC(kReceiverSsrc") == std::string::npos);
+    expect("JSON DC come testo", slurp("src/stream/stream_session.cpp").find("ch->send(text)") != std::string::npos);
+    expect("mtu 1280", slurp("src/stream/stream_session.cpp").find("config.mtu = 1280") != std::string::npos);
+    expect("STUN Google", slurp("src/stream/stream_session.cpp").find("stun.l.google.com") != std::string::npos);
+    expect("ECDSA", slurp("src/stream/stream_session.cpp").find("CertificateType::Ecdsa") != std::string::npos);
+    expect("coda lock-free", slurp("src/app/stream_player.cpp").find("FrameQueue") != std::string::npos);
+    expect("recv diag 1 Hz", slurp("src/app/stream_player.cpp").find("psbox_rd_snapshot") != std::string::npos);
+    expect("libdatachannel 0.24.6", slurp("scripts/fetch_deps.sh").find("v0.24.6") != std::string::npos);
+    expect("juice pin XCloud4", slurp("scripts/fetch_deps.sh").find("b89c792") != std::string::npos);
+    expect("RR solo su SR", slurp("src/stream/rtcp_reporter.cpp").find("RR su SR") != std::string::npos);
+    expect("niente sendRemb", slurp("src/stream/rtcp_reporter.cpp").find("sendRemb") == std::string::npos);
     expect("ABR senza recv_low", slurp("src/stream/abr_plan.h").find("recv_low") == std::string::npos &&
                                      slurp("src/stream/abr_plan.h").find("kAbrWarmupMs") != std::string::npos);
     expect("niente TWCC in offerta", sess.find("transport-cc") == std::string::npos &&
@@ -330,8 +345,14 @@ int main() {
     expect("un solo gamepadChanged", sess.find("sendGamepadChanged(0, false)") == std::string::npos);
     expect("reliableinput in /sdp", slurp("src/xcloud/gssv.cpp").find("reliableinput") != std::string::npos &&
                                         slurp("src/xcloud/gssv.cpp").find("unreliableinput") != std::string::npos);
-    expect("keepalive subito dopo /play", slurp("src/xcloud/gssv.cpp").find("keepalive subito dopo /play") !=
-                                              std::string::npos);
+    expect("niente keepalive subito dopo /play",
+           slurp("src/xcloud/gssv.cpp").find("keepalive subito dopo /play") == std::string::npos);
+    expect("keepalive dopo Provisioned",
+           slurp("src/stream/stream_session.cpp").find("primo keepalive dopo Provisioned") != std::string::npos);
+    expect("clientSessionId vuoto",
+           slurp("src/xcloud/gssv.cpp").find("body.set(\"clientSessionId\", \"\")") != std::string::npos);
+    expect("alias 1080",
+           slurp("src/app/stream_player.cpp").find("resolutionAlias = \"1080\"") != std::string::npos);
     expect("systemUi senza auto-complete", sess.find("systemUi senza auto-complete") != std::string::npos);
     expect("niente flushTwcc", slurp("src/stream/rtcp_reporter.cpp").find("flushTwcc") == std::string::npos);
 
@@ -339,9 +360,13 @@ int main() {
         "m=video 9 UDP/TLS/RTP/SAVPF 102\r\na=rtpmap:102 H264/90000\r\na=rtcp-fb:102 transport-cc\r\n";
     const char* good =
         "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=recvonly\r\na=rtpmap:111 opus/48000/2\r\n"
-        "m=video 9 UDP/TLS/RTP/SAVPF 102\r\na=rtpmap:102 H264/90000\r\na=rtcp-fb:102 goog-remb\r\n";
+        "m=video 9 UDP/TLS/RTP/SAVPF 102\r\na=rtpmap:102 H264/90000\r\n";
+    const char* badSsrc =
+        "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=recvonly\r\na=rtpmap:111 opus/48000/2\r\n"
+        "m=video 9 UDP/TLS/RTP/SAVPF 102\r\na=rtpmap:102 H264/90000\r\na=ssrc:1347635800 cname:video\r\n";
     expect("offerSdpOk rifiuta TWCC", !offerSdpOk(badTwcc));
-    expect("offerSdpOk accetta PT102+remb+recvonly", offerSdpOk(good));
+    expect("offerSdpOk accetta PT102+recvonly", offerSdpOk(good));
+    expect("offerSdpOk rifiuta a=ssrc video", !offerSdpOk(badSsrc));
     expect("depth 1 a 720", slurp("src/media/hw_decoder_ps4.cpp").find("kDepth720") != std::string::npos);
     expect("niente offerta a 30 Mb/s", player.find("30000000") == std::string::npos);
     std::string hw = slurp("src/media/hw_decoder_ps4.cpp");

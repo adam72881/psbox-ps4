@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 RafaelNGP
+// RTCP come libdatachannel 0.24.6 RtcpReceivingSession / XCloud4: RR solo su
+// SR del server, SSRC media. Niente REMB periodico. PLI su richiesta.
 #include "stream/rtcp_reporter.h"
 
 #include "stream/abr_plan.h"
+#include "stream/recv_diag.h"
 
 #include "util/log.h"
 
@@ -15,7 +18,6 @@ namespace xc::stream {
 
 namespace {
 
-constexpr uint64_t kReportIntervalUs = 1000000;
 constexpr uint64_t kPliQuietUs = 2000000;
 
 uint64_t nowUs() {
@@ -50,6 +52,7 @@ void RtcpReporter::armPli() { pliArmed_.store(1, std::memory_order_relaxed); }
 
 void RtcpReporter::onRtp(const uint8_t* d, size_t n, uint64_t now) {
     uint32_t ssrc = get32(d + 8);
+    psbox_rd_rtp(ssrc);
     uint16_t seq = get16(d + 2);
     if (!started_ || ssrc != mediaSsrc_) {
         started_ = true;
@@ -85,19 +88,6 @@ void RtcpReporter::onRtp(const uint8_t* d, size_t n, uint64_t now) {
     haveTransit_ = true;
 }
 
-void RtcpReporter::onRtcp(const uint8_t* d, size_t n, uint64_t now) {
-    for (size_t off = 0; off + 4 <= n;) {
-        uint8_t pt = d[off + 1];
-        size_t len = (static_cast<size_t>(get16(d + off + 2)) + 1) * 4;
-        if (off + len > n) break;
-        if (pt == 200 && len >= 28) {
-            lastSr_ = (get32(d + off + 8) << 16) | (get32(d + off + 12) >> 16);
-            lastSrArrivalUs_ = now;
-        }
-        off += len;
-    }
-}
-
 void RtcpReporter::sendPli(const rtc::message_callback& send) {
     if (!mediaSsrc_ || !send) return;
     std::vector<uint8_t> b;
@@ -114,12 +104,11 @@ void RtcpReporter::sendPli(const rtc::message_callback& send) {
     }
 }
 
-void RtcpReporter::report(uint64_t now, const rtc::message_callback& send) {
-    uint64_t intervalUs = lastReportUs_ ? now - lastReportUs_ : kReportIntervalUs;
-    lastReportUs_ = now;
+void RtcpReporter::sendRr(uint64_t now, const rtc::message_callback& send) {
+    if (!mediaSsrc_ || !send) return;
 
     uint32_t extMax = cycles_ + maxSeq_;
-    uint32_t expected = extMax - baseSeq_ + 1;
+    uint32_t expected = started_ ? extMax - baseSeq_ + 1 : 0;
     int64_t lost = static_cast<int64_t>(expected) - received_;
     lost = std::clamp<int64_t>(lost, -0x800000, 0x7FFFFF);
     uint32_t expectedInterval = expected - expectedPrior_;
@@ -133,19 +122,8 @@ void RtcpReporter::report(uint64_t now, const rtc::message_callback& send) {
     uint32_t dlsr = 0;
     if (lastSrArrivalUs_) dlsr = static_cast<uint32_t>((now - lastSrArrivalUs_) * 65536 / 1000000);
 
-    std::vector<uint8_t> b;
-    b.reserve(32);
-    b.push_back(0x81);
-    b.push_back(201);
-    put16(b, 7);
-    put32(b, kReceiverSsrc);
-    put32(b, mediaSsrc_);
-    put32(b, (uint32_t(fraction) << 24) | (static_cast<uint32_t>(lost) & 0xFFFFFF));
-    put32(b, extMax);
-    put32(b, static_cast<uint32_t>(jitter_));
-    put32(b, lastSr_);
-    put32(b, lastSr_ ? dlsr : 0);
-
+    uint64_t intervalUs = lastReportUs_ ? now - lastReportUs_ : 1000000;
+    lastReportUs_ = now;
     uint32_t rate = intervalUs ? static_cast<uint32_t>(bytesSinceReport_ * 8 * 1000000 / intervalUs) : 0;
     receiveRate_ = rate;
     bytesSinceReport_ = 0;
@@ -167,40 +145,44 @@ void RtcpReporter::report(uint64_t now, const rtc::message_callback& send) {
             XC_LOGI("abr: %u → %u kbps (%s) recv %u kbps stall %d ms", before / 1000u, abr_.currentBps / 1000u,
                     abr_.lastReason ? abr_.lastReason : "?", rate / 1000u, stallMs);
         }
-        if (bitrateSendRemb(&abr_)) {
-            std::vector<uint8_t> remb;
-            sendRemb(abr_.currentBps, mediaSsrc_, remb);
-            if (!remb.empty()) {
-                auto* rp = reinterpret_cast<const std::byte*>(remb.data());
-                send(rtc::make_message(rp, rp + remb.size(), rtc::Message::Control));
-            }
-        }
     }
+
+    std::vector<uint8_t> b;
+    b.reserve(32);
+    b.push_back(0x81);
+    b.push_back(201);
+    put16(b, 7);
+    put32(b, kReceiverSsrc);
+    put32(b, mediaSsrc_);
+    put32(b, (uint32_t(fraction) << 24) | (static_cast<uint32_t>(lost) & 0xFFFFFF));
+    put32(b, extMax);
+    put32(b, static_cast<uint32_t>(jitter_));
+    put32(b, lastSr_);
+    put32(b, lastSr_ ? dlsr : 0);
 
     uint32_t n = ++reportsSent_;
     if (n <= 4 || n % 5 == 0 || abr_.lastChanged)
-        XC_LOGI("rtcp: RR %u kbps ssrc %08x loss %u n %u%s", rate / 1000u, mediaSsrc_,
-                static_cast<unsigned>(fraction), n, maxBitrate_ ? " REMB" : " audio");
+        XC_LOGI("rtcp: RR su SR %u kbps ssrc %08x loss %u n %u", rate / 1000u, mediaSsrc_,
+                static_cast<unsigned>(fraction), n);
 
     auto* p = reinterpret_cast<const std::byte*>(b.data());
     send(rtc::make_message(p, p + b.size(), rtc::Message::Control));
 }
 
-void RtcpReporter::sendRemb(uint32_t bps, uint32_t mediaSsrc, std::vector<uint8_t>& b) {
-    uint8_t exp = 0;
-    uint32_t mantissa = bps;
-    while (mantissa >= (1u << 18)) {
-        mantissa >>= 1;
-        ++exp;
+void RtcpReporter::onRtcp(const uint8_t* d, size_t n, uint64_t now, const rtc::message_callback& send) {
+    for (size_t off = 0; off + 4 <= n;) {
+        uint8_t pt = d[off + 1];
+        size_t len = (static_cast<size_t>(get16(d + off + 2)) + 1) * 4;
+        if (off + len > n) break;
+        if (pt == 200 && len >= 28) {
+            lastSr_ = (get32(d + off + 8) << 16) | (get32(d + off + 12) >> 16);
+            lastSrArrivalUs_ = now;
+            uint32_t srSsrc = get32(d + off + 4);
+            if (srSsrc) mediaSsrc_ = srSsrc;
+            sendRr(now, send);
+        }
+        off += len;
     }
-    b.push_back(0x8F);
-    b.push_back(206);
-    put16(b, 5);
-    put32(b, kReceiverSsrc);
-    put32(b, 0);
-    b.insert(b.end(), {'R', 'E', 'M', 'B'});
-    put32(b, (1u << 24) | (uint32_t(exp) << 18) | mantissa);
-    put32(b, mediaSsrc);
 }
 
 int RtcpReporter::secondsQuiet() const {
@@ -229,19 +211,6 @@ void RtcpReporter::pump() {
                 XC_LOGI("rtcp: PLI video fermo");
             }
         }
-        if (lastReportUs_ && now - lastReportUs_ < kReportIntervalUs) return;
-        if (!started_) {
-            lastReportUs_ = now;
-            return;
-        }
-    }
-    try {
-        std::lock_guard<std::mutex> lock(mu_);
-        uint64_t now = nowUs();
-        if (now - lastReportUs_ < kReportIntervalUs) return;
-        report(now, send);
-    } catch (const std::exception& e) {
-        XC_LOGW("rtcp: invio %s", e.what());
     }
 }
 
@@ -253,7 +222,7 @@ void RtcpReporter::incoming(rtc::message_vector& messages, const rtc::message_ca
         const auto* d = reinterpret_cast<const uint8_t*>(message->data());
         size_t n = message->size();
         if (message->type == rtc::Message::Control) {
-            onRtcp(d, n, nowUs());
+            onRtcp(d, n, nowUs(), send);
         } else if (message->type == rtc::Message::Binary && n >= 12 && (d[0] >> 6) == 2) {
             onRtp(d, n, nowUs());
             rtp.push_back(std::move(message));

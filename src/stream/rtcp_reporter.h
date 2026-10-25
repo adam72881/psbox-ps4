@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 RafaelNGP
-// RTCP come XCloud4/Nexo: RR (RFC 3550) + REMB + PLI. Niente transport-cc /
-// TWCC (01.38/01.52: lo stream si fermava a ~5–8 s / ~109 feedback).
+// RTCP come libdatachannel 0.24.6 / XCloud4: RR solo su SR, SSRC media.
+// Niente REMB periodico. Niente transport-cc / TWCC.
 #pragma once
 
 #include "stream/abr_plan.h"
@@ -39,9 +39,8 @@ public:
 
 private:
     void onRtp(const uint8_t* d, size_t n, uint64_t nowUs);
-    void onRtcp(const uint8_t* d, size_t n, uint64_t nowUs);
-    void report(uint64_t nowUs, const rtc::message_callback& send);
-    void sendRemb(uint32_t bps, uint32_t mediaSsrc, std::vector<uint8_t>& out);
+    void onRtcp(const uint8_t* d, size_t n, uint64_t nowUs, const rtc::message_callback& send);
+    void sendRr(uint64_t nowUs, const rtc::message_callback& send);
     void sendPli(const rtc::message_callback& send);
 
     const uint32_t clockRate_, maxBitrate_;

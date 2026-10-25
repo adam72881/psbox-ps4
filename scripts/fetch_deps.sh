@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# Scarica OpenOrbis v0.5.4, mbedTLS 3.6.2 e libdatachannel 0.23.1 (con sottomoduli).
+# Scarica OpenOrbis v0.5.4, mbedTLS 3.6.2 e libdatachannel 0.24.6 (con sottomoduli).
+# libjuice pin XCloud4: b89c792 (export_source.sh). Contiene tryPush (3d81c0e/4fa648d),
+# MbedTLS timeout (c05cf83) e fairness juice (e74a986).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OO_PARENT="${OO_PARENT:-$HOME/ps4dev/OpenOrbis}"
 OO_URL="https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz"
+LDC_TAG="v0.24.6"
+JUICE_PIN="b89c792e3612faf2f12cf35bcc56857313a06be3"
 
 if [[ ! -x "$OO_PARENT/OpenOrbis/PS4Toolchain/bin/linux/create-fself" && ! -x "$OO_PARENT/PS4Toolchain/bin/linux/create-fself" ]]; then
     echo "scarico OpenOrbis v0.5.4"
@@ -29,8 +33,17 @@ if [[ ! -f "$ROOT/deps/mbedtls/framework/CMakeLists.txt" ]]; then
     git -C "$ROOT/deps/mbedtls" submodule update --init --depth 1 framework
 fi
 if [[ ! -f "$ROOT/deps/libdatachannel/CMakeLists.txt" ]]; then
-    git clone --depth 1 --branch v0.23.1 --recurse-submodules \
+    git clone --depth 1 --branch "$LDC_TAG" --recurse-submodules \
         https://github.com/paullouisageneau/libdatachannel.git "$ROOT/deps/libdatachannel"
+fi
+# XCloud4: stesso commit libjuice (b89c792), non il submodule tipico del tag.
+if [[ -d "$ROOT/deps/libdatachannel/deps/libjuice/.git" || -f "$ROOT/deps/libdatachannel/deps/libjuice/CMakeLists.txt" ]]; then
+    cur="$(git -C "$ROOT/deps/libdatachannel/deps/libjuice" rev-parse HEAD 2>/dev/null || true)"
+    if [[ "$cur" != "$JUICE_PIN"* ]]; then
+        echo "libjuice → $JUICE_PIN (XCloud4)"
+        git -C "$ROOT/deps/libdatachannel/deps/libjuice" fetch --depth 1 origin "$JUICE_PIN"
+        git -C "$ROOT/deps/libdatachannel/deps/libjuice" checkout -f "$JUICE_PIN"
+    fi
 fi
 if [[ ! -f "$ROOT/third_party/opus/CMakeLists.txt" ]]; then
     git clone --depth 1 --branch v1.5.2 https://github.com/xiph/opus.git "$ROOT/third_party/opus"

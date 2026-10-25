@@ -1,21 +1,18 @@
-# Release 01.54 (v1.0.54)
+# Release 01.55 (v1.0.55)
 
 | File | Note |
 | --- | --- |
-| `PSBox-PS4-01.54.pkg` | Build CI. SHA-256 dall'artifact `PSBox-PS4`. |
+| `PSBox-PS4-01.55.pkg` | Build CI. SHA-256 dall'artifact `PSBox-PS4`. |
 
-## Contenuto 01.54
+## Contenuto 01.55
 
-Allineamento XCloud4 (008f4ab) / Nexo (ce73289) dopo FAIL 01.52/01.53: stallo a ~109 TWCC / ~5,5 s indipendente dalla banda.
+Root-cause vs stallo ~5–6 s (STALLO_5S_ANALISI) allineando XCloud4 v1.1.0-beta:
 
-1. **TWCC fuori:** niente extmap/rtcp-fb transport-cc né feedback TWCC; solo RR + REMB (+ PLI).
-2. **Keepalive HTTP:** subito dopo `/play`, poi ogni 30 s; gestisce 410.
-3. **RR audio:** reporter attivo e pompato; traccia audio RecvOnly.
-4. **Audio:** niente `addSSRC(1)` / packetizer.
-5. **H.264:** solo PT 102 Constrained Baseline (niente 104/106).
-6. **/sdp body:** `reliableinput` / `unreliableinput` `{minVersion:9,maxVersion:9}`.
-7. **systemUi:** nessun TransactionComplete automatico (tastiera come Nexo).
-8. **control:** auth → un `gamepadChanged true` → config → un solo alias risoluzione.
-9. **Identità /play:** timezone locale; osName come XCloud4; `b=AS` dal tetto ABR.
-
-UI invariata.
+1. **libdatachannel 0.24.6** + **libjuice b89c792** (pin XCloud4); patch PS4 ribasate. Contiene tryPush, MbedTLS timeout, fairness juice.
+2. **Niente lock/send** nei callback ldc: coda video lock-free (drop se piena); `queueText`/`flushOutbound` per i JSON.
+3. **Identità XCloud4:** `/play` web/windows + displayInfo; altri endpoint native console; `osName` windows; `clientSessionId` vuoto; touch 0; video 1920×1080 / 60 / 12000 kbps / alias `1080`.
+4. **RTCP:** RR solo su SR (SSRC media); niente REMB periodico; niente `goog-remb` duplicato né `a=ssrc` su recvonly.
+5. **Data channel:** JSON come testo; `clientAppInstallId` XCloud4; niente TransactionComplete automatico.
+6. **Keepalive:** primo dopo Provisioned, poi ogni 30 s (non subito dopo `/play`).
+7. **PC:** mtu 1280, STUN Google, maxMessageSize 65536, certificato ECDSA.
+8. **Diagnostica:** contatori recv permanenti 1 Hz in `xcloud.log`.

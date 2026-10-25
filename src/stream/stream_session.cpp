@@ -42,8 +42,8 @@ namespace {
 
 // Fixed values the xbox.com web client sends.
 constexpr const char* kControlAccessKey = "4BDB3609-C1F1-4195-9B37-FEFF45DA8B8E";
-constexpr const char* kHandshakeId = "be0bfc6d-1e83-4c8a-90ed-fa8601c5a179";
-constexpr const char* kClientAppInstallId = "c97d7ee0-73b2-4239-bf1d-9d805a338429";
+/* Handshake id random (XCloud4). Install id pin XCloud4 rtc_transport.c:855. */
+constexpr const char* kClientAppInstallId = "f9ac8684-1032-4131-bb47-d2f58da9bb93";
 // SystemUiType che il client web xCloud dichiara in systemUis
 // (xbox-xcloud-player message.ts). Senza questi il server manda comunque
 // ShowGameTimeNotification e simili; con questi ci aspettiamo le Message
@@ -256,7 +256,7 @@ struct StreamSession::Impl {
     }
 
     static void sendTextUnlocked(const std::shared_ptr<rtc::DataChannel>& ch, const std::string& text) {
-        // The web client sends its JSON as binary (TextEncoder) messages.
+        /* XCloud4 rtc_transport.c:491 — JSON come testo (size -1). */
         if (!ch || !ch->isOpen()) {
             static int drops = 0;
             if (drops < 8) {
@@ -266,7 +266,7 @@ struct StreamSession::Impl {
             return;
         }
         try {
-            ch->send(reinterpret_cast<const rtc::byte*>(text.data()), text.size());
+            ch->send(text);
         } catch (const std::exception& e) {
             XC_LOGW("send on %s: %s", ch->label().c_str(), e.what());
         }
@@ -368,7 +368,7 @@ struct StreamSession::Impl {
         json::Value res = json::Value::object();
         res.set("message", "userRequestedResolutionUpdate");
         res.set("resolutionAlias", alias);
-        sendText(control, res.dump());
+        queueText(control, res.dump());
         XC_LOGI("requested stream resolution %s", alias.c_str());
     }
 
@@ -390,21 +390,21 @@ struct StreamSession::Impl {
         json::Value systemUis = json::Value::array();
         if (cb.textInput) systemUis.push(kShowVirtualKeyboard);
         ui.set("systemUis", systemUis);
-        sendText(message, messageEnvelope("/streaming/systemUi/configuration", ui));
+        queueText(message, messageEnvelope("/streaming/systemUi/configuration", ui));
 
         json::Value install = json::Value::object();
         install.set("clientAppInstallId", kClientAppInstallId);
-        sendText(message, messageEnvelope("/streaming/properties/clientappinstallidchanged", install));
+        queueText(message, messageEnvelope("/streaming/properties/clientappinstallidchanged", install));
 
         json::Value orientation = json::Value::object();
         orientation.set("orientation", 0);
-        sendText(message, messageEnvelope("/streaming/characteristics/orientationchanged", orientation));
+        queueText(message, messageEnvelope("/streaming/characteristics/orientationchanged", orientation));
 
         json::Value touch = json::Value::object();
         touch.set("touchInputEnabled", false);
-        sendText(message, messageEnvelope("/streaming/characteristics/touchinputenabledchanged", touch));
+        queueText(message, messageEnvelope("/streaming/characteristics/touchinputenabledchanged", touch));
 
-        sendText(message, messageEnvelope("/streaming/characteristics/clientdevicecapabilities", json::Value::object()));
+        queueText(message, messageEnvelope("/streaming/characteristics/clientdevicecapabilities", json::Value::object()));
 
         // Come il client web: horizontal/vertical sono i pixel dell'elemento
         // video. 720HQ / 1080HQ devono mappare la base (bug 01.51: == "720"
@@ -421,7 +421,7 @@ struct StreamSession::Impl {
         dims.set("safeAreaRight", w);
         dims.set("safeAreaBottom", h);
         dims.set("supportsCustomResolution", true);
-        sendText(message, messageEnvelope("/streaming/characteristics/dimensionschanged", dims));
+        queueText(message, messageEnvelope("/streaming/characteristics/dimensionschanged", dims));
         XC_LOGI("message: config client inviata %dx%d (alias %s) systemUis %s", w, h,
                 opt.resolutionAlias.empty() ? "-" : opt.resolutionAlias.c_str(),
                 cb.textInput ? "tastiera" : "vuoto");
@@ -436,7 +436,7 @@ struct StreamSession::Impl {
         v.set("message", "gamepadChanged");
         v.set("gamepadIndex", index);
         v.set("wasAdded", added);
-        sendText(control, v.dump());
+        queueText(control, v.dump());
     }
 
     void announceGamepad() {
@@ -457,7 +457,7 @@ struct StreamSession::Impl {
         json::Value auth = json::Value::object();
         auth.set("message", "authorizationRequest");
         auth.set("accessKey", kControlAccessKey);
-        sendText(control, auth.dump());
+        queueText(control, auth.dump());
         announceGamepad();
         sendClientConfig();
         if (opt.resolutionAlias == "1440" && !gssv.isHome())
@@ -477,15 +477,6 @@ struct StreamSession::Impl {
         auto j = json::parse(text);
         if (!j) {
             XC_LOGW("message channel: unparsable %s", text.substr(0, 200).c_str());
-            // Meglio chiudere una transazione a caso che lasciarla aperta 8 s.
-            auto idPos = text.find("\"id\"");
-            if (idPos != std::string::npos) {
-                auto q1 = text.find('"', idPos + 4);
-                if (q1 != std::string::npos) q1 = text.find('"', q1 + 1);
-                auto q2 = q1 != std::string::npos ? text.find('"', q1 + 1) : std::string::npos;
-                if (q1 != std::string::npos && q2 != std::string::npos && q2 > q1 + 1)
-                    completeTransaction(text.substr(q1 + 1, q2 - q1 - 1), json::Value::object());
-            }
             return;
         }
         std::string type = (*j)["type"].str();
@@ -533,26 +524,14 @@ struct StreamSession::Impl {
         if (target == "/streaming/properties/titleinfo") {
             auto info = json::parse((*j)["content"].str());
             if (info && cb.titleFocus) cb.titleFocus((*info)["focused"].asBool());
-            if (!id.empty()) {
-                XC_LOGI("message: titleinfo chiusa");
-                completeTransaction(id, json::Value::object());
-            }
+            /* XCloud4: nessun TransactionComplete automatico. */
             return;
         }
 
         if (target.find("serverInitiatedDisconnect") != std::string::npos) {
             std::string body = (*j)["content"].str();
             XC_LOGW("server disconnect: %s", body.substr(0, 300).c_str());
-            // Risposta immediata (thread message): senza TransactionComplete il
-            // server chiude DTLS prima che pumpFast flushi la coda.
-            {
-                json::Value v = json::Value::object();
-                v.set("type", "TransactionComplete");
-                v.set("content", json::Value("").dump());
-                v.set("id", id);
-                v.set("cv", "");
-                sendText(message, v.dump());
-            }
+            /* XCloud4: nessun TransactionComplete automatico. */
             auto content = json::parse(body);
             std::string reason = content ? (*content)["reason"].str() : std::string();
             if (reason.empty() && content) reason = (*content)["Reason"].str();
@@ -586,10 +565,7 @@ struct StreamSession::Impl {
             return;
         }
 
-        if (!id.empty()) {
-            XC_LOGI("message: transazione %s chiusa", target.c_str());
-            completeTransaction(id, json::Value::object());
-        }
+        /* XCloud4: nessun TransactionComplete automatico. */
     }
 
     // --- set-up ---------------------------------------------------------------
@@ -639,15 +615,13 @@ struct StreamSession::Impl {
         XC_LOGI("webrtc: config");
         rtc::Configuration config;
         config.disableAutoNegotiation = true;
-        // Default libdatachannel = 1280. Su Orbis i TWCC grandi della 01.35
-        // (count 222–314 ≈ 900–1300 B) finivano al bordo MTU; i ClientHello
-        // DTLS sono ~342 B quindi il fallimento 01.36 non era MTU, ma i
-        // feedback grandi sì. 1200 lascia margine su Teredo/UDP.
-        config.mtu = 1200;
-        /* STUN di Teams: il primo server è l'unico che libjuice interroga.
-         * Senza, l'unico candidato locale è l'host di getifaddrs. */
-        config.iceServers.emplace_back("worldaz.relay.teams.microsoft.com", uint16_t{3478});
-        XC_LOGI("webrtc: ctor (mtu %zu)", *config.mtu);
+        /* XCloud4 rtc_transport.c:988-995. */
+        config.mtu = 1280;
+        config.maxMessageSize = 65536;
+        config.certificateType = rtc::CertificateType::Ecdsa;
+        config.forceMediaTransport = true;
+        config.iceServers.emplace_back("stun:stun.l.google.com:19302");
+        XC_LOGI("webrtc: ctor (mtu %zu maxMsg %zu ecdsa)", *config.mtu, *config.maxMessageSize);
         pc = std::make_shared<rtc::PeerConnection>(config);
         XC_LOGI("webrtc: ctor ok");
 
@@ -705,7 +679,7 @@ struct StreamSession::Impl {
             inputDown.store(false);
             /* Solo ClientMetadata (type 8) all'apertura, come XCloud4. */
             uint32_t seq = inputSequence.fetch_add(1);
-            uint8_t touches = 1;
+            uint8_t touches = 0; /* XCloud4 */
             if (const char* t = std::getenv("XC_TOUCH_POINTS")) touches = static_cast<uint8_t>(std::atoi(t));
             sendBinary(input, clientMetadataReport(seq, nowMs(), touches));
         });
@@ -716,9 +690,9 @@ struct StreamSession::Impl {
             json::Value hs = json::Value::object();
             hs.set("type", "Handshake");
             hs.set("version", "messageV1");
-            hs.set("id", kHandshakeId);
+            hs.set("id", uuid4());
             hs.set("cv", "0");
-            sendText(message, hs.dump());
+            queueText(message, hs.dump());
         });
         message->onMessage([this](rtc::message_variant m) { onMessageChannel(m); });
         control->onMessage([](rtc::message_variant m) { XC_LOGD("control: %s", asText(m).substr(0, 300).c_str()); });
@@ -752,17 +726,14 @@ struct StreamSession::Impl {
             if (cb.audio) cb.audio(reinterpret_cast<const uint8_t*>(data.data()), data.size(), info.timestamp);
         });
 
-        /* Video: solo PT 102 Constrained Baseline + goog-remb. Niente TWCC
-         * (01.52: stallo a ~109 feedback / ~5,5 s indipendente dal bitrate). */
+        /* Video: PT 102. goog-remb una volta da addH264Codec. Niente a=ssrc. */
         rtc::Description::Video v("1", rtc::Description::Direction::RecvOnly);
         const char* fmtp = streamH264Fmtp(opt.resolutionAlias.c_str());
         v.addH264Codec(kOfferVideoPt, fmtp);
-        if (auto* m = v.rtpMap(kOfferVideoPt)) m->addFeedback("goog-remb");
         v.setBitrate(static_cast<int>(opt.maxBitrate / 1000u));
-        v.addSSRC(kReceiverSsrc, "video");
         StreamDims offerDim = streamDimsForAlias(opt.resolutionAlias.c_str());
-        XC_LOGI("video: offro %u kbps %dx%d fmtp %s, ssrc rtcp %08x, remb (no TWCC)",
-                opt.maxBitrate / 1000u, offerDim.w, offerDim.h, fmtp, kReceiverSsrc);
+        XC_LOGI("video: offro %u kbps %dx%d fmtp %s (no a=ssrc, no TWCC)",
+                opt.maxBitrate / 1000u, offerDim.w, offerDim.h, fmtp);
         video = pc->addTrack(v);
         guard->self = this;
         auto videoReceiver = std::make_shared<H264Receiver>(
@@ -878,7 +849,7 @@ struct StreamSession::Impl {
     // Una negoziazione ICE+SDP. Dopo ICE connected si attende l'handshake
     // fino a connectTimeoutMs (niente chiusura PC a 3 s).
     bool negotiateOnce(std::string& err) {
-        /* Keepalive già partito subito dopo /play; qui si ripete ogni 30 s. */
+        /* XCloud4: primo keepalive dopo Provisioned, poi ogni 30 s. */
         negKaMs = 0;
         negotiateKeepalive();
         createPeer();
@@ -906,9 +877,9 @@ struct StreamSession::Impl {
         }
         std::string offer = std::string(*local);
         if (!offerSdpOk(offer.c_str()))
-            XC_LOGW("offerta SDP fuori politica 01.54 (TWCC/PT extra/audio send?)");
+            XC_LOGW("offerta SDP fuori politica 01.55 (TWCC/PT extra/audio send?)");
         else
-            XC_LOGI("offerta SDP: PT102 Baseline, remb, audio recvonly, no TWCC");
+            XC_LOGI("offerta SDP: PT102 Baseline, audio recvonly, no TWCC/a=ssrc");
         XC_LOGD("local offer:\n%s", offer.c_str());
         logSdpLine("offer", offer, "a=setup:");
         logSdpLine("offer", offer, "a=fingerprint:");

@@ -17,6 +17,8 @@
 #include "stream/connect_plan.h"
 #include "stream/idr_gate.h"
 #include "stream/stream_session.h"
+#include "stream/frame_queue.h"
+#include "stream/recv_diag.h"
 #include "ui/strings.h"
 #include "util/log.h"
 
@@ -94,14 +96,8 @@ struct StreamPlayer::Impl {
 
     std::mutex mutex;
     std::condition_variable cv;
-    // An access unit, with what the server wants to hear about it.
-    struct VideoFrame {
-        std::vector<uint8_t> data;
-        uint32_t rtpTimestamp = 0;
-        double arrivalMs = 0;  // StreamSession::clockMs()
-        uint64_t arrivalUs = 0;  // platform::nowUs(), for the display latency
-    };
-    std::deque<VideoFrame> frames;
+    using VideoFrame = stream::QueuedFrame;
+    stream::FrameQueue<32> frameQ;
     std::atomic<bool> running{false};
     std::string endReason;
     platform::Thread videoThread, audioThread;
@@ -337,14 +333,13 @@ struct StreamPlayer::Impl {
             bool have = false;
             {
                 std::unique_lock<std::mutex> lock(mutex);
-                if (frames.empty()) {
+                if (frameQ.sizeApprox() == 0) {
                     cv.wait_for(lock, std::chrono::milliseconds(held.valid ? 8 : 500),
-                                [&] { return !running || g_appStopping.load() || !frames.empty(); });
+                                [&] { return !running || g_appStopping.load() || frameQ.sizeApprox() != 0; });
                 }
                 if (!running || g_appStopping.load()) break;
-                if (!frames.empty()) {
-                    frame = std::move(frames.front());
-                    frames.pop_front();
+                if (frameQ.sizeApprox() != 0) {
+                    if (!frameQ.tryPop(frame)) continue;
                     have = true;
                 }
             }
@@ -376,8 +371,8 @@ struct StreamPlayer::Impl {
                 size_t n = 1;
                 {
                     std::lock_guard<std::mutex> lock(mutex);
-                    n += frames.size();
-                    frames.clear();
+                    n += frameQ.sizeApprox();
+                    frameQ.clear();
                 }
                 stats::statsNoteDrop(1, n);
                 if (!waitIdr.exchange(true)) idrSinceMs.store(platform::nowMs());
@@ -528,11 +523,10 @@ struct StreamPlayer::Impl {
             size_t backlog;
             {
                 std::unique_lock<std::mutex> lock(mutex);
-                cv.wait(lock, [&] { return !running || !frames.empty(); });
+                cv.wait(lock, [&] { return !running || frameQ.sizeApprox() != 0; });
                 if (!running) break;
-                frame = std::move(frames.front());
-                frames.pop_front();
-                backlog = frames.size();
+                if (!frameQ.tryPop(frame)) continue;
+                backlog = frameQ.sizeApprox();
             }
             if (dumpFile) {
                 // 4-byte little-endian length, then the access unit as received.
@@ -728,6 +722,7 @@ struct StreamPlayer::Impl {
             }
         }
         trace::beginSession();
+        psbox_rd_reset();
         trace::setStage("PLAYER_START");
 #endif
         if (
@@ -745,15 +740,14 @@ struct StreamPlayer::Impl {
 
         stream::StreamCallbacks cb;
         cb.video = [this](const uint8_t* d, size_t n, uint32_t rtpTimestamp) {
-            // Thread RTP/juice: niente reportFrame, niente sessionMutex, niente
-            // decoder. Un send bloccante qui uccide ICE (01.30: Lost connectivity).
+            // Thread RTP/juice: coda lock-free, drop se piena. Niente mutex/decoder/send.
             if (n == 0) {
                 keyframeWanted = true;
                 return;
             }
             if (++videoFrames == 1) {
                 XC_LOGI("first video frame received: %zu bytes", n);
-                xc_log_stamp("video: rtp→coda (no ack sul thread rete)");
+                xc_log_stamp("video: rtp→coda lock-free");
             }
             {
                 static int lastProfile = -1, lastLevel = -1;
@@ -770,22 +764,29 @@ struct StreamPlayer::Impl {
                         break;
                     }
             }
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                if (frames.size() >= kMaxQueuedFrames) {
-                    size_t n = frames.size();
-                    frames.clear();
-                    droppedFrames += n;
-                    ++queueResets;
-                    keyframeWanted = true;
-                    waitIdr.store(true);
-                    if (!idrSinceMs.load()) idrSinceMs.store(platform::nowMs());
-                    stats::statsNoteDrop(0, n);
-                }
-                stats::statsNoteReceived(1);
-                stats::statsNoteQueue(static_cast<uint32_t>(frames.size() + 1));
-                frames.push_back({std::vector<uint8_t>(d, d + n), rtpTimestamp, stream::clockMs(), platform::nowUs()});
+            VideoFrame vf;
+            vf.data.assign(d, d + n);
+            vf.rtpTimestamp = rtpTimestamp;
+            vf.arrivalMs = stream::clockMs();
+            vf.arrivalUs = platform::nowUs();
+            if (!frameQ.tryPush(std::move(vf))) {
+                frameQ.clear();
+                droppedFrames += 1;
+                ++queueResets;
+                keyframeWanted = true;
+                waitIdr.store(true);
+                if (!idrSinceMs.load()) idrSinceMs.store(platform::nowMs());
+                stats::statsNoteDrop(0, 1);
+                // retry once after clear
+                VideoFrame again;
+                again.data.assign(d, d + n);
+                again.rtpTimestamp = rtpTimestamp;
+                again.arrivalMs = stream::clockMs();
+                again.arrivalUs = platform::nowUs();
+                frameQ.tryPush(std::move(again));
             }
+            stats::statsNoteReceived(1);
+            stats::statsNoteQueue(static_cast<uint32_t>(frameQ.sizeApprox()));
             cv.notify_one();
         };
         cb.audio = [this](const uint8_t* d, size_t n, uint32_t) {
@@ -856,7 +857,8 @@ struct StreamPlayer::Impl {
             break;
         case xcloud::Resolution::P1080:
         case xcloud::Resolution::P1080HQ:
-            opts.resolutionAlias = "1080HQ";
+            /* XCloud4 1080p-G8: alias 1080, 1920x1080, 12000 kbps. */
+            opts.resolutionAlias = "1080";
             tier = ABR_1080;
             break;
         case xcloud::Resolution::P720:
@@ -1124,6 +1126,8 @@ struct StreamPlayer::Impl {
         if (auto s = current()) s->pumpFast();
     }
 
+    uint64_t lastRecvDiagMs = 0;
+
     // About once a second (worker thread).
     void tick() {
         if (!running) return;
@@ -1131,6 +1135,24 @@ struct StreamPlayer::Impl {
         auto s = current();
         if (!s) return;
         s->tick();
+        uint64_t nowDiag = platform::nowMs();
+        if (nowDiag - lastRecvDiagMs >= 1000) {
+            lastRecvDiagMs = nowDiag;
+            PsboxRecvSnap snap{};
+            psbox_rd_snapshot(&snap);
+            XC_LOGI(
+                "recv: poll=%llu dtls_in=%llu push_ok=%llu push_drop=%llu dorecv=%llu q=%d inside=%d "
+                "consent_tx=%llu consent_rx=%llu rtp[%08x]=%llu rtp[%08x]=%llu",
+                static_cast<unsigned long long>(snap.poll_recv),
+                static_cast<unsigned long long>(snap.dtls_incoming),
+                static_cast<unsigned long long>(snap.dtls_push_ok),
+                static_cast<unsigned long long>(snap.dtls_push_drop),
+                static_cast<unsigned long long>(snap.dorecv), snap.queue_size, snap.inside_push,
+                static_cast<unsigned long long>(snap.consent_sent),
+                static_cast<unsigned long long>(snap.consent_recv), snap.rtp_ssrc_a,
+                static_cast<unsigned long long>(snap.rtp_a), snap.rtp_ssrc_b,
+                static_cast<unsigned long long>(snap.rtp_b));
+        }
         const auto& vst = s->videoStats();
         stats::statsNoteNet(vst.lost.load(), vst.nacks.load(), vst.recovered.load());
         stats::statsNoteBitrate(vst.estimate.load() ? vst.estimate.load() : options.maxBitrate);
@@ -1414,7 +1436,7 @@ StreamPlayer::Stats StreamPlayer::stats() const {
     }
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
-        st.queued = impl_->frames.size();
+        st.queued = impl_->frameQ.sizeApprox();
     }
     return st;
 }

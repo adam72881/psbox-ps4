@@ -2,7 +2,7 @@
 # Linux headless harness — same auth/GSSV/WebRTC/input/ack code as the PS4 app.
 #   cmake -S host -B build-host -G Ninja && cmake --build build-host -j$(nproc)
 cmake_minimum_required(VERSION 3.20)
-project(psbox_host VERSION 1.0.54 LANGUAGES C CXX)
+project(psbox_host VERSION 1.0.55 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -65,10 +65,10 @@ set_target_properties(MbedTLS::MbedCrypto PROPERTIES INTERFACE_LINK_LIBRARIES \"
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_BINARY_DIR}")
 find_package(MbedTLS REQUIRED)
 # Host must NOT use the PS4-patched deps/libdatachannel (sconn_len layout).
-# Use a clean v0.23.1 tree (same version) prepared at configure time.
+# Use a clean v0.24.6 tree (same version as PS4) prepared at configure time.
 set(LDC_HOST "/tmp/libdatachannel-host")
 if(NOT EXISTS "${LDC_HOST}/src/impl/sctptransport.cpp")
-    message(FATAL_ERROR "Missing ${LDC_HOST}. Clone libdatachannel v0.23.1 with submodules.")
+    message(FATAL_ERROR "Missing ${LDC_HOST}. Clone libdatachannel v0.24.6 with submodules.")
 endif()
 add_subdirectory(${LDC_HOST} ${CMAKE_BINARY_DIR}/libdatachannel EXCLUDE_FROM_ALL)
 
@@ -97,6 +97,7 @@ add_library(xcloud_stream STATIC
     ${PSBOX_ROOT}/src/stream/h264_receiver.cpp
     ${PSBOX_ROOT}/src/stream/input_packet.cpp
     ${PSBOX_ROOT}/src/stream/rtcp_reporter.cpp
+    ${PSBOX_ROOT}/src/stream/recv_diag.cpp
     ${PSBOX_ROOT}/src/stream/stream_session.cpp
 )
 target_link_libraries(xcloud_stream PUBLIC xcloud_core PRIVATE datachannel-static)

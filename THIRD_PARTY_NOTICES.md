@@ -16,8 +16,8 @@ the end.
 | Component | Version | License | Source / license text |
 | --- | --- | --- | --- |
 | Mbed TLS | 3.6.2 | Apache-2.0 (dual-licensed Apache-2.0 OR GPL-2.0-or-later) | `deps/mbedtls`, `deps/mbedtls/LICENSE` |
-| libdatachannel | 0.23.1 | MPL-2.0 | `deps/libdatachannel`, `LICENSE` there |
-| libjuice | b509b6c (libdatachannel submodule) | MPL-2.0 | `deps/libdatachannel/deps/libjuice` |
+| libdatachannel | 0.24.6 | MPL-2.0 | `deps/libdatachannel`, `LICENSE` there |
+| libjuice | b89c792 (XCloud4 pin) | MPL-2.0 | `deps/libdatachannel/deps/libjuice` |
 | usrsctp | fec583d (libdatachannel submodule) | BSD-3-Clause | `deps/libdatachannel/deps/usrsctp/LICENSE.md` |
 | libSRTP | ee1a77c (libdatachannel submodule) | BSD-3-Clause | `deps/libdatachannel/deps/libsrtp/LICENSE` |
 | plog | 94899e0 (libdatachannel submodule) | MIT | `deps/libdatachannel/deps/plog/LICENSE` |
