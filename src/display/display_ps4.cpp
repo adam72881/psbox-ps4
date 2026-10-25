@@ -8,6 +8,7 @@
 // un jmp infinito: il simbolo si prende dallo SPRX, come AddBufferYccPrivilege.
 #include "display/display.h"
 #include "display/flip_sched.h"
+#include "display/scale_3to2.h"
 #include "display/gpu.h"
 #include "platform/platform.h"
 #include "util/log.h"
@@ -507,10 +508,10 @@ void scale3to2Rows(const BlitWork& j) {
             // Come NV12 a destinazione: u0 v0 u1 v1 … (stesso layout di sseRows).
             alignas(16) uint8_t uvs[16];
             for (int k = 0; k < 16; ++k) {
-                int sx = (x + k) + ((x + k) >> 1);  // * 3/2
-                if (sx >= srcW) sx = srcW - 1;
-                ys[k] = yrow[sx];
-                int uvx = sx & ~1;
+                int i0 = 0, i1 = 0;
+                scale3to2Tap(x + k, srcW, &i0, &i1);
+                ys[k] = i0 == i1 ? yrow[i0] : static_cast<uint8_t>((yrow[i0] + yrow[i1]) >> 1);
+                int uvx = i0 & ~1;
                 uvs[k] = (k & 1) ? uvrow[uvx + 1] : uvrow[uvx];
             }
             __m128i uv8 = _mm_load_si128(reinterpret_cast<const __m128i*>(uvs));
@@ -526,10 +527,11 @@ void scale3to2Rows(const BlitWork& j) {
                        _mm_unpackhi_epi16(guv, guv), _mm_unpackhi_epi16(bu, bu), a255);
         }
         for (; x < j.dstW; ++x) {
-            int sx = x + (x >> 1);
-            if (sx >= srcW) sx = srcW - 1;
-            int uvx = sx & ~1;
-            bgraPx(drow + x * 4, yrow[sx], uvrow[uvx] - 128, uvrow[uvx + 1] - 128);
+            int i0 = 0, i1 = 0;
+            scale3to2Tap(x, srcW, &i0, &i1);
+            int y = i0 == i1 ? yrow[i0] : (yrow[i0] + yrow[i1]) >> 1;
+            int uvx = i0 & ~1;
+            bgraPx(drow + x * 4, static_cast<uint8_t>(y), uvrow[uvx] - 128, uvrow[uvx + 1] - 128);
         }
     }
 }

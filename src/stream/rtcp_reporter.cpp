@@ -2,6 +2,8 @@
 // Copyright (C) 2026 RafaelNGP
 #include "stream/rtcp_reporter.h"
 
+#include "stream/abr_plan.h"
+
 #include "util/log.h"
 
 #include <algorithm>
@@ -101,8 +103,13 @@ void logTwccPacket(uint32_t n, const std::vector<uint8_t>& b, uint16_t base, int
 
 RtcpReporter::RtcpReporter(uint32_t clockRate, uint32_t maxBitrate)
     : clockRate_(clockRate), maxBitrate_(maxBitrate) {
-    estimate_ = maxBitrate;
+    abr_ = bitrateBegin(ABR_1080, 0);
+    abr_.ceilingBps = maxBitrate ? maxBitrate : abr_.ceilingBps;
+    abr_.currentBps = abr_.ceilingBps;
+    estimate_ = abr_.currentBps;
 }
+
+void RtcpReporter::armPli() { pliArmed_.store(1, std::memory_order_relaxed); }
 
 void RtcpReporter::onRtp(const uint8_t* d, size_t n, uint64_t now) {
     uint32_t ssrc = get32(d + 8);
@@ -375,11 +382,22 @@ void RtcpReporter::report(uint64_t now, const rtc::message_callback& send) {
     // insieme a TWCC confonde il GCC del server (PS5/browser: solo TWCC).
     uint32_t rate = intervalUs ? static_cast<uint32_t>(bytesSinceReport_ * 8 * 1000000 / intervalUs) : 0;
     receiveRate_ = rate;
-    estimate_ = rate ? rate : estimate_.load();
+    bitrateOnReport(&abr_, fraction, static_cast<int>(intervalUs / 1000));
+    estimate_ = abr_.currentBps;
+    bool sentRemb = bitrateSendRemb(&abr_) != 0;
+    if (sentRemb) {
+        std::vector<uint8_t> remb;
+        sendRemb(abr_.currentBps, mediaSsrc_, remb);
+        if (!remb.empty()) {
+            auto* rp = reinterpret_cast<const std::byte*>(remb.data());
+            send(rtc::make_message(rp, rp + remb.size(), rtc::Message::Control));
+        }
+    }
     uint32_t n = ++reportsSent_;
     if (n <= 4 || n % 5 == 0)
-        XC_LOGI("rtcp: RR %u kbps (recv) ssrc %08x loss %u n %u twcc %u (no REMB)", rate / 1000u, mediaSsrc_,
-                static_cast<unsigned>(fraction), n, twccSent_.load());
+        XC_LOGI("rtcp: RR %u kbps (recv) stima %u kbps ssrc %08x loss %u n %u twcc %u%s", rate / 1000u,
+                abr_.currentBps / 1000u, mediaSsrc_, static_cast<unsigned>(fraction), n, twccSent_.load(),
+                sentRemb ? " REMB" : "");
     bytesSinceReport_ = 0;
 
     auto* p = reinterpret_cast<const std::byte*>(b.data());
@@ -392,7 +410,7 @@ void RtcpReporter::report(uint64_t now, const rtc::message_callback& send) {
 }
 
 void RtcpReporter::sendRemb(uint32_t bps, uint32_t mediaSsrc, std::vector<uint8_t>& b) {
-    // Tenuto per compat / test; il path stream con TWCC non lo chiama più.
+    // Solo quando la stima è sotto il tetto. Al tetto il TWCC basta.
     uint8_t exp = 0;
     uint32_t mantissa = bps;
     while (mantissa >= (1u << 18)) {
@@ -431,8 +449,11 @@ void RtcpReporter::pump() {
                 now = nowUs();
             }
         }
-        if (started_ && maxBitrate_ && lastRtpUs_.load() && now - lastRtpUs_.load() >= kPliQuietUs &&
-            (!lastPliUs_ || now - lastPliUs_ >= kPliQuietUs)) {
+        if (pliArmed_.exchange(0, std::memory_order_relaxed)) {
+            sendPli(send);
+            lastPliUs_ = now;
+        } else if (started_ && maxBitrate_ && lastRtpUs_.load() && now - lastRtpUs_.load() >= kPliQuietUs &&
+                   (!lastPliUs_ || now - lastPliUs_ >= kPliQuietUs)) {
             sendPli(send);
             lastPliUs_ = now;
             XC_LOGI("rtcp: PLI video fermo");
@@ -470,6 +491,7 @@ void RtcpReporter::incoming(rtc::message_vector& messages, const rtc::message_ca
         }
     }
     messages.swap(rtp);
+    if (pliArmed_.exchange(0, std::memory_order_relaxed)) sendPli(send);
 }
 
 }  // namespace xc::stream

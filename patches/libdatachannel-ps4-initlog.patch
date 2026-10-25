@@ -82,7 +82,7 @@ index f28422c..105d399 100644
  #include <iostream>
  #include <random>
  #include <sstream>
-@@ -29,6 +30,8 @@
+@@ -29,6 +30,9 @@
  
  #include <sys/types.h>
  
@@ -111,7 +111,7 @@ index f28422c..105d399 100644
  }
  
  optional<string> IceTransport::getLocalAddress() const {
-@@ -361,6 +367,16 @@ void IceTransport::RecvCallback(juice_agent_t *, const char *data, size_t size,
+@@ -361,6 +367,20 @@ void IceTransport::RecvCallback(juice_agent_t *, const char *data, size_t size,
  	auto iceTransport = static_cast<rtc::impl::IceTransport *>(user_ptr);
  	try {
  		PLOG_VERBOSE << "Incoming size=" << size;
@@ -181,7 +181,7 @@ index aad72dd..8b7e5d4 100644
  
  #ifdef _WIN32
  	WSADATA wsaData;
-@@ -118,10 +142,25 @@ void Init::doInit() {
+@@ -118,10 +142,27 @@ void Init::doInit() {
  		throw std::runtime_error("WSAStartup failed, error=" + std::to_string(WSAGetLastError()));
  #endif
  
@@ -194,7 +194,9 @@ index aad72dd..8b7e5d4 100644
 +	 * sysconf(84): su Orbis musl entra in cpuset_getaffinity. Il pool è fisso,
 +	 * uguale a MIN_THREADPOOL_SIZE. Nessuna delle due chiamate. */
 +	xc_log_flush_line("I", "init nproc");
-+	int count = MIN_THREADPOOL_SIZE;
++	/* hardware_concurrency su Orbis chiama sysconf e può morire. 4 thread
++	 * coprono ICE, DTLS, SCTP e i NACK senza chiedere il numero di CPU. */
++	int count = 4;
 +	{
 +		char msg[40];
 +		std::snprintf(msg, sizeof msg, "nproc %d pool %d", count, count);

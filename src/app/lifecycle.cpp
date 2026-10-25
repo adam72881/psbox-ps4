@@ -12,6 +12,7 @@
 
 #include "app/lifecycle_decide.h"
 
+#include "app/session_stats.h"
 #include "app/stream_player.h"
 #include "display/display.h"
 #include "input/controller.h"
@@ -127,6 +128,8 @@ void dieNow(const char* why) {
 
     // ATTRIBUTE=0: niente LoadExec. _exit evita i dtor di libdatachannel /
     // Videodec2 che in chiusura di sistema sono CE-34878-0.
+    stats::statsFinish("chiusura");
+    stats::statsWriteFinal();
     xc_log_stamp("exit: _exit(0)");
     xc_log_stamp("exit: processo terminato (dieNow)");
     _exit(0);
@@ -316,6 +319,7 @@ void applyLifeResult(const LifeResult& step) {
         xc_log_stamp("exit: bg=1 risorse rilasciate");
         XC_LOGI("exit: bg=1 VideoOut/audio/pad rilasciati, flip fermi, app sospesa");
         xc_log_stamp("exit: Chiudi dal menu = SIGTERM sullo stack normale");
+        stats::statsNoteMenu(1);
     }
     if (step.homeResume) {
         input::resumeFromHome();
@@ -323,11 +327,12 @@ void applyLifeResult(const LifeResult& step) {
         display::resumeFromHome();
         g_psMenu.store(false);
         if (g_playerMutex.try_lock()) {
-            if (g_player) g_player->requestKeyframe();
+            if (g_player) g_player->armReferenceLoss();
             g_playerMutex.unlock();
         }
         xc_log_stamp("exit: ripresa dal menu PS");
         XC_LOGI("exit: ripresa dal menu PS (video, audio, pad)");
+        stats::statsNoteMenu(0);
     }
     if (step.releaseStream) softReleaseStreamResources("bg>300ms");
     if (step.resumeStream) {
@@ -581,13 +586,6 @@ void pumpLifecycle(bool fromMain) {
 
 void monitorLoop() {
     ensureModules();
-    sigset_t open;
-    sigemptyset(&open);
-    sigaddset(&open, SIGTERM);
-    sigaddset(&open, SIGINT);
-    sigaddset(&open, SIGQUIT);
-    sigaddset(&open, SIGHUP);
-    pthread_sigmask(SIG_UNBLOCK, &open, nullptr);
     xc_log_stamp("exit: monitor avviato");
     while (!g_appStopping.load() && !g_dying.load()) {
         pumpLifecycle(false);

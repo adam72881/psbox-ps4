@@ -1,13 +1,16 @@
-# Release 01.41 (v1.0.41)
+# Release 01.51 (v1.0.51)
 
 | File | Note |
 | --- | --- |
-| `PSBox-PS4-01.41.pkg` | Build corrente |
-| `PSBox-PS4-01.42.pkg` | Solo test update 01.41 → 01.42 da `/data/psbox/update/` |
+| `PSBox-PS4-01.51.pkg` | Build corrente. Lo SHA-256 è quello dell'artifact CI, non un valore scritto a mano. |
 
-## Contenuto 01.41
+## Contenuto 01.51
 
-- **Chiusura falsa al boot:** `IsAppSuspended` con errore SCE (es. `0x80A10009`) non chiude più; solo `rc > 0` conta come sospeso. Niente Close da AppMessaging / eventi inventati / GetStatus ko.
-- **Update con dialogo:** all’avvio e da «Controlla aggiornamenti» se c’è un pkg più nuovo → «È disponibile l’aggiornamento X. Vuoi installarlo?» **Sì / No** (✗ conferma, ○ indietro). No lascia il pkg e riproporrà al prossimo avvio. Log `[UPDATE] scelta Sì/No`.
-- **Install sicuro (solo dopo Sì):** path BGFT `/user/data/...`, copia senza rename/unlink a metà, attesa `GetProgress` fino a fine/errore, poi `LoadExec("exit")`. Mai UnInstall di `XCLD00001`.
-- Mantiene i fix 01.39: TWCC, pausa decode in menu PS, screenshot (incluso dialog update).
+- **Patch libdatachannel applicabili** e pool di 4 thread (niente `hardware_concurrency` su Orbis).
+- **Riconnessione:** budget DTLS 20 s, seconda re-iniezione candidati a 8 s se ancora 0 byte RX, keepalive GSSV durante la negoziazione. Uno stop di chiusura non viene cancellato da una sessione nuova. I sleep della negoziazione sono a fette da 200 ms.
+- **Chiusura dal menu PS:** SIGTERM/INT/QUIT/HUP bloccati prima di `platform::init`, attesi da `sigwait`, poi `_exit`. Il monitor non li sblocca più.
+- **Stream:** dopo coda piena, menu PS o errore di decode si scarta fino a un IDR. Keyframe al massimo uno ogni 500 ms e 10 in 5 s, con PLI. Bitrate di partenza 8 Mb/s a 720p e 12 Mb/s a 1080p; il tetto utente, se più basso, vince. REMB solo sotto il tetto. Framebuffer Videodec2 non si rioffre se il decoder lo tiene. Un solo flip in volo; il blit non aspetta il flip. Audio con prefill 40 ms e trim a fade. Scaler 3:2 con due tap di luma sui pixel dispari.
+- **Diagnostica:** `/data/psbox/stats/stream-AAAAMMGG-HHMMSS.json`, ultimi 10, aggiornato ogni 5 s da un thread a bassa priorità. Nessun token.
+- La qualità chiesta resta **1080HQ**. Niente profilo Constrained Baseline e niente copia frame via GPU.
+
+Non è un PASS sulla console: la checklist di prova è nel messaggio della modifica.

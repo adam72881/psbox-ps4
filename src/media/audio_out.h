@@ -27,5 +27,7 @@ void audioSetVolume(float gain);
 // Past ~60 ms queued (a burst from the network) cuts back to ~40 ms, the
 // oldest samples first, to keep the sound close to the picture.
 void audioPush(const float* interleaved, size_t frames);
+uint64_t audioUnderruns();
+uint64_t audioTrimmedFrames();
 
 }  // namespace xc::media

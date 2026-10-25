@@ -2,6 +2,8 @@
 // Copyright (C) 2026 RafaelNGP
 #include "stream/stream_session.h"
 
+#include "stream/connect_plan.h"
+
 #include "stream/h264_receiver.h"
 #include "stream/rtcp_reporter.h"
 
@@ -119,10 +121,24 @@ bool decodeTeredo(const std::string& ipv6, std::string& ipv4, int& port) {
 }
 
 std::atomic<bool> g_streamStop{false};
+std::atomic<bool> g_exitStop{false};
 
-void requestStop() { g_streamStop.store(true); }
+static bool stopRequested() { return g_streamStop.load() || g_exitStop.load(); }
+
+void requestStop() {
+    StopFlags f{g_streamStop.load() ? 1 : 0, g_exitStop.load() ? 1 : 0};
+    onRequestStop(&f);
+    g_streamStop.store(f.streamStop != 0);
+    g_exitStop.store(f.exitStop != 0);
+}
 
 void armNewSession() {
+    StopFlags f{g_streamStop.load() ? 1 : 0, g_exitStop.load() ? 1 : 0};
+    if (!onArmNewSession(&f)) {
+        g_streamStop.store(true);
+        XC_LOGI("stream: nuova sessione rifiutata, chiusura in corso");
+        return;
+    }
     g_streamStop.store(false);
     XC_LOGI("stream: nuova sessione, stop azzerato");
 }
@@ -761,11 +777,33 @@ struct StreamSession::Impl {
         });
     }
 
+    uint64_t negKaMs = 0;
+
+    void negotiateKeepalive() {
+        uint64_t now = platform::nowMs();
+        if (!keepaliveDue(now, negKaMs)) return;
+        negKaMs = now;
+        std::string e;
+        if (!gssv.keepalive(e)) XC_LOGW("negoziazione keepalive: %s", e.c_str());
+    }
+
+    bool sleepUnlessStop(int ms) {
+        int left = ms;
+        while (left > 0) {
+            if (stopRequested()) return false;
+            int slice = left < kNegotiateSliceMs ? left : kNegotiateSliceMs;
+            platform::sleepMs(static_cast<unsigned>(slice));
+            left -= slice;
+            negotiateKeepalive();
+        }
+        return !stopRequested();
+    }
+
     bool waitFor(const std::function<bool()>& pred, int timeoutMs) {
         const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
         std::unique_lock<std::mutex> lock(mutex);
         for (;;) {
-            if (g_streamStop.load()) {
+            if (stopRequested()) {
                 failed = true;
                 if (failReason.empty()) failReason = "chiusura";
                 return false;
@@ -774,9 +812,12 @@ struct StreamSession::Impl {
             if (pred()) return true;
             const auto now = std::chrono::steady_clock::now();
             if (now >= end) return false;
-            auto slice = std::chrono::milliseconds(200);
+            auto slice = std::chrono::milliseconds(kNegotiateSliceMs);
             if (end - now < slice) slice = std::chrono::duration_cast<std::chrono::milliseconds>(end - now);
-            cv.wait_for(lock, slice, [&] { return failed || pred() || g_streamStop.load(); });
+            cv.wait_for(lock, slice, [&] { return failed || pred() || stopRequested(); });
+            lock.unlock();
+            negotiateKeepalive();
+            lock.lock();
         }
     }
 
@@ -821,6 +862,7 @@ struct StreamSession::Impl {
     // Una negoziazione ICE+SDP. Dopo ICE connected si attende l'handshake
     // fino a connectTimeoutMs (niente chiusura PC a 3 s).
     bool negotiateOnce(std::string& err) {
+        negKaMs = platform::nowMs();
         createPeer();
         if (!pc) {
             err = "PeerConnection nulla";
@@ -852,12 +894,15 @@ struct StreamSession::Impl {
 
         std::string answer;
         for (int i = 0; i < 60 && answer.empty(); ++i) {
-            if (g_streamStop.load()) {
+            if (stopRequested()) {
                 err = "chiusura";
                 return false;
             }
             if (!gssv.pollSdpAnswer(answer, err)) return false;
-            if (answer.empty()) platform::sleepMs(500);
+            if (answer.empty() && !sleepUnlessStop(500)) {
+                err = "chiusura";
+                return false;
+            }
         }
         if (answer.empty()) {
             err = "timed out waiting for the SDP answer";
@@ -897,8 +942,15 @@ struct StreamSession::Impl {
 
         std::vector<xcloud::IceCandidate> theirs;
         for (int i = 0; i < 30 && theirs.empty(); ++i) {
+            if (stopRequested()) {
+                err = "chiusura";
+                return false;
+            }
             if (!gssv.pollIceCandidates(theirs, err)) return false;
-            if (theirs.empty()) platform::sleepMs(1000);
+            if (theirs.empty() && !sleepUnlessStop(1000)) {
+                err = "chiusura";
+                return false;
+            }
         }
         if (theirs.empty()) {
             err = "the server sent no ICE candidates";
@@ -980,9 +1032,10 @@ struct StreamSession::Impl {
         const uint64_t started = platform::nowMs();
 #if defined(XCLOUD_PS4)
         bool reinjectedDtls = false;
+        bool reinjectedDtlsAgain = false;
 #endif
         while (platform::nowMs() - started < static_cast<uint64_t>(totalMs)) {
-            if (g_streamStop.load()) {
+            if (stopRequested()) {
                 err = "chiusura";
                 return false;
             }
@@ -1000,7 +1053,9 @@ struct StreamSession::Impl {
                 }
             }
 #if defined(XCLOUD_PS4)
-            if (!reinjectedDtls && platform::nowMs() - started >= 3000 && xc_dtls_rx_pkts() == 0) {
+            const uint64_t elapsed = platform::nowMs() - started;
+            const bool rx0 = xc_dtls_rx_pkts() == 0;
+            if (!reinjectedDtls && elapsed >= static_cast<uint64_t>(kDtlsReinjectMs) && rx0) {
                 reinjectedDtls = true;
                 XC_LOGW("dtls: 0 byte a 3 s dopo ICE — re-iniezione candidati (niente riparto PC)");
                 ::xc::app::trace::setStage("DTLS_REINJECT");
@@ -1010,6 +1065,17 @@ struct StreamSession::Impl {
                     ports.push_back(9002);
                     if (teredoPort > 0) ports.push_back(teredoPort);
                     addHostPorts(teredoIpv4, ports, bundleMid, 40);
+                }
+            } else if (!reinjectedDtlsAgain && elapsed >= static_cast<uint64_t>(kDtlsReinjectAgainMs) && rx0) {
+                reinjectedDtlsAgain = true;
+                XC_LOGW("dtls: ancora 0 byte a 8 s — seconda re-iniezione");
+                ::xc::app::trace::setStage("DTLS_REINJECT2");
+                for (const auto& rc : remoteAdded) addRemoteCandidate(rc.first, rc.second);
+                if (!teredoIpv4.empty()) {
+                    std::vector<int> ports = answerPorts;
+                    ports.push_back(9002);
+                    if (teredoPort > 0) ports.push_back(teredoPort);
+                    addHostPorts(teredoIpv4, ports, bundleMid, 60);
                 }
             }
 #endif
@@ -1073,6 +1139,7 @@ struct StreamSession::Impl {
         v.set("message", "videoKeyframeRequested");
         v.set("ifrRequested", true);
         sendText(control, v.dump());
+        if (videoReporter) videoReporter->armPli();
     }
 
     uint64_t lastQuietKf = 0;

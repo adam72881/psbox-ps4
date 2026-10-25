@@ -1,9 +1,13 @@
 name: PS4
 
-# Solo manuale: i push frequenti (import sorgente) spamavano e-mail di failure.
-# Avvia da Actions → PS4 → Run workflow quando serve una build CI.
+# main non parte a ogni push (gli import spamavano e-mail di failure).
+# Una pull request e il branch di questa modifica compilano il pkg.
 on:
   workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - cursor/stream-reliability-e0ea
 
 jobs:
   pkg:

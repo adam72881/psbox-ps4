@@ -5,6 +5,7 @@
 // Il present resta su display_ps4: renderer_videoout.c aprirebbe un secondo
 // VideoOut e il percorso YCbCr dipende da un kpayload solo per il firmware 9.00.
 #include "media/hw_decoder.h"
+#include "media/fb_own.h"
 #include "util/log.h"
 
 extern "C" {
@@ -78,6 +79,7 @@ struct State {
     size_t fbStride = 0;
     int fbN = 1;
     int fbI = 0;
+    FbOwn fbOwn{};
     Block au[kFbCount];
     int auN = 1;
     int auI = 0;
@@ -197,6 +199,7 @@ bool HwDecoder::init(int maxWidth, int maxHeight) {
         st->fb.size = total;
         st->fbStride = one;
         st->fbN = kFbCount;
+        fbOwnInit(&st->fbOwn, st->fbN);
 
         struct Try {
             int type;
@@ -247,9 +250,12 @@ bool HwDecoder::init(int maxWidth, int maxHeight) {
 
 bool HwDecoder::reset() {
     lastNeededReset_ = false;
+    lastOutputBusy_ = false;
+    lastErrorFrame_ = false;
     auto* hold = static_cast<HwHold*>(platform_);
     State* st = hold ? hold->st : nullptr;
     if (!st || !st->dec || !st->api.Reset) return false;
+    fbOwnInit(&st->fbOwn, st->fbN);
     int rc = st->api.Reset(st->dec);
     XC_LOGI("hwdec: Reset => %s", hex(rc));
     return rc >= 0;
@@ -258,6 +264,8 @@ bool HwDecoder::reset() {
 bool HwDecoder::decode(const uint8_t* data, size_t len, uint64_t pts, Picture& out) {
     out = {};
     lastFailed_ = false;
+    lastErrorFrame_ = false;
+    lastOutputBusy_ = false;
     lastNeededReset_ = false;
     auto* hold = static_cast<HwHold*>(platform_);
     State* st = hold ? hold->st : nullptr;
@@ -280,11 +288,21 @@ bool HwDecoder::decode(const uint8_t* data, size_t len, uint64_t pts, Picture& o
     in.ptsData = pts;
     in.dtsData = pts;
 
+    int slot = fbOffer(&st->fbOwn);
+    if (slot < 0) {
+        lastFailed_ = true;
+        lastNeededReset_ = true;
+        lastOutputBusy_ = true;
+        lastError_ = "framebuffer trattenuto";
+        XC_LOGE("hwdec: nessun framebuffer libero (trattenuti %d)", fbHeldCount(&st->fbOwn));
+        return false;
+    }
     OrbisVideodec2FrameBuffer fb;
     std::memset(&fb, 0, sizeof fb);
     fb.thisSize = sizeof fb;
-    fb.frameBuffer = static_cast<uint8_t*>(st->fb.ptr) + static_cast<size_t>(st->fbI) * st->fbStride;
+    fb.frameBuffer = static_cast<uint8_t*>(st->fb.ptr) + static_cast<size_t>(slot) * st->fbStride;
     fb.frameBufferSize = st->fbStride;
+    fb.isAccepted = false;
 
     OrbisVideodec2OutputInfo info;
     std::memset(&info, 0, sizeof info);
@@ -318,13 +336,18 @@ bool HwDecoder::decode(const uint8_t* data, size_t len, uint64_t pts, Picture& o
             XC_LOGW("hwdec: Decode %s → Reset %s, ritento AU %zu nal %u", hex(rc), hex(rr), len,
                     static_cast<unsigned>(nalType));
             if (rr >= 0) {
+                fbOwnInit(&st->fbOwn, st->fbN);
+                slot = fbOffer(&st->fbOwn);
                 std::memset(&info, 0, sizeof info);
                 info.thisSize = sizeof info;
                 std::memset(&fb, 0, sizeof fb);
                 fb.thisSize = sizeof fb;
-                fb.frameBuffer = static_cast<uint8_t*>(st->fb.ptr) + static_cast<size_t>(st->fbI) * st->fbStride;
-                fb.frameBufferSize = st->fbStride;
-                rc = st->api.Decode(st->dec, &in, &fb, &info);
+                if (slot >= 0) {
+                    fb.frameBuffer = static_cast<uint8_t*>(st->fb.ptr) + static_cast<size_t>(slot) * st->fbStride;
+                    fb.frameBufferSize = st->fbStride;
+                    fb.isAccepted = false;
+                    rc = st->api.Decode(st->dec, &in, &fb, &info);
+                }
             }
         }
     }
@@ -332,7 +355,9 @@ bool HwDecoder::decode(const uint8_t* data, size_t len, uint64_t pts, Picture& o
         onceDec = 2;
         XC_LOGI("hwdec: Decode leave rc %s valid=%d", hex(rc), info.isValid ? 1 : 0);
     }
+    if (slot >= 0) fbOnAccept(&st->fbOwn, slot, fb.isAccepted ? 1 : 0);
     if (rc < 0) {
+        if (!fb.isAccepted && slot >= 0) fbRelease(&st->fbOwn, slot);
         lastFailed_ = true;
         auto u = static_cast<unsigned>(rc);
         if (u == kNewSequence || u == kFatalStream) lastNeededReset_ = true;
@@ -345,7 +370,9 @@ bool HwDecoder::decode(const uint8_t* data, size_t len, uint64_t pts, Picture& o
         return false;
     }
     if (!info.isValid || info.isErrorFrame || !info.frameWidth || !info.frameHeight || !info.frameBuffer) {
+        if (!fb.isAccepted && slot >= 0) fbRelease(&st->fbOwn, slot);
         lastFailed_ = info.isErrorFrame != 0;
+        lastErrorFrame_ = info.isErrorFrame != 0;
         if (st->decodeLogs++ < 12)
             XC_LOGI("hwdec: Decode ok senza pic valid=%d err=%d %ux%u nal %u AU %zu", info.isValid ? 1 : 0,
                     info.isErrorFrame ? 1 : 0, info.frameWidth, info.frameHeight, static_cast<unsigned>(nalType),
@@ -358,7 +385,8 @@ bool HwDecoder::decode(const uint8_t* data, size_t len, uint64_t pts, Picture& o
         }
         return false;
     }
-    st->fbI = (st->fbI + 1) % (st->fbN > 0 ? st->fbN : 1);
+    int outSlot = fbIndexOf(st->fb.ptr, st->fbStride, info.frameBuffer, st->fbN);
+    if (outSlot < 0) outSlot = slot;
 
     uint32_t pitchBytes = info.framePitchInBytes ? info.framePitchInBytes : (info.framePitch ? info.framePitch : info.frameWidth);
     size_t bytes = static_cast<size_t>(pitchBytes) * info.frameHeight * 3 / 2;
@@ -373,12 +401,11 @@ bool HwDecoder::decode(const uint8_t* data, size_t len, uint64_t pts, Picture& o
     // riusato subito). Senza alias la memoria è WC_GARLIC e una lettura
     // sparsa è lentissima: una sola copia in RAM cacheabile, come il bounce
     // di Moonlight-ps4.
-    const uint8_t* picture = src;
-    if (!st->fbAlias) {
-        st->shadow.resize(bytes);
-        std::memcpy(st->shadow.data(), src, bytes);
-        picture = st->shadow.data();
-    }
+    // Copia sempre: il framebuffer si rilascia prima della Decode successiva.
+    st->shadow.resize(bytes);
+    std::memcpy(st->shadow.data(), src, bytes);
+    const uint8_t* picture = st->shadow.data();
+    fbRelease(&st->fbOwn, outSlot);
     if (st->decodeLogs == 0) {
         XC_LOGI("hwdec: prima immagine %ux%u pitch %u fmt 0x%x", info.frameWidth, info.frameHeight, pitchBytes,
                 info.frameFormat);

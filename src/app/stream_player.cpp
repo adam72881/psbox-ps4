@@ -3,6 +3,8 @@
 #include "app/stream_player.h"
 
 #include "app/crash_guard.h"
+#include "app/frame_slot.h"
+#include "app/session_stats.h"
 #include "display/display.h"
 #include "input/controller.h"
 #include "media/audio_out.h"
@@ -11,6 +13,10 @@
 #include "media/decoder.h"
 #include "media/hw_decoder.h"
 #include "platform/platform.h"
+#include "stream/abr_plan.h"
+#include "stream/connect_plan.h"
+#include "stream/idr_gate.h"
+#include "stream/keyframe_limit.h"
 #include "stream/stream_session.h"
 #include "ui/strings.h"
 #include "util/log.h"
@@ -43,7 +49,9 @@ namespace {
 // Come il loop video della PS5: oltre questa coda si riparte da un keyframe.
 // Il jitter buffer può consegnare diversi frame insieme dopo una ritrasmissione.
 constexpr size_t kMaxQueuedFrames = 30;
+#if !defined(XCLOUD_PS4)
 constexpr int kMaxFullStreak = 30;  // frames shown one refresh late before dropping one
+#endif
 }
 
 struct StreamPlayer::Impl {
@@ -62,7 +70,21 @@ struct StreamPlayer::Impl {
     // to 20 attempts a second apart while the cloud session is still there.
     std::atomic<bool> reconnecting{false};
     std::atomic<bool> needDecoderReset{false};
-    std::atomic<bool> waitIdr{false};  // dopo Reset: solo Decode su IDR
+    std::atomic<bool> waitIdr{false};  // dopo Reset o perdita di riferimento: solo IDR
+    std::atomic<uint64_t> idrSinceMs{0};
+    KfLimit kf{};
+    int idrResetDone = 0;
+    FrameSlot shownSlot{};
+    uint64_t picSeq = 0;
+    struct HeldPic {
+        bool valid = false;
+        std::vector<uint8_t> nv12;
+        int pitch = 0, w = 0, h = 0;
+        uint32_t rtp = 0;
+        double arrivalMs = 0, submittedMs = 0, decodedMs = 0;
+        uint64_t arrivalUs = 0;
+    };
+    HeldPic held;
     std::atomic<bool> titleFocused{true};
     int reconnectAttempts = 0;
     std::atomic<uint32_t> reconnects{0};
@@ -185,10 +207,20 @@ struct StreamPlayer::Impl {
         running = false;
         cv.notify_all();
         audioCv.notify_all();
+        const char* why = "fine";
+        if (reason.find("lost") != std::string::npos || reason.find("persa") != std::string::npos ||
+            reason.find("couldn't") != std::string::npos)
+            why = "persa";
+        stats::statsFinish(why);
 #if defined(XCLOUD_PS4)
         trace::setStage(("END " + reason).c_str());
         trace::endSession();
 #endif
+    }
+
+    void armReferenceLoss() {
+        if (!waitIdr.exchange(true)) idrSinceMs.store(platform::nowMs());
+        keyframeWanted = true;
     }
 
     void audioLoop() {
@@ -248,27 +280,76 @@ struct StreamPlayer::Impl {
         xc_log_stamp("video: loop avviato, attendo AU");
         trace::setStage("VIDEO_LOOP");
         bool loggedAu = false, loggedDecode = false, loggedBlit = false;
-        int fullStreak = 0;
         uint64_t lastTraceSec = platform::nowMs();
         uint64_t presentedAtSec = 0, lateAtSec = 0;
+        kfInit(&kf);
+        frameSlotInit(&shownSlot);
+        auto presentHeld = [&] {
+            if (!held.valid || g_psMenu.load() || g_appStopping.load()) return;
+            std::unique_lock<std::timed_mutex> lock(display::frameMutex(), std::defer_lock);
+            if (!lock.try_lock()) return;
+            uint64_t tDraw0 = platform::nowUs();
+            if (!loggedBlit) {
+                XC_LOGI("video: primo blit %dx%d pitch %d", held.w, held.h, held.pitch);
+                trace::setStage("PRESENT_FIRST");
+            }
+            // wait=false: un flip occupato non blocca il decode.
+            bool drawn = display::drawNv12(held.nv12.data(), held.pitch, held.w, held.h, false);
+            bool shown = drawn && display::present();
+            uint64_t presentUs = platform::nowUs() - tDraw0;
+            if (!loggedBlit) {
+                loggedBlit = true;
+                XC_LOGI("video: primo blit %s", shown ? "ok" : "in coda");
+            }
+            constexpr int kDstW = 1280, kDstH = 720;
+            trace::notePresent(decodedFrames, held.w, held.h, kDstW, kDstH, presentUs, shown);
+            if (!shown) return;
+            stats::statsNotePresented(presentUs);
+            frameShown(&shownSlot);
+            stream::FrameMetadata meta;
+            meta.serverDataKey = held.rtp;
+            meta.firstPacketArrivalMs = held.arrivalMs ? held.arrivalMs : held.submittedMs;
+            meta.submittedMs = held.submittedMs;
+            meta.decodedMs = held.decodedMs;
+            meta.renderedMs = stream::clockMs();
+            if (auto s = current()) s->reportFrame(meta);
+            if (decodedFrames == 1) {
+                XC_LOGI("primo frame Videodec2 presentato %dx%d", held.w, held.h);
+                if (shot::enabled()) {
+                    shot::request(shot::Kind::FirstStream, true);
+                    shot::afterPresent();
+                }
+            }
+            drawUs += presentUs;
+            ++drawCalls;
+            ++presentedAtSec;
+            atomicMax(drawMaxUs, presentUs);
+            uint64_t lat = held.arrivalUs && platform::nowUs() > held.arrivalUs ? platform::nowUs() - held.arrivalUs : presentUs;
+            displayUs += lat;
+            ++displayCount;
+            atomicMax(displayMaxUs, lat);
+            held.valid = false;
+        };
         while (running && !g_appStopping.load()) {
             crash::videoHeartbeat();
+            presentHeld();
             VideoFrame frame;
+            bool have = false;
             {
                 std::unique_lock<std::mutex> lock(mutex);
-                // Timeout: se la rete è viva ma non arriva video, il watchdog
-                // vede comunque il beat; se Decode si pianta, il beat si ferma.
-                if (!cv.wait_for(lock, std::chrono::milliseconds(500),
-                                 [&] { return !running || g_appStopping.load() || !frames.empty(); })) {
-                    crash::videoHeartbeat();
-                    continue;
+                if (frames.empty()) {
+                    cv.wait_for(lock, std::chrono::milliseconds(held.valid ? 8 : 500),
+                                [&] { return !running || g_appStopping.load() || !frames.empty(); });
                 }
                 if (!running || g_appStopping.load()) break;
-                frame = std::move(frames.front());
-                frames.pop_front();
+                if (!frames.empty()) {
+                    frame = std::move(frames.front());
+                    frames.pop_front();
+                    have = true;
+                }
             }
             crash::videoHeartbeat();
-            if (g_appStopping.load()) break;
+            if (!have) continue;
             if (frame.data.empty()) {
                 XC_LOGW("video: AU vuota");
                 continue;
@@ -278,49 +359,41 @@ struct StreamPlayer::Impl {
                 XC_LOGI("video: prima AU %zu byte", frame.data.size());
                 xc_log_stamp("video: prima AU");
             }
-            // Dopo riconnessione o cambio sequenza: Reset esplicito prima
-            // della prossima AU (NEW_SEQUENCE 0x811d0300).
+            uint64_t nowMs = platform::nowMs();
+            if (waitIdr.load() && idrSinceMs.load() && !idrResetDone && nowMs - idrSinceMs.load() > kIdrResetAfterMs) {
+                idrResetDone = 1;
+                needDecoderReset.store(true);
+            }
             if (needDecoderReset.exchange(false)) {
                 XC_LOGI("video: Reset decoder (nuova sessione/sequenza) — attendo IDR");
                 hw.reset();
-                waitIdr.store(true);
+                if (!waitIdr.exchange(true)) idrSinceMs.store(nowMs);
                 keyframeWanted = true;
                 requestKeyframeIfWanted();
             }
-            // Chiusura / menu PS: non entrare in Decode (Videodec2 in syscall
-            // mentre ShellCore revoca → CE-34878-0). Sessione e TWCC restano
-            // vivi: si scartano solo i frame finché non si riprende.
             if (g_appStopping.load()) break;
             if (g_psMenu.load()) {
-                crash::videoHeartbeat();
+                size_t n = 1;
                 {
                     std::lock_guard<std::mutex> lock(mutex);
+                    n += frames.size();
                     frames.clear();
                 }
+                stats::statsNoteDrop(1, n);
+                if (!waitIdr.exchange(true)) idrSinceMs.store(platform::nowMs());
                 platform::sleepMs(40);
                 continue;
             }
-            // Dopo Reset: niente Decode finché non arriva un IDR (evita 0x811d0303).
-            if (waitIdr.load()) {
-                auto isIdrAu = [](const std::vector<uint8_t>& d) {
-                    for (size_t i = 0; i + 4 < d.size(); ++i) {
-                        if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 0 && d[i + 3] == 1) {
-                            if ((d[i + 4] & 0x1f) == 5) return true;
-                            ++i;
-                        } else if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1) {
-                            if ((d[i + 3] & 0x1f) == 5) return true;
-                        }
-                    }
-                    return false;
-                };
-                if (!isIdrAu(frame.data)) {
-                    keyframeWanted = true;
-                    requestKeyframeIfWanted();
-                    crash::videoHeartbeat();
-                    continue;
-                }
-                waitIdr.store(false);
-                XC_LOGI("video: IDR dopo reset, riprendo Decode");
+            if (waitIdr.load() && !auIsIdr(frame.data.data(), frame.data.size())) {
+                stats::statsNoteDrop(1, 1);
+                keyframeWanted = true;
+                requestKeyframeIfWanted();
+                continue;
+            }
+            if (waitIdr.exchange(false)) {
+                idrSinceMs.store(0);
+                idrResetDone = 0;
+                XC_LOGI("video: IDR dopo la perdita di riferimento, riprendo Decode");
             }
             media::HwDecoder::Picture hp;
             bool got = false;
@@ -355,13 +428,12 @@ struct StreamPlayer::Impl {
                 end("Decode Videodec2: errore interno");
                 return;
             }
-            double decodedMs = stream::clockMs();
             if (!got || !hp.data || hp.width < 2 || hp.height < 2) {
-                /* Videodec2 tiene in coda i primi AU: non è un reset. Un
-                 * errore vero chiede un keyframe, al massimo ogni 500 ms. */
                 if (hw.lastFailed()) {
                     ++decodeFailures;
+                    stats::statsNoteDrop(2, 1);
                     if (hw.lastNeededReset()) needDecoderReset.store(true);
+                    if (!waitIdr.exchange(true)) idrSinceMs.store(platform::nowMs());
                     if (decodeFailures <= 8 || decodeFailures % 50 == 0) {
                         uint8_t nal = 0;
                         if (frame.data.size() >= 5 && frame.data[0] == 0 && frame.data[1] == 0 &&
@@ -379,6 +451,7 @@ struct StreamPlayer::Impl {
                 }
                 continue;
             }
+            stats::statsNoteDecoded(platform::nowUs() - tDec0);
             int w = static_cast<int>(hp.width) & ~1;
             int h = static_cast<int>(hp.height) & ~1;
             int pitch = hp.pitchBytes ? static_cast<int>(hp.pitchBytes) : static_cast<int>(hp.width);
@@ -387,74 +460,26 @@ struct StreamPlayer::Impl {
             if (hp.size < need) {
                 XC_LOGE("video: frame corto %zu < %zu", hp.size, need);
                 ++decodeFailures;
+                stats::statsNoteDrop(2, 1);
+                if (!waitIdr.exchange(true)) idrSinceMs.store(platform::nowMs());
+                keyframeWanted = true;
+                requestKeyframeIfWanted();
                 continue;
             }
             ++decodedFrames;
             pictureSize = (static_cast<uint32_t>(w) << 16) | static_cast<uint32_t>(h);
-            const bool pausePresent = g_psMenu.load() || g_appStopping.load();
-            uint64_t tDraw0 = platform::nowUs();
-            bool drawn = false;
-            bool shown = false;
-            if (!pausePresent) {
-                std::unique_lock<std::timed_mutex> lock(display::frameMutex(), std::defer_lock);
-                if (lock.try_lock_for(std::chrono::milliseconds(4))) {
-                    if (!loggedBlit) {
-                        XC_LOGI("video: primo blit %dx%d pitch %d", w, h, pitch);
-                        trace::setStage("PRESENT_FIRST");
-                    }
-                    drawn = display::drawNv12(hp.data, pitch, w, h, false);
-                    if (drawn) {
-                        fullStreak = 0;
-                    } else if (++fullStreak < kMaxFullStreak) {
-                        // Ritenta con wait: non marcare "già presentato" se fallisce
-                        // (AJ-GFN: un fail che aggiorna generation congela per sempre).
-                        drawn = display::drawNv12(hp.data, pitch, w, h, true);
-                    } else {
-                        fullStreak = 0;
-                    }
-                    if (!loggedBlit) {
-                        loggedBlit = true;
-                        XC_LOGI("video: primo blit %s", drawn ? "ok" : "fallito");
-                    }
-                    if (drawn) shown = display::present();
-                    // Ack solo del frame che è entrato in coda, con l'ora del
-                    // present. Un flip rifiutato non è un frame visto.
-                    if (shown) {
-                        stream::FrameMetadata meta;
-                        meta.serverDataKey = frame.rtpTimestamp;
-                        meta.firstPacketArrivalMs = frame.arrivalMs ? frame.arrivalMs : submittedMs;
-                        meta.submittedMs = submittedMs;
-                        meta.decodedMs = decodedMs;
-                        meta.renderedMs = stream::clockMs();
-                        if (auto s = current()) s->reportFrame(meta);
-                        if (decodedFrames == 1) {
-                            XC_LOGI("primo frame Videodec2 presentato %dx%d", w, h);
-                            if (shot::enabled()) {
-                                shot::request(shot::Kind::FirstStream, true);
-                                shot::afterPresent();
-                            }
-                        }
-                    }
-                }
-            }
-            uint64_t tDraw1 = platform::nowUs();
-            const uint64_t presentUs = tDraw1 - tDraw0;
-            // Scanout BGRA720: dst fissa; src è la res xCloud (1080HQ).
-            constexpr int kDstW = 1280, kDstH = 720;
-            trace::notePresent(decodedFrames, w, h, kDstW, kDstH, presentUs, shown && !pausePresent);
-            if (shown) {
-                drawUs += presentUs;
-                ++drawCalls;
-                ++presentedAtSec;
-                atomicMax(drawMaxUs, presentUs);
-                uint64_t lat = frame.arrivalUs && tDraw1 > frame.arrivalUs ? tDraw1 - frame.arrivalUs : presentUs;
-                displayUs += lat;
-                ++displayCount;
-                atomicMax(displayMaxUs, lat);
-            } else if (!pausePresent) {
-                ++lateFrames;
-                ++lateAtSec;
-            }
+            if (shownSlot.seq) stats::statsNoteDrop(3, 1);
+            frameReplace(&shownSlot, ++picSeq);
+            held.nv12.assign(hp.data, hp.data + need);
+            held.pitch = pitch;
+            held.w = w;
+            held.h = h;
+            held.rtp = frame.rtpTimestamp;
+            held.arrivalMs = frame.arrivalMs;
+            held.submittedMs = submittedMs;
+            held.decodedMs = stream::clockMs();
+            held.arrivalUs = frame.arrivalUs;
+            held.valid = true;
             uint64_t now = platform::nowMs();
             if (now - lastTraceSec >= 1000) {
                 lastTraceSec = now;
@@ -670,6 +695,7 @@ struct StreamPlayer::Impl {
 #endif
     }
 
+
     bool start(std::string& err) {
 #if defined(XCLOUD_PS4)
         // Stereo Opus 48 kHz, come l'SDP (minptime=10, stereo=1). 960 campioni = 20 ms.
@@ -735,13 +761,17 @@ struct StreamPlayer::Impl {
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 if (frames.size() >= kMaxQueuedFrames) {
-                    while (frames.size() > 4) {
-                        frames.pop_front();
-                        ++droppedFrames;
-                    }
+                    size_t n = frames.size();
+                    frames.clear();
+                    droppedFrames += n;
                     ++queueResets;
                     keyframeWanted = true;
+                    waitIdr.store(true);
+                    if (!idrSinceMs.load()) idrSinceMs.store(platform::nowMs());
+                    stats::statsNoteDrop(0, n);
                 }
+                stats::statsNoteReceived(1);
+                stats::statsNoteQueue(static_cast<uint32_t>(frames.size() + 1));
                 frames.push_back({std::vector<uint8_t>(d, d + n), rtpTimestamp, stream::clockMs(), platform::nowUs()});
             }
             cv.notify_one();
@@ -806,18 +836,24 @@ struct StreamPlayer::Impl {
         // Pass Ultimate and a market where Microsoft enabled them; elsewhere
         // the plain tier the session asks for first holds.
         // Come PSBox PS5: 1080 e 1080HQ chiedono entrambi il tier "1080HQ".
+        int tier = ABR_1080;
         switch (gssv.resolution()) {
-        case xcloud::Resolution::P1440: opts.resolutionAlias = "1440"; break;
+        case xcloud::Resolution::P1440:
+            opts.resolutionAlias = "1440";
+            tier = ABR_1440;
+            break;
         case xcloud::Resolution::P1080:
-        case xcloud::Resolution::P1080HQ: opts.resolutionAlias = "1080HQ"; break;
-        case xcloud::Resolution::P720: opts.resolutionAlias = "720HQ"; break;
+        case xcloud::Resolution::P1080HQ:
+            opts.resolutionAlias = "1080HQ";
+            tier = ABR_1080;
+            break;
+        case xcloud::Resolution::P720:
+            opts.resolutionAlias = "720HQ";
+            tier = ABR_720;
+            break;
         }
-        opts.maxBitrate = gssv.resolution() == xcloud::Resolution::P720    ? 12000000
-                          : gssv.resolution() == xcloud::Resolution::P1440 ? 40000000
-                          : gssv.resolution() == xcloud::Resolution::P1080HQ ? 30000000
-                                                                           : 25000000;
-        if (maxBitrateMbps > 0)  // the user's cap (Wi-Fi): REMB never offers more
-            opts.maxBitrate = std::min<uint32_t>(opts.maxBitrate, static_cast<uint32_t>(maxBitrateMbps) * 1000000u);
+        BitratePlan plan = bitrateBegin(tier, maxBitrateMbps > 0 ? static_cast<uint32_t>(maxBitrateMbps) * 1000000u : 0);
+        opts.maxBitrate = plan.ceilingBps;
         opts.simulatedVideoLoss = simulatedLoss;
         if (const char* loss = std::getenv("XC_SIM_LOSS")) opts.simulatedVideoLoss = std::atoi(loss);
         callbacks = cb;
@@ -847,6 +883,7 @@ struct StreamPlayer::Impl {
             return false;
         }
         stream::armNewSession();
+        stats::statsBegin(platform::dataDir() + "/stats", opts.resolutionAlias.c_str(), opts.maxBitrate, stats::kStatsIntervalMs);
         XC_LOGI("stream: avvio PeerConnection");
         auto dropSession = [](std::shared_ptr<stream::StreamSession> failed) {
             if (!failed) return;
@@ -963,7 +1000,7 @@ struct StreamPlayer::Impl {
         // Stesse opzioni della sessione originale (bitrate/risoluzione pieni):
         // niente ripartenza a 2 kbps per colpa di opts azzerate.
         stream::StreamOptions opts = options;
-        opts.connectTimeoutMs = 8000;
+        opts.connectTimeoutMs = kReconnectDtlsBudgetMs;
         auto next = std::make_shared<stream::StreamSession>(gssv, callbacks, opts);
         {
             std::lock_guard<std::mutex> lock(sessionMutex);
@@ -1052,15 +1089,20 @@ struct StreamPlayer::Impl {
 
     // Video thread only (data channel sends are thread-safe).
     void requestKeyframeIfWanted() {
-        uint64_t now = platform::nowMs();
-        if (keyframeWanted && now - lastKeyframeRequestMs > 500) {
-            auto s = current();
-            if (!s) return;
-            keyframeWanted = false;
-            lastKeyframeRequestMs = now;
-            ++keyframeRequests;
-            s->requestKeyframe();
+        if (!keyframeWanted) return;
+        int d = kfDecide(&kf, platform::nowMs());
+        if (d == 0) return;
+        if (d < 0) {
+            stats::statsNoteKf(0);
+            return;
         }
+        auto s = current();
+        if (!s) return;
+        keyframeWanted = false;
+        lastKeyframeRequestMs = platform::nowMs();
+        ++keyframeRequests;
+        stats::statsNoteKf(1);
+        s->requestKeyframe();
     }
 
     void pumpFast() {
@@ -1075,6 +1117,10 @@ struct StreamPlayer::Impl {
         auto s = current();
         if (!s) return;
         s->tick();
+        const auto& vst = s->videoStats();
+        stats::statsNoteNet(vst.lost.load(), vst.nacks.load(), vst.recovered.load());
+        stats::statsNoteBitrate(vst.estimate.load() ? vst.estimate.load() : options.maxBitrate);
+        stats::statsNoteAudio(media::audioUnderruns(), media::audioTrimmedFrames());
         // xCloud sends video all the time, even for a still picture: three
         // seconds without a packet is a dead connection, long before WebRTC
         // notices. With the sound still coming, the connection is alive and
@@ -1255,6 +1301,7 @@ void StreamPlayer::answerTextInput(const std::string& id, bool accepted, const s
 }
 
 void StreamPlayer::requestKeyframe() { impl_->keyframeWanted = true; }
+void StreamPlayer::armReferenceLoss() { impl_->armReferenceLoss(); }
 
 uint32_t StreamPlayer::reconnects() const { return impl_->reconnects; }
 

@@ -4,6 +4,8 @@
 // PLI se il video tace (senza spam all'avvio).
 #pragma once
 
+#include "stream/abr_plan.h"
+
 #include <rtc/rtc.hpp>
 
 #include <atomic>
@@ -21,6 +23,7 @@ public:
 
     void incoming(rtc::message_vector& messages, const rtc::message_callback& send) override;
     void pump();
+    void armPli();
     int secondsQuiet() const;
 
     uint32_t estimate() const { return estimate_; }
@@ -54,6 +57,8 @@ private:
     uint64_t bytesSinceReport_ = 0;
     std::atomic<uint64_t> lastRtpUs_{0};
     int lossyReports_ = 0;
+    BitratePlan abr_{};
+    std::atomic<int> pliArmed_{0};
     std::atomic<uint32_t> estimate_{0}, receiveRate_{0}, reportsSent_{0}, twccSent_{0};
 
     static constexpr int kTwccCap = 512;
