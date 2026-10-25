@@ -31,6 +31,10 @@ public:
     // true solo se l'ultima decode è un errore del modulo, non un'immagine
     // ancora in coda (quella non è un reset del flusso).
     bool lastFailed() const { return lastFailed_; }
+    // errorFrame di Videodec2: il riferimento è perso, serve un IDR.
+    bool lastErrorFrame() const { return lastErrorFrame_; }
+    // Nessun framebuffer libero: il decoder ne tiene ancora uno.
+    bool lastOutputBusy() const { return lastOutputBusy_; }
     // true se l'ultima decode ha chiesto Reset (NEW_SEQUENCE / FATAL_STREAM).
     bool lastNeededReset() const { return lastNeededReset_; }
     // sceVideodec2Reset: obbligatorio dopo 0x811D0300 (nuova sequenza SPS/PPS).
@@ -46,6 +50,8 @@ private:
     // Stato extra del port PS4 (code Videodec2, buffer direct memory). La PS5 non lo usa.
     void* platform_ = nullptr;
     bool lastFailed_ = false;
+    bool lastErrorFrame_ = false;
+    bool lastOutputBusy_ = false;
     bool lastNeededReset_ = false;
     std::string lastError_;
 };

@@ -11,6 +11,9 @@
 
 namespace xc::app::crash {
 
+// SIGTERM/INT/QUIT/HUP bloccati prima di ogni thread, così lo eredita
+// il processo. Il thread sigwait li prende. Va chiamato per primo in main.
+void blockCloseSignals();
 // Handlers for the fatal signals and std::terminate, writing to `markerPath`.
 void install(const std::string& markerPath);
 // What the app is doing (copied; up to 95 bytes): "home", "streaming ...".

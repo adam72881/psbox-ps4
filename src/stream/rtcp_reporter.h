@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 RafaelNGP
-// RTCP: RR (RFC 3550), REMB, transport-cc (draft-holmer) ogni ~100 ms,
-// PLI se il video tace (senza spam all'avvio).
+// RTCP come libdatachannel 0.24.6 / XCloud4: RR solo su SR, SSRC media.
+// Niente REMB periodico. Niente transport-cc / TWCC.
 #pragma once
+
+#include "stream/abr_plan.h"
 
 #include <rtc/rtc.hpp>
 
@@ -17,24 +19,29 @@ constexpr uint32_t kReceiverSsrc = 0x50534278;  // "PSBx"
 
 class RtcpReporter final : public rtc::MediaHandler {
 public:
-    RtcpReporter(uint32_t clockRate, uint32_t maxBitrate);
+    RtcpReporter(uint32_t clockRate, uint32_t maxBitrate, int abrTier = ABR_1080);
 
     void incoming(rtc::message_vector& messages, const rtc::message_callback& send) override;
     void pump();
+    void armPli();
     int secondsQuiet() const;
 
     uint32_t estimate() const { return estimate_; }
     uint32_t receiveRate() const { return receiveRate_; }
     uint32_t reportsSent() const { return reportsSent_.load(); }
-    uint32_t twccSent() const { return twccSent_.load(); }
+    uint32_t twccSent() const { return 0; }
+    bool demoteWanted() const { return demoteWanted_.load(std::memory_order_relaxed) != 0; }
+    bool promoteWanted() const { return promoteWanted_.load(std::memory_order_relaxed) != 0; }
+    void clearTierHints() {
+        demoteWanted_.store(0, std::memory_order_relaxed);
+        promoteWanted_.store(0, std::memory_order_relaxed);
+    }
 
 private:
     void onRtp(const uint8_t* d, size_t n, uint64_t nowUs);
-    void onRtcp(const uint8_t* d, size_t n, uint64_t nowUs);
-    void report(uint64_t nowUs, const rtc::message_callback& send);
-    void sendRemb(uint32_t bps, uint32_t mediaSsrc, std::vector<uint8_t>& out);
+    void onRtcp(const uint8_t* d, size_t n, uint64_t nowUs, const rtc::message_callback& send);
+    void sendRr(uint64_t nowUs, const rtc::message_callback& send);
     void sendPli(const rtc::message_callback& send);
-    bool flushTwcc(uint64_t nowUs, const rtc::message_callback& send);
 
     const uint32_t clockRate_, maxBitrate_;
     uint32_t mediaSsrc_ = 0;
@@ -49,23 +56,14 @@ private:
     uint32_t lastSr_ = 0;
     uint64_t lastSrArrivalUs_ = 0;
     uint64_t lastReportUs_ = 0;
-    uint64_t lastTwccUs_ = 0;
     uint64_t lastPliUs_ = 0;
     uint64_t bytesSinceReport_ = 0;
     std::atomic<uint64_t> lastRtpUs_{0};
-    int lossyReports_ = 0;
-    std::atomic<uint32_t> estimate_{0}, receiveRate_{0}, reportsSent_{0}, twccSent_{0};
-
-    static constexpr int kTwccCap = 512;
-    struct TwccHit {
-        uint16_t seq = 0;
-        uint64_t us = 0;
-    };
-    TwccHit twccHits_[kTwccCap]{};
-    int twccHead_ = 0;
-    int twccCount_ = 0;
-    uint8_t twccFbCount_ = 0;
-    bool twccActive_ = false;  // dopo il 1° TWCC: niente REMB (solo RR+TWCC)
+    BitratePlan abr_{};
+    std::atomic<int> pliArmed_{0};
+    std::atomic<int> demoteWanted_{0};
+    std::atomic<int> promoteWanted_{0};
+    std::atomic<uint32_t> estimate_{0}, receiveRate_{0}, reportsSent_{0};
 
     rtc::message_callback send_;
     std::mutex mu_;

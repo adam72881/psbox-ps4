@@ -172,6 +172,8 @@ int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
 
+    // Prima di ogni thread: SIGTERM del menu PS resta bloccato e lo prende sigwait.
+    crash::blockCloseSignals();
     platform::init();
     bool previousLog = preparePreviousLog();
     log::setFile((platform::dataDir() + "/xcloud.log").c_str());
@@ -365,9 +367,9 @@ int main(int argc, char** argv) {
             // It couldn't start again by itself: closed, the next start is the new version.
             platform::notify(ui::tr(ui::Str::UpdateReopen), "update installed, restart failed: closing");
             platform::sleepMs(2000);
-            // Not std::exit: its destructors would free what the background
-            // threads still use (a crash, then a false "closed unexpectedly").
-            // The log is already on disk (flushed by line).
+            // Uscita chiesta dall'app: LoadExec("exit"). Il menu PS resta su SIGTERM.
+            // Se LoadExec torna, _exit: i dtor non devono correre coi thread vivi.
+            platform::exitToShell();
             _exit(0);
         }
         input::poll(pad);

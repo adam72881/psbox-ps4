@@ -1,7 +1,6 @@
-diff -ruN a/deps/libjuice/include/juice/juice.h b/deps/libjuice/include/juice/juice.h
---- a/deps/libjuice/include/juice/juice.h	2026-10-18 12:15:31.699247562 +0000
-+++ b/deps/libjuice/include/juice/juice.h	2026-10-18 12:15:31.635247582 +0000
-@@ -115,6 +115,8 @@
+--- a/deps/libjuice/include/juice/juice.h
++++ b/deps/libjuice/include/juice/juice.h
+@@ -120,6 +120,8 @@
  
  JUICE_EXPORT juice_agent_t *juice_create(const juice_config_t *config);
  JUICE_EXPORT void juice_destroy(juice_agent_t *agent);
@@ -10,7 +9,7 @@ diff -ruN a/deps/libjuice/include/juice/juice.h b/deps/libjuice/include/juice/ju
  
  JUICE_EXPORT int juice_gather_candidates(juice_agent_t *agent);
  JUICE_EXPORT int juice_get_local_description(juice_agent_t *agent, char *buffer, size_t size);
-@@ -124,6 +126,8 @@
+@@ -129,6 +131,8 @@
  JUICE_EXPORT int juice_set_remote_gathering_done(juice_agent_t *agent);
  JUICE_EXPORT int juice_send(juice_agent_t *agent, const char *data, size_t size);
  JUICE_EXPORT int juice_send_diffserv(juice_agent_t *agent, const char *data, size_t size, int ds);
@@ -19,10 +18,37 @@ diff -ruN a/deps/libjuice/include/juice/juice.h b/deps/libjuice/include/juice/ju
  JUICE_EXPORT juice_state_t juice_get_state(juice_agent_t *agent);
  JUICE_EXPORT int juice_get_selected_candidates(juice_agent_t *agent, char *local, size_t local_size,
                                                 char *remote, size_t remote_size);
-diff -ruN a/deps/libjuice/src/agent.c b/deps/libjuice/src/agent.c
---- a/deps/libjuice/src/agent.c	2026-10-18 12:15:31.723247554 +0000
-+++ b/deps/libjuice/src/agent.c	2026-10-18 12:15:31.647247577 +0000
-@@ -634,6 +634,46 @@
+--- a/deps/libjuice/src/agent.h
++++ b/deps/libjuice/src/agent.h
+@@ -158,6 +158,7 @@
+ 
+ juice_agent_t *agent_create(const juice_config_t *config);
+ void agent_destroy(juice_agent_t *agent);
++void agent_halt(juice_agent_t *agent);
+ 
+ int agent_gather_candidates(juice_agent_t *agent);
+ int agent_resolve_servers(juice_agent_t *agent);
+@@ -168,6 +169,7 @@
+ int agent_add_turn_server(juice_agent_t *agent, const juice_turn_server_t *turn_server);
+ int agent_set_remote_gathering_done(juice_agent_t *agent);
+ int agent_send(juice_agent_t *agent, const char *data, size_t size, int ds);
++int agent_send_dtls_fanout(juice_agent_t *agent, const char *data, size_t size, int ds);
+ int agent_direct_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
+                       int ds);
+ int agent_relay_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr_record_t *dst,
+--- a/deps/libjuice/src/agent.c
++++ b/deps/libjuice/src/agent.c
+@@ -15,6 +15,9 @@
+ #include "turn.h"
+ #include "udp.h"
+ 
++void psbox_rd_consent_sent(void);
++void psbox_rd_consent_recv(void);
++
+ #include <assert.h>
+ #include <inttypes.h>
+ #include <math.h>
+@@ -667,6 +670,46 @@
  	return 0;
  }
  
@@ -69,7 +95,7 @@ diff -ruN a/deps/libjuice/src/agent.c b/deps/libjuice/src/agent.c
  int agent_send(juice_agent_t *agent, const char *data, size_t size, int ds) {
  	// Try not to lock in the send path
  	agent_stun_entry_t *selected_entry = atomic_load(&agent->selected_entry);
-@@ -803,6 +843,13 @@
+@@ -836,6 +879,13 @@
  		JLOG_WARN("Received a datagram from unknown address, ignoring");
  		return -1;
  	}
@@ -83,28 +109,24 @@ diff -ruN a/deps/libjuice/src/agent.c b/deps/libjuice/src/agent.c
  	switch (entry->type) {
  	case AGENT_STUN_ENTRY_TYPE_RELAY:
  		if (is_channel_data(buf, len)) {
-diff -ruN a/deps/libjuice/src/agent.h b/deps/libjuice/src/agent.h
---- a/deps/libjuice/src/agent.h	2026-10-18 12:15:31.699247562 +0000
-+++ b/deps/libjuice/src/agent.h	2026-10-18 12:15:31.643247579 +0000
-@@ -154,6 +154,7 @@
+@@ -1057,6 +1107,7 @@
+ 				agent_arm_transmission(agent, entry, STUN_KEEPALIVE_PERIOD);
+ 				continue;
+ 			}
++			psbox_rd_consent_sent();
  
- juice_agent_t *agent_create(const juice_config_t *config);
- void agent_destroy(juice_agent_t *agent);
-+void agent_halt(juice_agent_t *agent);
+ 			agent_arm_keepalive(agent, entry);
  
- int agent_gather_candidates(juice_agent_t *agent);
- int agent_resolve_servers(juice_agent_t *agent);
-@@ -164,6 +165,7 @@
- int agent_add_turn_server(juice_agent_t *agent, const juice_turn_server_t *turn_server);
- int agent_set_remote_gathering_done(juice_agent_t *agent);
- int agent_send(juice_agent_t *agent, const char *data, size_t size, int ds);
-+int agent_send_dtls_fanout(juice_agent_t *agent, const char *data, size_t size, int ds);
- int agent_direct_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
-                       int ds);
- int agent_relay_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr_record_t *dst,
-diff -ruN a/deps/libjuice/src/juice.c b/deps/libjuice/src/juice.c
---- a/deps/libjuice/src/juice.c	2026-10-18 12:15:31.699247562 +0000
-+++ b/deps/libjuice/src/juice.c	2026-10-18 12:15:31.639247581 +0000
+@@ -1588,6 +1639,7 @@
+ 
+ 			// Update consent timestamp
+ 			pair->consent_expiry = current_timestamp() + CONSENT_TIMEOUT;
++			psbox_rd_consent_recv();
+ 
+ 			// RFC 8445 7.3.1.5. Updating the Nominated Flag:
+ 			// [...] once the check is sent and if it generates a successful response, and
+--- a/deps/libjuice/src/juice.c
++++ b/deps/libjuice/src/juice.c
 @@ -30,6 +30,11 @@
  		agent_destroy(agent);
  }
@@ -138,163 +160,49 @@ diff -ruN a/deps/libjuice/src/juice.c b/deps/libjuice/src/juice.c
  
  JUICE_EXPORT juice_state_t juice_get_state(juice_agent_t *agent) { return agent_get_state(agent); }
  
-diff -ruN a/include/rtc/peerconnection.hpp b/include/rtc/peerconnection.hpp
---- a/include/rtc/peerconnection.hpp	2026-10-18 12:15:43.251243956 +0000
-+++ b/include/rtc/peerconnection.hpp	2026-10-18 12:15:31.679247567 +0000
-@@ -80,6 +80,8 @@
- 	~PeerConnection();
+--- a/deps/libjuice/src/conn_poll.c
++++ b/deps/libjuice/src/conn_poll.c
+@@ -14,6 +14,8 @@
+ #include "thread.h"
+ #include "udp.h"
  
- 	void close();
-+	// Ferma i keepalive STUN dell'agent senza aspettare il join.
-+	void silenceIce();
- 
- 	const Configuration *config() const;
- 	State state() const;
-diff -ruN a/src/impl/dtlstransport.cpp b/src/impl/dtlstransport.cpp
---- a/src/impl/dtlstransport.cpp	2026-10-18 12:15:43.251243956 +0000
-+++ b/src/impl/dtlstransport.cpp	2026-10-18 12:15:31.659247574 +0000
-@@ -394,7 +394,8 @@
-       mIncomingQueue(RECV_QUEUE_LIMIT, message_size_func) {
- 
- 	PLOG_DEBUG << "Initializing DTLS transport (MbedTLS)";
--	xc_log_flush_line("I", "dtls ctor");
-+	xc_log_flush_line("I", mIsClient ? "dtls: ruolo client (active, manda ClientHello)"
-+	                                 : "dtls: ruolo server (passive, attende ClientHello)");
- 
- 	if (!mCertificate)
- 		throw std::invalid_argument("DTLS certificate is null");
-diff -ruN a/src/impl/icetransport.cpp b/src/impl/icetransport.cpp
---- a/src/impl/icetransport.cpp	2026-10-18 12:15:43.251243956 +0000
-+++ b/src/impl/icetransport.cpp	2026-10-18 12:15:31.655247575 +0000
-@@ -185,9 +185,19 @@
- 
- IceTransport::~IceTransport() {
- 	PLOG_DEBUG << "Destroying ICE transport";
-+	halt();
- 	mAgent.reset();
- }
- 
-+void IceTransport::halt() {
-+#if !USE_NICE
-+	if (mAgent)
-+		juice_halt(mAgent.get());
-+#else
-+	(void)0;
-+#endif
-+}
++void psbox_rd_poll_recv(void);
 +
- Description::Role IceTransport::role() const { return mRole; }
+ #include <assert.h>
+ #include <string.h>
  
- Description IceTransport::getLocalDescription(Description::Type type) const {
-@@ -220,6 +230,27 @@
- 		mRole = description.role() == Description::Role::Active ? Description::Role::Passive
- 		                                                        : Description::Role::Active;
+@@ -251,6 +253,7 @@
+ 				break;
+ 			}
  
-+	{
-+		const char *remote = description.role() == Description::Role::Active    ? "active"
-+		                     : description.role() == Description::Role::Passive ? "passive"
-+		                                                                        : "actpass";
-+		const char *local = mRole == Description::Role::Active    ? "active"
-+		                    : mRole == Description::Role::Passive ? "passive"
-+		                                                          : "actpass";
-+		char line[96];
-+		std::snprintf(line, sizeof line, "ice: setup remoto %s, ruolo locale %s", remote, local);
-+		xc_log_flush_line("I", line);
-+		if (auto fp = description.fingerprint()) {
-+			string algo = CertificateFingerprint::AlgorithmIdentifier(fp->algorithm);
-+			char fline[180];
-+			std::snprintf(fline, sizeof fline, "ice: fingerprint remoto %s %s", algo.c_str(),
-+			              fp->value.c_str());
-+			xc_log_flush_line("I", fline);
-+		} else {
-+			xc_log_flush_line("W", "ice: fingerprint remoto assente");
-+		}
-+	}
-+
- 	if (mRole == description.role())
- 		throw std::invalid_argument("Incompatible roles with remote description");
++			psbox_rd_poll_recv();
+ 			if (agent_conn_recv(agent, buffer, (size_t)ret, &src) != 0) {
+ 				JLOG_WARN("Agent receive failed");
+ 				conn_impl->state = CONN_STATE_FINISHED;
+@@ -506,6 +509,8 @@
+ 		timediff_t timediff = next_timestamp - current_timestamp();
+ 		if (timediff < 0)
+ 			timediff = 0;
++		if (timediff > 50)
++			timediff = 50; /* PSBOX_POLL_CAP */
  
-@@ -302,8 +333,13 @@
- bool IceTransport::outgoing(message_ptr message) {
- 	// Explicit Congestion Notification takes the least-significant 2 bits of the DS field
- 	int ds = int(message->dscp << 2);
--	return juice_send_diffserv(mAgent.get(), reinterpret_cast<const char *>(message->data()),
--	                           message->size(), ds) >= 0;
-+	const char *bytes = reinterpret_cast<const char *>(message->data());
-+	unsigned b0 = message->size() ? static_cast<unsigned char>(bytes[0]) : 0;
-+	// Record DTLS di handshake (20 change_cipher_spec, 21 alert, 22 handshake).
-+	// Il 23 è application data: non si duplica su altre pair.
-+	if (b0 >= 20 && b0 <= 22)
-+		return juice_send_dtls_fanout(mAgent.get(), bytes, message->size(), ds) >= 0;
-+	return juice_send_diffserv(mAgent.get(), bytes, message->size(), ds) >= 0;
- }
- 
- void IceTransport::changeGatheringState(GatheringState state) {
-@@ -413,6 +449,8 @@
- 
- #else // USE_NICE == 1
- 
-+void IceTransport::halt() {}
-+
- IceTransport::MainLoopWrapper *IceTransport::MainLoop = nullptr;
- 
- IceTransport::MainLoopWrapper::MainLoopWrapper()
-diff -ruN a/src/impl/icetransport.hpp b/src/impl/icetransport.hpp
---- a/src/impl/icetransport.hpp	2026-10-18 12:15:43.247243958 +0000
-+++ b/src/impl/icetransport.hpp	2026-10-18 12:15:31.651247577 +0000
-@@ -57,6 +57,8 @@
- 	optional<string> getRemoteAddress() const;
- 
- 	bool send(message_ptr message) override; // false if dropped
-+	// Ferma i keepalive STUN subito, senza join del thread juice.
-+	void halt();
- 
- 	bool getSelectedCandidatePair(Candidate *local, Candidate *remote);
- 
-diff -ruN a/src/impl/peerconnection.cpp b/src/impl/peerconnection.cpp
---- a/src/impl/peerconnection.cpp	2026-10-18 12:15:43.251243956 +0000
-+++ b/src/impl/peerconnection.cpp	2026-10-18 12:15:31.671247571 +0000
-@@ -100,6 +100,11 @@
- 	mProcessor.join();
- }
- 
-+void PeerConnection::silenceIce() {
-+	if (auto ice = std::atomic_load(&mIceTransport))
-+		ice->halt();
-+}
-+
- void PeerConnection::close() {
- 	if (!closing.exchange(true)) {
- 		PLOG_VERBOSE << "Closing PeerConnection";
-@@ -411,6 +416,8 @@
- 	auto sctp = std::atomic_exchange(&mSctpTransport, decltype(mSctpTransport)(nullptr));
- 	auto dtls = std::atomic_exchange(&mDtlsTransport, decltype(mDtlsTransport)(nullptr));
- 	auto ice = std::atomic_exchange(&mIceTransport, decltype(mIceTransport)(nullptr));
-+	if (ice)
-+		ice->halt();
- 
- 	if (sctp) {
- 		sctp->onRecv(nullptr);
-diff -ruN a/src/impl/peerconnection.hpp b/src/impl/peerconnection.hpp
---- a/src/impl/peerconnection.hpp	2026-10-18 12:15:43.251243956 +0000
-+++ b/src/impl/peerconnection.hpp	2026-10-18 12:15:31.667247571 +0000
-@@ -38,6 +38,7 @@
- 
- 	void close();
- 	void remoteClose();
-+	void silenceIce();
- 
- 	optional<Description> localDescription() const;
- 	optional<Description> remoteDescription() const;
-diff -ruN a/src/peerconnection.cpp b/src/peerconnection.cpp
---- a/src/peerconnection.cpp	2026-10-18 12:15:43.251243956 +0000
-+++ b/src/peerconnection.cpp	2026-10-18 12:15:31.675247569 +0000
-@@ -47,6 +47,8 @@
- 
- void PeerConnection::close() { impl()->close(); }
- 
-+void PeerConnection::silenceIce() { impl()->silenceIce(); }
-+
- const Configuration *PeerConnection::config() const { return &impl()->config; }
- 
- PeerConnection::State PeerConnection::state() const { return impl()->state; }
+ 		JLOG_VERBOSE("Entering poll on %d sockets for %d ms", count, (int)timediff);
+ 		int ret = poll(pfds.pfds, pfds.size, (int)timediff);
+--- a/deps/libjuice/src/stun.c
++++ b/deps/libjuice/src/stun.c
+@@ -1052,6 +1052,7 @@
+ 		mapped->socktype = SOCK_DGRAM;
+ 		struct sockaddr_in *sin = (struct sockaddr_in *)&mapped->addr;
+ 		sin->sin_family = AF_INET;
++		sin->sin_len = sizeof(*sin);
+ 		sin->sin_port = value->port ^ *((uint16_t *)mask);
+ 		uint8_t *bytes = (uint8_t *)&sin->sin_addr;
+ 		for (int i = 0; i < 4; ++i)
+@@ -1069,6 +1070,7 @@
+ 		mapped->socktype = SOCK_DGRAM;
+ 		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&mapped->addr;
+ 		sin6->sin6_family = AF_INET6;
++		sin6->sin6_len = sizeof(*sin6);
+ 		sin6->sin6_port = value->port ^ *((uint16_t *)mask);
+ 		uint8_t *bytes = (uint8_t *)&sin6->sin6_addr;
+ 		for (int i = 0; i < 16; ++i)

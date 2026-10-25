@@ -95,6 +95,7 @@ bool openSystemKeyboard(const std::string&, const std::string&, size_t, Keyboard
 KeyboardStatus pollSystemKeyboard(std::string&) { return KeyboardStatus::Closed; }
 
 bool restartApp() { return false; }
+bool exitToShell() { return false; }
 
 std::string firmwareVersion() { return {}; }
 

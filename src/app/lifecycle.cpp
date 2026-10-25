@@ -12,6 +12,7 @@
 
 #include "app/lifecycle_decide.h"
 
+#include "app/session_stats.h"
 #include "app/stream_player.h"
 #include "display/display.h"
 #include "input/controller.h"
@@ -127,6 +128,8 @@ void dieNow(const char* why) {
 
     // ATTRIBUTE=0: niente LoadExec. _exit evita i dtor di libdatachannel /
     // Videodec2 che in chiusura di sistema sono CE-34878-0.
+    stats::statsFinish("chiusura");
+    stats::statsWriteFinal();
     xc_log_stamp("exit: _exit(0)");
     xc_log_stamp("exit: processo terminato (dieNow)");
     _exit(0);
@@ -310,12 +313,31 @@ void applyLifeResult(const LifeResult& step) {
     if (step.stopReceive) XC_LOGE("exit: receive disattivato");
     if (step.homeSuspend) {
         // Main thread: present() ha già visto g_psMenu e non è in SubmitFlip.
-        display::suspendForHome();
-        media::audioSuspendForHome();
-        input::suspendForHome();
+        // Se lo stream è già morto (ICE failed → ERROR), Close di VideoOut
+        // lascia il processo in uno stato in cui Chiudi/SIGTERM faceva
+        // EXIT ERROR (01.55: marker fermo su bg=1, niente «processo terminato»).
+        // Senza player attivo: solo invalida l'handle (come releaseForExit);
+        // il kernel ripulisce al _exit del sigwait.
+        bool streamAlive = false;
+        if (g_playerMutex.try_lock()) {
+            streamAlive = g_player && g_player->running();
+            g_playerMutex.unlock();
+        }
+        if (streamAlive) {
+            display::suspendForHome();
+            media::audioSuspendForHome();
+            input::suspendForHome();
+        } else {
+            display::holdFlips(true);
+            display::releaseForExit();
+            media::audioAbortForExit();
+            input::suspendForHome();
+            XC_LOGI("exit: bg=1 post-stream (no VideoOutClose, attendo SIGTERM)");
+        }
         xc_log_stamp("exit: bg=1 risorse rilasciate");
         XC_LOGI("exit: bg=1 VideoOut/audio/pad rilasciati, flip fermi, app sospesa");
-        xc_log_stamp("exit: Chiudi dal menu = SIGTERM sullo stack normale");
+        XC_LOGI("exit: Chiudi dal menu = SIGTERM sullo stack normale");
+        stats::statsNoteMenu(1);
     }
     if (step.homeResume) {
         input::resumeFromHome();
@@ -323,11 +345,12 @@ void applyLifeResult(const LifeResult& step) {
         display::resumeFromHome();
         g_psMenu.store(false);
         if (g_playerMutex.try_lock()) {
-            if (g_player) g_player->requestKeyframe();
+            if (g_player) g_player->armReferenceLoss();
             g_playerMutex.unlock();
         }
         xc_log_stamp("exit: ripresa dal menu PS");
         XC_LOGI("exit: ripresa dal menu PS (video, audio, pad)");
+        stats::statsNoteMenu(0);
     }
     if (step.releaseStream) softReleaseStreamResources("bg>300ms");
     if (step.resumeStream) {
@@ -515,29 +538,33 @@ void pumpLifecycle(bool fromMain) {
         }
     }
 
-    // Solo diagnostica, una volta per valore: ShellUI in FG è il menu PS, non Chiudi.
-    if (g_isShellUiFg && (inMenu || st.exitArmed)) {
-        int32_t shellFg = g_isShellUiFg();
-        static int32_t lastShell = 0x7fffffff;
-        if (shellFg != lastShell) {
-            lastShell = shellFg;
-            char line[64];
-            std::snprintf(line, sizeof line, "exit: ShellUiFg rc %d", static_cast<int>(shellFg));
-            xc_log_stamp(line);
-        }
-    }
-
-    // Solo diagnostica: il tasto PS non chiude (Pause via overlay).
-    if (g_getPsButton && inMenu) {
-        int32_t ps = 0;
-        static int32_t lastPs = 0;
-        if (g_getPsButton(&ps) == 0) {
-            if (ps && !lastPs) {
-                char line[48];
-                std::snprintf(line, sizeof line, "exit: PSButton %d (no close)", static_cast<int>(ps));
+    // Dopo homeSuspend: niente ShellUiFg/PSButton — Chiudi revoca i moduli
+    // mentre queste call sono in corso → EXIT ERROR (01.55, marker bg=1).
+    if (!st.homeSuspended) {
+        // Solo diagnostica, una volta per valore: ShellUI in FG è il menu PS, non Chiudi.
+        if (g_isShellUiFg && (inMenu || st.exitArmed)) {
+            int32_t shellFg = g_isShellUiFg();
+            static int32_t lastShell = 0x7fffffff;
+            if (shellFg != lastShell) {
+                lastShell = shellFg;
+                char line[64];
+                std::snprintf(line, sizeof line, "exit: ShellUiFg rc %d", static_cast<int>(shellFg));
                 xc_log_stamp(line);
             }
-            lastPs = ps;
+        }
+
+        // Solo diagnostica: il tasto PS non chiude (Pause via overlay).
+        if (g_getPsButton && inMenu) {
+            int32_t ps = 0;
+            static int32_t lastPs = 0;
+            if (g_getPsButton(&ps) == 0) {
+                if (ps && !lastPs) {
+                    char line[48];
+                    std::snprintf(line, sizeof line, "exit: PSButton %d (no close)", static_cast<int>(ps));
+                    xc_log_stamp(line);
+                }
+                lastPs = ps;
+            }
         }
     }
 
@@ -581,13 +608,6 @@ void pumpLifecycle(bool fromMain) {
 
 void monitorLoop() {
     ensureModules();
-    sigset_t open;
-    sigemptyset(&open);
-    sigaddset(&open, SIGTERM);
-    sigaddset(&open, SIGINT);
-    sigaddset(&open, SIGQUIT);
-    sigaddset(&open, SIGHUP);
-    pthread_sigmask(SIG_UNBLOCK, &open, nullptr);
     xc_log_stamp("exit: monitor avviato");
     while (!g_appStopping.load() && !g_dying.load()) {
         pumpLifecycle(false);

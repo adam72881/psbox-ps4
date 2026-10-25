@@ -169,6 +169,13 @@ extern "C" int xc_resolve_ipv4(const char* host, uint32_t* addr) {
 
 namespace xc::platform {
 
+bool exitToShell() {
+    char* argv[] = {nullptr};
+    int rc = sceSystemServiceLoadExec("exit", argv);
+    XC_LOGE("uscita: sceSystemServiceLoadExec ha risposto 0x%08x", static_cast<unsigned>(rc));
+    return false;
+}
+
 bool restartApp() {
     // Replaces this process with /app0/eboot.bin (the console showed it
     // takes under a second, and the new eboot.bin is the one that starts).

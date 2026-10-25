@@ -134,6 +134,13 @@ bool restartApp() {
     return false;
 }
 
+bool exitToShell() {
+    const char* argv[] = {nullptr};
+    int rc = sceSystemServiceLoadExec("exit", argv);
+    XC_LOGE("uscita: sceSystemServiceLoadExec ha risposto 0x%08x", static_cast<unsigned>(rc));
+    return false;
+}
+
 std::string firmwareVersion() {
     OrbisKernelSwVersion v{};
     v.Size = sizeof v;

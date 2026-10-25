@@ -330,8 +330,11 @@ std::string play(auth::AuthManager& am, xcloud::GssvClient& gssv, const ui::Game
             tier = xcloud::Resolution::P720;
         else if (home || isBest)
             tier = xcloud::Resolution::P1440;
+        else if (res == "1080p" || res == "1080p-hq")
+            tier = xcloud::Resolution::P1080HQ;
         else
-            tier = xcloud::Resolution::P1080;
+            // Default senza scelta esplicita: 720, poi eventuale promote a 1080.
+            tier = xcloud::Resolution::P720;
         gssv.setResolution(tier);
         const xcloud::Region* region = gssv.session().defaultRegion();
         const std::string& wanted = regionName.empty() ? g_settings.region : regionName;

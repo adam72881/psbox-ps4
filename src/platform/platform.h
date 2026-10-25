@@ -73,6 +73,9 @@ KeyboardStatus pollSystemKeyboard(std::string& text);
 // Starts the app again from its eboot.bin (after an update); returns only
 // when it can't (false; the host never can).
 bool restartApp();
+// Uscita chiesta dall'app (non dal menu PS, che arriva come SIGTERM).
+// sceSystemServiceLoadExec("exit"). Ritorna solo se non è partita.
+bool exitToShell();
 
 // The console's system software ("13.00"); empty where unknown.
 std::string firmwareVersion();

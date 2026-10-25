@@ -49,14 +49,18 @@ if(EXISTS "${_xc_ldc_dtls}")
         file(READ "${_xc_ldc_dtls}" _xc_ldc_dtls_src)
     endif()
     if(NOT _xc_ldc_dtls_src MATCHES "dtls: recv in coda")
-        execute_process(
-            COMMAND patch -p1 --forward --batch
-            INPUT_FILE "${CMAKE_SOURCE_DIR}/patches/libdatachannel-ps4-dtls-log.patch"
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/deps/libdatachannel"
-            RESULT_VARIABLE _xc_ldc_dtls_log
-        )
-        if(NOT _xc_ldc_dtls_log EQUAL 0)
-            message(FATAL_ERROR "patch libdatachannel-ps4-dtls-log fallita (${_xc_ldc_dtls_log})")
+        # 0.24.6: i log DTLS sono in initlog; lo stub dtls-log non ha hunks.
+        file(STRINGS "${CMAKE_SOURCE_DIR}/patches/libdatachannel-ps4-dtls-log.patch" _xc_dtls_lines REGEX "^@@")
+        if(_xc_dtls_lines)
+            execute_process(
+                COMMAND patch -p1 --forward --batch
+                INPUT_FILE "${CMAKE_SOURCE_DIR}/patches/libdatachannel-ps4-dtls-log.patch"
+                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/deps/libdatachannel"
+                RESULT_VARIABLE _xc_ldc_dtls_log
+            )
+            if(NOT _xc_ldc_dtls_log EQUAL 0)
+                message(FATAL_ERROR "patch libdatachannel-ps4-dtls-log fallita (${_xc_ldc_dtls_log})")
+            endif()
         endif()
     endif()
 endif()

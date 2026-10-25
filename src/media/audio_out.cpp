@@ -2,6 +2,7 @@
 // Copyright (C) 2026 RafaelNGP
 #include "media/audio_out.h"
 
+#include "media/audio_pace.h"
 #include "util/log.h"
 
 #include <atomic>
@@ -41,6 +42,9 @@ std::atomic<float> g_volume{1.0f};
 // Measured for the log every ~10 s (under g_mutex): the queue's depth at each
 // grain, the grains that found it empty, what was cut.
 uint64_t g_depthSum = 0, g_depthMax = 0, g_grains = 0, g_underruns = 0, g_trimmed = 0;
+std::atomic<uint64_t> g_underrunTotal{0};
+std::atomic<uint64_t> g_trimTotal{0};
+AudioPace g_pace{};
 std::thread g_thread;
 
 #if defined(XCLOUD_PS5) || defined(XCLOUD_PS4)
@@ -57,16 +61,42 @@ void loop() {
             size_t depth = g_queue.size() / 2;
             g_depthSum += depth;
             g_depthMax = std::max<uint64_t>(g_depthMax, depth);
-            if (depth == 0) ++g_underruns;
+            AudioDecision pace = audioDecide(&g_pace, static_cast<int>(depth), kRate);
+            if (pace.dropFrames > 0) {
+                int drop = pace.dropFrames;
+                int fade = pace.fadeFrames;
+                int have = static_cast<int>(g_queue.size() / 2);
+                if (drop > have) drop = have;
+                if (drop + fade > have) fade = have - drop;
+                if (fade < 0) fade = 0;
+                if (drop > 0) {
+                    std::vector<float> tmp(static_cast<size_t>(drop + fade) * 2);
+                    std::copy(g_queue.begin(), g_queue.begin() + static_cast<long>(tmp.size()), tmp.begin());
+                    audioApplyFade(tmp.data(), drop + fade, drop, fade);
+                    g_queue.erase(g_queue.begin(), g_queue.begin() + static_cast<long>(drop * 2));
+                    for (int i = 0; i < fade * 2 && i < static_cast<int>(g_queue.size()); ++i)
+                        g_queue[static_cast<size_t>(i)] = tmp[static_cast<size_t>(drop * 2 + i)];
+                    g_trimmed += static_cast<uint64_t>(drop);
+                    g_trimTotal.fetch_add(static_cast<uint64_t>(drop));
+                }
+            }
+            if (!pace.play && depth == 0) {
+                ++g_underruns;
+                g_underrunTotal.fetch_add(1);
+            }
+            depth = g_queue.size() / 2;
             if (++g_grains == 1875) {  // 256-frame grains: ~10 s
                 XC_LOGI("audio out: queue %.1f ms on average (max %.1f), %llu empty grains, %.0f ms cut",
                         g_depthSum * 1000.0 / kRate / g_grains, g_depthMax * 1000.0 / kRate,
                         static_cast<unsigned long long>(g_underruns), g_trimmed * 1000.0 / kRate);
                 g_depthSum = g_depthMax = g_grains = g_underruns = g_trimmed = 0;
             }
-            size_t n = std::min(grain.size(), g_queue.size());
-            std::copy(g_queue.begin(), g_queue.begin() + static_cast<long>(n), grain.begin());
-            g_queue.erase(g_queue.begin(), g_queue.begin() + static_cast<long>(n));
+            size_t n = 0;
+            if (pace.play) {
+                n = std::min(grain.size(), g_queue.size());
+                std::copy(g_queue.begin(), g_queue.begin() + static_cast<long>(n), grain.begin());
+                g_queue.erase(g_queue.begin(), g_queue.begin() + static_cast<long>(n));
+            }
             std::fill(grain.begin() + static_cast<long>(n), grain.end(), 0.0f);
         }
         if (!g_running || g_handle < 0) break;
@@ -126,6 +156,7 @@ bool audioStart() {
         XC_LOGE("sceAudioOutOpen: 0x%08x", static_cast<unsigned>(g_handle));
         return false;
     }
+    audioPaceInit(&g_pace);
     g_running = true;
     g_thread = std::thread(loop);
     XC_LOGI("audio output open (48 kHz float stereo, handle %d)", g_handle);
@@ -204,11 +235,25 @@ void audioPush(const float* interleaved, size_t frames) {
     if (!g_running) return;
     std::lock_guard<std::mutex> lock(g_mutex);
     g_queue.insert(g_queue.end(), interleaved, interleaved + frames * 2);
-    if (g_queue.size() > kMaxQueued * 2) {
-        size_t cut = g_queue.size() - kTrimTo * 2;
-        g_trimmed += cut / 2;
-        g_queue.erase(g_queue.begin(), g_queue.begin() + static_cast<long>(cut));
+    int guard = 0;
+    while (g_queue.size() / 2 > static_cast<size_t>(kRate * 100 / 1000) && guard++ < 4) {
+        int have = static_cast<int>(g_queue.size() / 2);
+        int drop = kRate * 10 / 1000;
+        int fade = kRate * 5 / 1000;
+        if (drop >= have) break;
+        if (drop + fade > have) fade = have - drop;
+        std::vector<float> tmp(static_cast<size_t>(drop + fade) * 2);
+        std::copy(g_queue.begin(), g_queue.begin() + static_cast<long>(tmp.size()), tmp.begin());
+        audioApplyFade(tmp.data(), drop + fade, drop, fade);
+        g_queue.erase(g_queue.begin(), g_queue.begin() + static_cast<long>(drop * 2));
+        for (int i = 0; i < fade * 2 && i < static_cast<int>(g_queue.size()); ++i)
+            g_queue[static_cast<size_t>(i)] = tmp[static_cast<size_t>(drop * 2 + i)];
+        g_trimmed += static_cast<uint64_t>(drop);
+        g_trimTotal.fetch_add(static_cast<uint64_t>(drop));
     }
 }
+
+uint64_t audioUnderruns() { return g_underrunTotal.load(); }
+uint64_t audioTrimmedFrames() { return g_trimTotal.load(); }
 
 }  // namespace xc::media

@@ -1,8 +1,6 @@
-diff --git a/include/rtc/utils.hpp b/include/rtc/utils.hpp
-index be27733..009adf2 100644
 --- a/include/rtc/utils.hpp
 +++ b/include/rtc/utils.hpp
-@@ -50,7 +50,21 @@ private:
+@@ -50,7 +50,21 @@
  };
  
  // callback with built-in synchronization
@@ -24,11 +22,9 @@ index be27733..009adf2 100644
  public:
  	synchronized_callback() = default;
  	synchronized_callback(synchronized_callback &&cb) { *this = std::move(cb); }
-diff --git a/src/impl/certificate.cpp b/src/impl/certificate.cpp
-index ff0e5c3..866e96f 100644
 --- a/src/impl/certificate.cpp
 +++ b/src/impl/certificate.cpp
-@@ -594,8 +594,12 @@ string make_fingerprint(X509 *x509, CertificateFingerprint::Algorithm fingerprin
+@@ -594,8 +594,12 @@
  
  // Common for GnuTLS, Mbed TLS, and OpenSSL
  
@@ -41,99 +37,6 @@ index ff0e5c3..866e96f 100644
  		return std::make_shared<Certificate>(Certificate::Generate(type, "libdatachannel"));
  	});
  }
-diff --git a/src/impl/dtlstransport.cpp b/src/impl/dtlstransport.cpp
-index 6a289ef..394ae68 100644
---- a/src/impl/dtlstransport.cpp
-+++ b/src/impl/dtlstransport.cpp
-@@ -27,6 +27,8 @@
- 
- using namespace std::chrono;
- 
-+extern "C" void xc_log_flush_line(const char* level, const char* msg);
-+
- namespace rtc::impl {
- 
- void DtlsTransport::enqueueRecv() {
-@@ -385,6 +387,7 @@ DtlsTransport::DtlsTransport(shared_ptr<IceTransport> lower, certificate_ptr cer
-       mIncomingQueue(RECV_QUEUE_LIMIT, message_size_func) {
- 
- 	PLOG_DEBUG << "Initializing DTLS transport (MbedTLS)";
-+	xc_log_flush_line("I", "dtls ctor");
- 
- 	if (!mCertificate)
- 		throw std::invalid_argument("DTLS certificate is null");
-@@ -452,6 +455,7 @@ void DtlsTransport::Cleanup() {
- 
- void DtlsTransport::start() {
- 	PLOG_DEBUG << "Starting DTLS transport";
-+	xc_log_flush_line("I", "dtls start");
- 	registerIncoming();
- 	changeState(State::Connecting);
- 
-diff --git a/src/impl/icetransport.cpp b/src/impl/icetransport.cpp
-index f28422c..105d399 100644
---- a/src/impl/icetransport.cpp
-+++ b/src/impl/icetransport.cpp
-@@ -13,6 +13,7 @@
- #include "utils.hpp"
- 
- #include <algorithm>
-+#include <cstdio>
- #include <iostream>
- #include <random>
- #include <sstream>
-@@ -29,6 +30,8 @@
- 
- #include <sys/types.h>
- 
-+extern "C" void xc_log_flush_line(const char* level, const char* msg);
-+extern "C" void xc_dtls_note_rx(size_t n);
-+
- using namespace std::chrono_literals;
- using std::chrono::system_clock;
- 
-@@ -235,6 +238,7 @@ bool IceTransport::addRemoteCandidate(const Candidate &candidate) {
- 
- void IceTransport::gatherLocalCandidates(string mid, std::vector<IceServer> additionalIceServers) {
- 	mMid = std::move(mid);
-+	xc_log_flush_line("I", "ice gather");
- 
- 	std::shuffle(additionalIceServers.begin(), additionalIceServers.end(), utils::random_engine());
- 	for (const auto &server : additionalIceServers)
-@@ -244,8 +248,10 @@ void IceTransport::gatherLocalCandidates(string mid, std::vector<IceServer> addi
- 	changeGatheringState(GatheringState::InProgress);
- 
- 	if (juice_gather_candidates(mAgent.get()) < 0) {
-+		xc_log_flush_line("W", "ice gather no");
- 		throw std::runtime_error("Failed to gather local ICE candidates");
- 	}
-+	xc_log_flush_line("I", "ice gather ok");
- }
- 
- optional<string> IceTransport::getLocalAddress() const {
-@@ -361,6 +367,16 @@ void IceTransport::RecvCallback(juice_agent_t *, const char *data, size_t size,
- 	auto iceTransport = static_cast<rtc::impl::IceTransport *>(user_ptr);
- 	try {
- 		PLOG_VERBOSE << "Incoming size=" << size;
-+		if (data && size > 0) {
-+			static int n = 0;
-+			unsigned b0 = static_cast<unsigned>(static_cast<unsigned char>(data[0]));
-+			/* 20-63 è DTLS (RFC 7983). Contatore per ripartenza a freddo. */
-+			if (b0 >= 20 && b0 <= 63) {
-+				xc_dtls_note_rx(size);
-+				if (n < 8) {
-+					++n;
-+					char msg[40];
-+					std::snprintf(msg, sizeof msg, "ice: rx %u b0 %u", static_cast<unsigned>(size), b0);
-+					xc_log_flush_line("I", msg);
-+				}
-+			}
-+		}
- 		auto b = reinterpret_cast<const byte *>(data);
- 		iceTransport->incoming(make_message(b, b + size));
- 	} catch (const std::exception &e) {
-diff --git a/src/impl/init.cpp b/src/impl/init.cpp
-index aad72dd..8b7e5d4 100644
 --- a/src/impl/init.cpp
 +++ b/src/impl/init.cpp
 @@ -31,6 +31,12 @@
@@ -149,9 +52,9 @@ index aad72dd..8b7e5d4 100644
  namespace rtc::impl {
  
  struct Init::TokenPayload {
-@@ -106,11 +112,29 @@ void Init::setSctpSettings(SctpSettings s) {
+@@ -112,11 +118,29 @@
  
- void Init::doInit() {
+ void Init::doInit() try {
  	// mMutex needs to be locked
 +	xc_log_flush_line("I", "init enter");
 +	/* Nel binario 01.10 la prima istruzione DOPO il ritorno di quel flush è
@@ -181,27 +84,21 @@ index aad72dd..8b7e5d4 100644
  
  #ifdef _WIN32
  	WSADATA wsaData;
-@@ -118,10 +142,25 @@ void Init::doInit() {
+@@ -124,10 +148,19 @@
  		throw std::runtime_error("WSAStartup failed, error=" + std::to_string(WSAGetLastError()));
  #endif
  
--	int concurrency = std::thread::hardware_concurrency();
--	int count = std::max(concurrency, MIN_THREADPOOL_SIZE);
+-	unsigned int count = mThreadPoolSize > 0 ? mThreadPoolSize : std::thread::hardware_concurrency();
+-	count = std::max(count, MIN_THREADPOOL_SIZE);
 -	PLOG_DEBUG << "Spawning " << count << " threads";
-+	/* La 01.08 moriva qui, prima di "init nproc". Nel binario, fra i due log
-+	 * c'era PLOG_DEBUG (singleton di plog, poi Record/iostream se la severità
-+	 * è debug). std::thread::hardware_concurrency sta DOPO quel log e chiama
-+	 * sysconf(84): su Orbis musl entra in cpuset_getaffinity. Il pool è fisso,
-+	 * uguale a MIN_THREADPOOL_SIZE. Nessuna delle due chiamate. */
++	/* PSBox: Orbis hardware_concurrency/sysconf può morire. Pool fisso a 4
++	 * (come XCloud4 rtcSetThreadPoolSize(4)). */
 +	xc_log_flush_line("I", "init nproc");
-+	int count = MIN_THREADPOOL_SIZE;
++	int count = mThreadPoolSize > 0 ? static_cast<int>(mThreadPoolSize) : 4;
++	if (count < static_cast<int>(MIN_THREADPOOL_SIZE)) count = static_cast<int>(MIN_THREADPOOL_SIZE);
 +	{
 +		char msg[40];
 +		std::snprintf(msg, sizeof msg, "nproc %d pool %d", count, count);
-+		xc_log_flush_line("I", msg);
-+		struct timespec ts;
-+		int crc = clock_gettime(CLOCK_MONOTONIC, &ts);
-+		std::snprintf(msg, sizeof msg, "clock %d", crc);
 +		xc_log_flush_line("I", msg);
 +	}
 +	xc_log_flush_line("I", "pool");
@@ -210,7 +107,7 @@ index aad72dd..8b7e5d4 100644
  
  #if RTC_ENABLE_WEBSOCKET
  	PollService::Instance().start();
-@@ -135,16 +174,22 @@ void Init::doInit() {
+@@ -141,16 +174,22 @@
  	openssl::init();
  #endif
  
@@ -230,11 +127,79 @@ index aad72dd..8b7e5d4 100644
 +	xc_log_flush_line("I", "ice");
  	IceTransport::Init();
 +	xc_log_flush_line("I", "ice ok");
+ } catch (...) {
+ 	PLOG_ERROR << "Global initialization failed, resetting";
+ 	ThreadPool::Instance().join();
+--- a/src/impl/threadpool.cpp
++++ b/src/impl/threadpool.cpp
+@@ -9,6 +9,8 @@
+ #include "threadpool.hpp"
+ #include "utils.hpp"
+ 
++extern "C" void xc_log_flush_line(const char* level, const char* msg);
++
+ namespace rtc::impl {
+ 
+ ThreadPool &ThreadPool::Instance() {
+@@ -26,9 +28,13 @@
  }
  
- void Init::doCleanup() {
-diff --git a/src/impl/peerconnection.cpp b/src/impl/peerconnection.cpp
-index c9eefca..b8b00f0 100644
+ void ThreadPool::spawn(int count) {
++	xc_log_flush_line("I", "pool spawn");
+ 	std::unique_lock lock(mWorkersMutex);
+-	while (count-- > 0)
++	while (count-- > 0) {
++		xc_log_flush_line("I", "pool thread");
+ 		mWorkers.emplace_back(std::bind(&ThreadPool::run, this));
++		xc_log_flush_line("I", "pool thread ok");
++	}
+ }
+ 
+ void ThreadPool::join() {
+@@ -55,6 +61,7 @@
+ }
+ 
+ void ThreadPool::run() {
++	xc_log_flush_line("I", "worker");
+ 	utils::this_thread::set_name("RTC worker");
+ 	++mBusyWorkers;
+ 	scope_guard guard([&]() { --mBusyWorkers; });
+--- a/include/rtc/peerconnection.hpp
++++ b/include/rtc/peerconnection.hpp
+@@ -80,6 +80,8 @@
+ 	~PeerConnection();
+ 
+ 	void close();
++	// Ferma i keepalive STUN dell'agent senza aspettare il join.
++	void silenceIce();
+ 
+ 	const Configuration *config() const;
+ 	State state() const;
+--- a/src/impl/peerconnection.hpp
++++ b/src/impl/peerconnection.hpp
+@@ -38,6 +38,7 @@
+ 
+ 	void close();
+ 	void remoteClose();
++	void silenceIce();
+ 
+ 	optional<Description> localDescription() const;
+ 	optional<Description> remoteDescription() const;
+@@ -135,6 +136,14 @@
+ 	void dispatchMedia(message_ptr message);
+ 	void updateTrackSsrcCache(const Description &description);
+ 
++	struct XcMembersDone {
++		XcMembersDone() { xc_log_flush_line("I", "pc members"); }
++	} mXcMembersDone;
++	/* Prima di Init::token(): this e sizeof, senza entrare in doInit.
++	 * L'allocazione (make_shared) è un altro numero, loggato dal ctor. */
++	struct XcSize {
++		explicit XcSize(const PeerConnection *self);
++	} mXcSize{this};
+ 	const init_token mInitToken = Init::Instance().token();
+ 	future_certificate_ptr mCertificate;
+ 
 --- a/src/impl/peerconnection.cpp
 +++ b/src/impl/peerconnection.cpp
 @@ -24,6 +24,8 @@
@@ -246,7 +211,7 @@ index c9eefca..b8b00f0 100644
  #include <array>
  #include <iomanip>
  #include <set>
-@@ -46,7 +48,21 @@ static LogCounter
+@@ -46,7 +48,21 @@
  
  const string PemBeginCertificateTag = "-----BEGIN CERTIFICATE-----";
  
@@ -268,91 +233,439 @@ index c9eefca..b8b00f0 100644
  	PLOG_VERBOSE << "Creating PeerConnection";
  
  	if (config.certificatePemFile && config.keyPemFile) {
-diff --git a/src/impl/peerconnection.hpp b/src/impl/peerconnection.hpp
-index 22826cc..7bd5743 100644
---- a/src/impl/peerconnection.hpp
-+++ b/src/impl/peerconnection.hpp
-@@ -135,6 +135,14 @@ private:
- 	void dispatchMedia(message_ptr message);
- 	void updateTrackSsrcCache(const Description &description);
+@@ -84,6 +100,11 @@
+ 	mProcessor.join();
+ }
  
-+	struct XcMembersDone {
-+		XcMembersDone() { xc_log_flush_line("I", "pc members"); }
-+	} mXcMembersDone;
-+	/* Prima di Init::token(): this e sizeof, senza entrare in doInit.
-+	 * L'allocazione (make_shared) è un altro numero, loggato dal ctor. */
-+	struct XcSize {
-+		explicit XcSize(const PeerConnection *self);
-+	} mXcSize{this};
- 	const init_token mInitToken = Init::Instance().token();
- 	future_certificate_ptr mCertificate;
- 
-diff --git a/src/impl/sctptransport.cpp b/src/impl/sctptransport.cpp
-index 6afe772..bd481df 100644
---- a/src/impl/sctptransport.cpp
-+++ b/src/impl/sctptransport.cpp
-@@ -84,8 +84,12 @@ private:
- 
- std::unique_ptr<SctpTransport::InstancesSet> SctpTransport::Instances = std::make_unique<InstancesSet>();
- 
-+extern "C" void xc_log_flush_line(const char* level, const char* msg);
++void PeerConnection::silenceIce() {
++	if (auto ice = std::atomic_load(&mIceTransport))
++		ice->halt();
++}
 +
- void SctpTransport::Init() {
-+	xc_log_flush_line("I", "sctp init");
- 	usrsctp_init(0, SctpTransport::WriteCallback, SctpTransport::DebugCallback);
-+	xc_log_flush_line("I", "sctp flags");
- 	usrsctp_sysctl_set_sctp_pr_enable(1);  // Enable Partial Reliability Extension (RFC 3758)
- 	usrsctp_sysctl_set_sctp_ecn_enable(0); // Disable Explicit Congestion Notification
- #ifndef SCTP_ACCEPT_ZERO_CHECKSUM
-@@ -94,6 +98,7 @@ void SctpTransport::Init() {
- #ifdef SCTP_DEBUG
- 	usrsctp_sysctl_set_sctp_debug_on(SCTP_DEBUG_ALL);
- #endif
-+	xc_log_flush_line("I", "sctp flags ok");
- }
+ void PeerConnection::close() {
+ 	if (!closing.exchange(true)) {
+ 		PLOG_VERBOSE << "Closing PeerConnection";
+@@ -358,6 +379,9 @@
  
- void SctpTransport::SetSettings(const SctpSettings &s) {
-@@ -143,6 +148,7 @@ void SctpTransport::SetSettings(const SctpSettings &s) {
- 	// Heartbeat interval
- 	usrsctp_sysctl_set_sctp_heartbeat_interval_default(
- 	    to_uint32(s.heartbeatInterval.value_or(10000ms).count()));
-+	xc_log_flush_line("I", "sctp set ok");
- }
+ 	} catch (const std::exception &e) {
+ 		PLOG_ERROR << e.what();
++		std::string line = std::string("sctp: ") + e.what();
++		if (line.size() > 110) line.resize(110);
++		xc_log_flush_line("E", line.c_str());
+ 		changeState(State::Failed);
+ 		throw std::runtime_error("SCTP transport initialization failed");
+ 	}
+@@ -393,6 +417,8 @@
+ 	auto sctp = std::atomic_exchange(&mSctpTransport, decltype(mSctpTransport)(nullptr));
+ 	auto dtls = std::atomic_exchange(&mDtlsTransport, decltype(mDtlsTransport)(nullptr));
+ 	auto ice = std::atomic_exchange(&mIceTransport, decltype(mIceTransport)(nullptr));
++	if (ice)
++		ice->halt();
  
- void SctpTransport::Cleanup() {
-diff --git a/src/impl/threadpool.cpp b/src/impl/threadpool.cpp
-index 1fda4e2..7a9c776 100644
---- a/src/impl/threadpool.cpp
-+++ b/src/impl/threadpool.cpp
-@@ -9,6 +9,8 @@
- #include "threadpool.hpp"
+ 	if (sctp) {
+ 		sctp->onRecv(nullptr);
+--- a/src/peerconnection.cpp
++++ b/src/peerconnection.cpp
+@@ -47,6 +47,8 @@
+ 
+ void PeerConnection::close() { impl()->close(); }
+ 
++void PeerConnection::silenceIce() { impl()->silenceIce(); }
++
+ const Configuration *PeerConnection::config() const { return &impl()->config; }
+ 
+ PeerConnection::State PeerConnection::state() const { return impl()->state; }
+--- a/src/impl/icetransport.hpp
++++ b/src/impl/icetransport.hpp
+@@ -57,6 +57,8 @@
+ 	optional<string> getRemoteAddress() const;
+ 
+ 	bool send(message_ptr message) override; // false if dropped
++	// Ferma i keepalive STUN subito, senza join del thread juice.
++	void halt();
+ 
+ 	bool getSelectedCandidatePair(Candidate *local, Candidate *remote);
+ 
+--- a/src/impl/icetransport.cpp
++++ b/src/impl/icetransport.cpp
+@@ -13,6 +13,7 @@
  #include "utils.hpp"
  
+ #include <algorithm>
++#include <cstdio>
+ #include <future>
+ #include <iostream>
+ #include <random>
+@@ -30,6 +31,9 @@
+ 
+ #include <sys/types.h>
+ 
 +extern "C" void xc_log_flush_line(const char* level, const char* msg);
++extern "C" void xc_dtls_note_rx(size_t n);
++
+ using namespace std::chrono_literals;
+ using std::chrono::system_clock;
+ 
+@@ -182,9 +186,19 @@
+ 
+ IceTransport::~IceTransport() {
+ 	PLOG_DEBUG << "Destroying ICE transport";
++	halt();
+ 	mAgent.reset();
+ }
+ 
++void IceTransport::halt() {
++#if !USE_NICE
++	if (mAgent)
++		juice_halt(mAgent.get());
++#else
++	(void)0;
++#endif
++}
++
+ Description::Role IceTransport::role() const { return mRole; }
+ 
+ Description IceTransport::getLocalDescription(Description::Type type) const {
+@@ -217,6 +231,27 @@
+ 		mRole = description.role() == Description::Role::Active ? Description::Role::Passive
+ 		                                                        : Description::Role::Active;
+ 
++	{
++		const char *remote = description.role() == Description::Role::Active    ? "active"
++		                     : description.role() == Description::Role::Passive ? "passive"
++		                                                                        : "actpass";
++		const char *local = mRole == Description::Role::Active    ? "active"
++		                    : mRole == Description::Role::Passive ? "passive"
++		                                                          : "actpass";
++		char line[96];
++		std::snprintf(line, sizeof line, "ice: setup remoto %s, ruolo locale %s", remote, local);
++		xc_log_flush_line("I", line);
++		if (auto fp = description.fingerprint()) {
++			string algo = CertificateFingerprint::AlgorithmIdentifier(fp->algorithm);
++			char fline[180];
++			std::snprintf(fline, sizeof fline, "ice: fingerprint remoto %s %s", algo.c_str(),
++			              fp->value.c_str());
++			xc_log_flush_line("I", fline);
++		} else {
++			xc_log_flush_line("W", "ice: fingerprint remoto assente");
++		}
++	}
++
+ 	if (mRole == description.role())
+ 		throw std::invalid_argument("Incompatible roles with remote description");
+ 
+@@ -236,6 +271,7 @@
+ 
+ void IceTransport::gatherLocalCandidates(string mid, std::vector<IceServer> additionalIceServers) {
+ 	mMid = std::move(mid);
++	xc_log_flush_line("I", "ice gather");
+ 
+ 	std::shuffle(additionalIceServers.begin(), additionalIceServers.end(), utils::random_engine());
+ 	for (const auto &server : additionalIceServers)
+@@ -245,8 +281,10 @@
+ 	changeGatheringState(GatheringState::InProgress);
+ 
+ 	if (juice_gather_candidates(mAgent.get()) < 0) {
++		xc_log_flush_line("W", "ice gather no");
+ 		throw std::runtime_error("Failed to gather local ICE candidates");
+ 	}
++	xc_log_flush_line("I", "ice gather ok");
+ }
+ 
+ optional<string> IceTransport::getLocalAddress() const {
+@@ -296,8 +334,13 @@
+ bool IceTransport::outgoing(message_ptr message) {
+ 	// Explicit Congestion Notification takes the least-significant 2 bits of the DS field
+ 	int ds = int(message->dscp << 2);
+-	return juice_send_diffserv(mAgent.get(), reinterpret_cast<const char *>(message->data()),
+-	                           message->size(), ds) >= 0;
++	const char *bytes = reinterpret_cast<const char *>(message->data());
++	unsigned b0 = message->size() ? static_cast<unsigned char>(bytes[0]) : 0;
++	// Record DTLS di handshake (20 change_cipher_spec, 21 alert, 22 handshake).
++	// Il 23 è application data: non si duplica su altre pair.
++	if (b0 >= 20 && b0 <= 22)
++		return juice_send_dtls_fanout(mAgent.get(), bytes, message->size(), ds) >= 0;
++	return juice_send_diffserv(mAgent.get(), bytes, message->size(), ds) >= 0;
+ }
+ 
+ void IceTransport::changeGatheringState(GatheringState state) {
+@@ -362,6 +405,20 @@
+ 	auto iceTransport = static_cast<rtc::impl::IceTransport *>(user_ptr);
+ 	try {
+ 		PLOG_VERBOSE << "Incoming size=" << size;
++		if (data && size > 0) {
++			static int n = 0;
++			unsigned b0 = static_cast<unsigned>(static_cast<unsigned char>(data[0]));
++			/* 20-63 è DTLS (RFC 7983). Contatore per ripartenza a freddo. */
++			if (b0 >= 20 && b0 <= 63) {
++				xc_dtls_note_rx(size);
++				if (n < 8) {
++					++n;
++					char msg[40];
++					std::snprintf(msg, sizeof msg, "ice: rx %u b0 %u", static_cast<unsigned>(size), b0);
++					xc_log_flush_line("I", msg);
++				}
++			}
++		}
+ 		auto b = reinterpret_cast<const byte *>(data);
+ 		iceTransport->incoming(make_message(b, b + size));
+ 	} catch (const std::exception &e) {
+@@ -393,6 +450,8 @@
+ 
+ #else // USE_NICE == 1
+ 
++void IceTransport::halt() {}
++
+ IceTransport::MainLoopWrapper *IceTransport::MainLoop = nullptr;
+ 
+ IceTransport::MainLoopWrapper::MainLoopWrapper()
+--- a/src/impl/dtlstransport.cpp
++++ b/src/impl/dtlstransport.cpp
+@@ -14,6 +14,7 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <cstdio>
+ #include <cstring>
+ #include <exception>
+ 
+@@ -27,6 +28,19 @@
+ 
+ using namespace std::chrono;
+ 
++extern "C" void xc_log_flush_line(const char* level, const char* msg);
++extern "C" void psbox_rd_dtls_incoming(size_t n);
++extern "C" void psbox_rd_dtls_push(int ok, size_t qsize);
++extern "C" void psbox_rd_dorecv(void);
++extern "C" void psbox_rd_push_enter(void);
++extern "C" void psbox_rd_push_leave(void);
++
++static void xc_dtls_line(const char* fmt, int a, int b) {
++	char msg[96];
++	std::snprintf(msg, sizeof msg, fmt, a, b);
++	xc_log_flush_line("I", msg);
++}
 +
  namespace rtc::impl {
  
- ThreadPool &ThreadPool::Instance() {
-@@ -26,9 +28,13 @@ int ThreadPool::count() const {
+ void DtlsTransport::enqueueRecv() {
+@@ -164,7 +178,12 @@
+ 	}
+ 
+ 	PLOG_VERBOSE << "Incoming size=" << message->size();
+-	if (mIncomingQueue.tryPush(std::move(message))) {
++	psbox_rd_dtls_incoming(message->size());
++	psbox_rd_push_enter();
++	bool pushed = mIncomingQueue.tryPush(std::move(message));
++	psbox_rd_dtls_push(pushed ? 1 : 0, mIncomingQueue.size());
++	psbox_rd_push_leave();
++	if (pushed) {
+ 		enqueueRecv();
+ 	} else {
+ 		PLOG_VERBOSE << "DTLS incoming queue is full, dropping";
+@@ -191,6 +210,7 @@
+ void DtlsTransport::doRecv() {
+ 	std::lock_guard lock(mRecvMutex);
+ 	--mPendingRecvCount;
++	psbox_rd_dorecv();
+ 
+ 	if (state() != State::Connecting && state() != State::Connected)
+ 		return;
+@@ -392,6 +412,8 @@
+       mIncomingQueue(RECV_QUEUE_LIMIT, message_size_func) {
+ 
+ 	PLOG_DEBUG << "Initializing DTLS transport (MbedTLS)";
++	xc_log_flush_line("I", mIsClient ? "dtls: ruolo client (active, manda ClientHello)"
++	                                 : "dtls: ruolo server (passive, attende ClientHello)");
+ 
+ 	if (!mCertificate)
+ 		throw std::invalid_argument("DTLS certificate is null");
+@@ -459,6 +481,7 @@
+ 
+ void DtlsTransport::start() {
+ 	PLOG_DEBUG << "Starting DTLS transport";
++	xc_log_flush_line("I", "dtls start");
+ 	registerIncoming();
+ 	changeState(State::Connecting);
+ 
+@@ -470,6 +493,7 @@
+ 	}
+ 
+ 	enqueueRecv(); // to initiate the handshake
++	xc_log_flush_line("I", "dtls: recv in coda");
  }
  
- void ThreadPool::spawn(int count) {
-+	xc_log_flush_line("I", "pool spawn");
- 	std::unique_lock lock(mWorkersMutex);
--	while (count-- > 0)
-+	while (count-- > 0) {
-+		xc_log_flush_line("I", "pool thread");
- 		mWorkers.emplace_back(std::bind(&ThreadPool::run, this));
-+		xc_log_flush_line("I", "pool thread ok");
+ void DtlsTransport::stop() {
+@@ -506,7 +530,12 @@
+ 	}
+ 
+ 	PLOG_VERBOSE << "Incoming size=" << message->size();
+-	if (mIncomingQueue.tryPush(std::move(message))) {
++	psbox_rd_dtls_incoming(message->size());
++	psbox_rd_push_enter();
++	bool pushed = mIncomingQueue.tryPush(std::move(message));
++	psbox_rd_dtls_push(pushed ? 1 : 0, mIncomingQueue.size());
++	psbox_rd_push_leave();
++	if (pushed) {
+ 		enqueueRecv();
+ 	} else {
+ 		PLOG_VERBOSE << "DTLS incoming queue is full, dropping";
+@@ -533,6 +562,18 @@
+ void DtlsTransport::doRecv() {
+ 	std::lock_guard lock(mRecvMutex);
+ 	--mPendingRecvCount;
++	psbox_rd_dorecv();
++
++	{
++		static int n = 0;
++		static int last = -999;
++		int st = static_cast<int>(state());
++		if (n < 16 || st != last) {
++			if (n < 16) ++n;
++			last = st;
++			xc_dtls_line("dtls: recv n %d stato %d", n, st);
++		}
++	}
+ 
+ 	if (state() != State::Connecting && state() != State::Connected)
+ 		return;
+@@ -549,8 +590,22 @@
+ 					std::lock_guard lock(mSslMutex);
+ 					ret = mbedtls_ssl_handshake(&mSsl);
+ 				}
++				{
++					static int n = 0;
++					static int last = 0x7fffffff;
++					if (n < 24 || ret != last) {
++						if (n < 24) ++n;
++						last = ret;
++						xc_dtls_line("dtls: handshake rc %d fin %d", ret, static_cast<int>(mFinMs));
++					}
++				}
+ 
+ 				if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
++					static int waits = 0;
++					if (waits < 12) {
++						++waits;
++						xc_dtls_line("dtls: attesa byte fin %d ms", static_cast<int>(mFinMs), waits);
++					}
+ 					auto timeout = mFinMs != 0 ? mTimerSetAt + milliseconds(mFinMs)
+ 					                           : std::chrono::steady_clock::now() + milliseconds(MBEDTLS_SSL_DTLS_TIMEOUT_DFL_MIN);
+ 					ThreadPool::Instance().schedule(timeout,
+@@ -562,6 +617,7 @@
+ 				}
+ 
+ 				if (mbedtls::check(ret, "Handshake failed")) {
++					xc_log_flush_line("I", "dtls: handshake fatto");
+ 					// RFC 8261: DTLS MUST support sending messages larger than the current path MTU
+ 					// See https://www.rfc-editor.org/rfc/rfc8261.html#section-5
+ 					{
+@@ -570,8 +626,9 @@
+ 					}
+ 
+ 					PLOG_INFO << "DTLS handshake finished";
+-					changeState(State::Connected);
++					// SRTP prima dello stato: SCTP parte con le chiavi già pronte.
+ 					postHandshake();
++					changeState(State::Connected);
+ 					break;
+ 				}
+ 			}
+@@ -607,6 +664,7 @@
+ 		}
+ 	} catch (const std::exception &e) {
+ 		PLOG_ERROR << "DTLS recv: " << e.what();
++		xc_log_flush_line("E", "dtls: recv eccezione");
+ 	}
+ 
+ 	if (state() == State::Connected) {
+@@ -615,6 +673,7 @@
+ 		recv(nullptr);
+ 	} else {
+ 		PLOG_ERROR << "DTLS handshake failed";
++		xc_log_flush_line("E", "dtls: handshake fallito");
+ 		changeState(State::Failed);
+ 	}
+ }
+@@ -650,8 +709,14 @@
+ 	auto *t = static_cast<DtlsTransport *>(ctx);
+ 	try {
+ 		if (len > 0) {
++			static int n = 0;
++			if (n < 8) {
++				++n;
++				xc_dtls_line("dtls: tx %d", static_cast<int>(len), n);
++			}
+ 			auto b = reinterpret_cast<const byte *>(buf);
+-			t->outgoing(make_message(b, b + len));
++			bool sent = t->outgoing(make_message(b, b + len));
++			if (!sent) xc_log_flush_line("W", "dtls: tx non uscito");
+ 		}
+ 		return int(len);
+ 
+@@ -697,6 +762,11 @@
+ 	if (fin_ms != 0) {
+ 		dtlsTransport->mTimerSetAt = std::chrono::steady_clock::now();
+ 	}
++	static int n = 0;
++	if (n < 8) {
++		++n;
++		xc_dtls_line("dtls: timer int %d fin %d", static_cast<int>(int_ms), static_cast<int>(fin_ms));
 +	}
  }
  
- void ThreadPool::join() {
-@@ -55,6 +61,7 @@ void ThreadPool::clear() {
+ int DtlsTransport::GetTimerCallback(void *ctx) {
+@@ -706,6 +776,12 @@
+ 	if (dtlsTransport->mFinMs == 0) {
+ 		return -1;
+ 	} else if (now >= dtlsTransport->mTimerSetAt + milliseconds(dtlsTransport->mFinMs)) {
++		static int n = 0;
++		if (n < 8) {
++			++n;
++			xc_dtls_line("dtls: timeout fin %d int %d", static_cast<int>(dtlsTransport->mFinMs),
++			             static_cast<int>(dtlsTransport->mIntMs));
++		}
+ 		return 2;
+ 	} else if (now >= dtlsTransport->mTimerSetAt + milliseconds(dtlsTransport->mIntMs)) {
+ 		return 1;
+@@ -918,7 +994,12 @@
+ 	}
+ 
+ 	PLOG_VERBOSE << "Incoming size=" << message->size();
+-	if (mIncomingQueue.tryPush(std::move(message))) {
++	psbox_rd_dtls_incoming(message->size());
++	psbox_rd_push_enter();
++	bool pushed = mIncomingQueue.tryPush(std::move(message));
++	psbox_rd_dtls_push(pushed ? 1 : 0, mIncomingQueue.size());
++	psbox_rd_push_leave();
++	if (pushed) {
+ 		enqueueRecv();
+ 	} else {
+ 		PLOG_VERBOSE << "DTLS incoming queue is full, dropping";
+@@ -945,6 +1026,7 @@
+ void DtlsTransport::doRecv() {
+ 	std::lock_guard lock(mRecvMutex);
+ 	--mPendingRecvCount;
++	psbox_rd_dorecv();
+ 
+ 	if (state() != State::Connecting && state() != State::Connected)
+ 		return;
+--- a/src/impl/dtlssrtptransport.cpp
++++ b/src/impl/dtlssrtptransport.cpp
+@@ -16,6 +16,8 @@
+ #include <cstring>
+ #include <exception>
+ 
++extern "C" void xc_log_flush_line(const char* level, const char* msg);
++
+ using std::to_integer;
+ using std::to_string;
+ 
+@@ -365,6 +367,7 @@
+ 		throw std::runtime_error("SRTP add outbound stream failed, status=" +
+ 		                         to_string(static_cast<int>(err)));
+ 
++	xc_log_flush_line("I", "srtp keys ok");
+ 	mInitDone = true;
  }
  
- void ThreadPool::run() {
-+	xc_log_flush_line("I", "worker");
- 	utils::this_thread::set_name("RTC worker");
- 	++mBusyWorkers;
- 	scope_guard guard([&]() { --mBusyWorkers; });

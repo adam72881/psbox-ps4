@@ -1,13 +1,14 @@
-# Release 01.41 (v1.0.41)
+# Release 01.56 (v1.0.56)
 
 | File | Note |
 | --- | --- |
-| `PSBox-PS4-01.41.pkg` | Build corrente |
-| `PSBox-PS4-01.42.pkg` | Solo test update 01.41 → 01.42 da `/data/psbox/update/` |
+| `PSBox-PS4-01.56.pkg` | Build CI. SHA-256 dall'artifact `PSBox-PS4`. |
 
-## Contenuto 01.41
+## Contenuto 01.56
 
-- **Chiusura falsa al boot:** `IsAppSuspended` con errore SCE (es. `0x80A10009`) non chiude più; solo `rc > 0` conta come sospeso. Niente Close da AppMessaging / eventi inventati / GetStatus ko.
-- **Update con dialogo:** all’avvio e da «Controlla aggiornamenti» se c’è un pkg più nuovo → «È disponibile l’aggiornamento X. Vuoi installarlo?» **Sì / No** (✗ conferma, ○ indietro). No lascia il pkg e riproporrà al prossimo avvio. Log `[UPDATE] scelta Sì/No`.
-- **Install sicuro (solo dopo Sì):** path BGFT `/user/data/...`, copia senza rename/unlink a metà, attesa `GetProgress` fino a fine/errore, poi `LoadExec("exit")`. Mai UnInstall di `XCLD00001`.
-- Mantiene i fix 01.39: TWCC, pausa decode in menu PS, screenshot (incluso dialog update).
+Correzioni sul fail 01.55 (trace ~50 fps per ~5 s poi stop inbound; Consent expired; niente `stream:`/`recv:`; EXIT ERROR da menu PS):
+
+1. **Deadlock Handshake:** `queueText` da `message->onOpen` / `onHandshakeAck`, ma `flushOutbound` solo in `pumpFast` dopo `start()`. Durante `waitFor(handshakeDone)` ora si fa flush (+ RR). Senza HandshakeAck non partono auth/config/alias → il server taglia l’RTP ~5 s.
+2. **Capabilities XCloud4:** `clientdevicecapabilities` piene (width/height/bitrate/fps), non `{}`; log «RTC canales Xbox preparados».
+3. **recv: 1 Hz** su thread dedicato (`psbox_rd_start_logger`), indipendente dal worker bloccato in `start()`.
+4. **EXIT menu PS post-stream:** se lo stream è già morto, niente `sceVideoOutClose` (solo `releaseForExit`); dopo `homeSuspend` niente ShellUiFg/PSButton; `sigwait` fa solo write+unlink marker+`_exit(0)` (niente stats).

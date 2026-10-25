@@ -7,7 +7,8 @@
 #ifndef PSBOX_FLIP_SCHED_H
 #define PSBOX_FLIP_SCHED_H
 
-static const int kFlipQueueMax = 2;
+/* Un solo flip in volo: il decode non riempie la coda mentre il present è in ritardo. */
+static const int kFlipQueueMax = 1;
 
 static int flipIndexBusy(int index, int current, int pending, const int* recent, int nRecent) {
     int n;

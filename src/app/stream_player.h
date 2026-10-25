@@ -42,6 +42,8 @@ public:
     void answerTextInput(const std::string& id, bool accepted, const std::string& text);
     // A new key frame (a clean picture), as after packet loss.
     void requestKeyframe();
+    // Coda scartata o ritorno dal menu: niente P-frame finché non arriva un IDR.
+    void armReferenceLoss();
     // How many times the stream reconnected after losing the connection (a
     // new session: controllers 1..3 must be announced again).
     uint32_t reconnects() const;

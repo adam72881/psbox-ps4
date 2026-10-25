@@ -5,6 +5,8 @@
 // subito _exit(0): niente re-raise, niente dtor, niente report di crash.
 #include "app/crash_guard.h"
 
+#include "app/close_plan.h"
+#include "app/session_stats.h"
 #include "platform/platform.h"
 #include "util/log.h"
 
@@ -151,19 +153,45 @@ void onSignal(int sig, siginfo_t* info, void* uctx) {
     _exit(0);
 }
 
-void unblockCloseSignals() {
+void closeSet(sigset_t* set) {
+    sigemptyset(set);
+    sigaddset(set, SIGTERM);
+    sigaddset(set, SIGINT);
+    sigaddset(set, SIGQUIT);
+    sigaddset(set, SIGHUP);
+}
+
+void sigwaitLoop() {
+    sigset_t set;
+    closeSet(&set);
+    for (;;) {
+        int sig = 0;
+        if (sigwait(&set, &sig) != 0) continue;
+        if (!closeSignalWakes(sig)) continue;
+        // 01.56: dopo bg=1 (VideoOut/pad già chiusi) Chiudi manda SIGTERM.
+        // Niente stats/heap: solo write+fsync+_exit. Si cancella il marker
+        // così il boot successivo non legge «last line / bg=1…» come crash.
+        const char fin[] = "exit: processo terminato (segnale)\n";
+        flushFd(STDERR_FILENO, fin, static_cast<int>(sizeof fin - 1));
+        flushFd(g_logFd, fin, static_cast<int>(sizeof fin - 1));
+        if (g_marker[0]) ::unlink(g_marker);
+        _exit(0);
+    }
+}
+
+}  // namespace
+
+void setLogFd(int fd) { g_logFd = fd; }
+
+void blockCloseSignals() {
     sigset_t set;
     sigemptyset(&set);
     sigaddset(&set, SIGTERM);
     sigaddset(&set, SIGINT);
     sigaddset(&set, SIGQUIT);
     sigaddset(&set, SIGHUP);
-    pthread_sigmask(SIG_UNBLOCK, &set, nullptr);
+    pthread_sigmask(SIG_BLOCK, &set, nullptr);
 }
-
-}  // namespace
-
-void setLogFd(int fd) { g_logFd = fd; }
 
 void install(const std::string& markerPath) {
     std::strncpy(g_marker, markerPath.c_str(), sizeof g_marker - 1);
@@ -192,11 +220,16 @@ void install(const std::string& markerPath) {
     // stack normale, come Itemzflow / RetroArch / HB-Store.
     struct sigaction closeSig {};
     closeSig.__sa_handler.__sa_sigaction = onSignal;
-    closeSig.sa_flags = SA_SIGINFO;
+    closeSig.sa_flags = closeSigFlags();
     sigemptyset(&closeSig.sa_mask);
     for (int sig : {SIGTERM, SIGINT, SIGQUIT, SIGHUP}) sigaction(sig, &closeSig, nullptr);
-    unblockCloseSignals();
-    XC_LOGI("crash guard: SIGTERM/INT/QUIT/HUP sullo stack normale, sbloccati");
+    blockCloseSignals();
+    static platform::Thread sigThread;
+    if (!platform::startThread(sigThread, sigwaitLoop, 1u << 20)) {
+        XC_LOGE("crash guard: sigwait non partito");
+    } else {
+        XC_LOGI("crash guard: SIGTERM/INT/QUIT/HUP bloccati, sigwait");
+    }
     std::set_terminate([] {
         const char* what = "uncaught exception";
         try {

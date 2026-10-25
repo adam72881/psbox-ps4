@@ -2,6 +2,7 @@
 // Copyright (C) 2026 RafaelNGP
 #include "stream/h264_receiver.h"
 
+#include "stream/nack_plan.h"
 #include "stream/rtcp_reporter.h"
 
 #include "platform/platform.h"
@@ -15,8 +16,8 @@ namespace {
 
 // How long a hole may wait for its retransmission (a couple of RTTs), how
 // often a NACK is repeated, and how many times.
-constexpr uint64_t kWaitMs = 150;
-constexpr uint64_t kRenackMs = 40;
+constexpr uint64_t kWaitMs = kNackGraceMs;
+constexpr uint64_t kRenackMs = kNackRepeatMs;
 constexpr int kMaxNacks = 3;
 constexpr size_t kMaxBuffered = 4000;      // packets (about 4 MB)
 

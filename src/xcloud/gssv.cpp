@@ -19,100 +19,11 @@ namespace xc::xcloud {
 namespace {
 constexpr const char* kClientHeader = "XboxComBrowser";
 
-// Sent like the Windows Xbox app does: "Windows" plus a 1080p display is what
-// gets a 1080p stream; an Android device with a 720p display gets 720p.
-const std::string& deviceInfo(Resolution res) {
-    auto build = [](bool hd, int w = 1920, int h = 1080) {
-        json::Value env = json::Value::object();
-        env.set("clientAppId", "Microsoft.GamingApp");
-        env.set("clientAppType", "native");
-        env.set("clientAppVersion", "2203.1001.4.0");
-        env.set("clientSdkVersion", "8.5.2");
-        env.set("httpEnvironment", "prod");
-        env.set("sdkInstallId", "");
-        json::Value app = json::Value::object();
-        app.set("env", env);
-        json::Value hw = json::Value::object();
-        hw.set("make", hd ? "Microsoft" : "Google");
-        hw.set("model", hd ? "Surface Pro" : "Pixel");
-        hw.set("sdktype", "native");
-        json::Value os = json::Value::object();
-        os.set("name", hd ? "Windows 11" : "Android");
-        os.set("ver", hd ? "22631.2715" : "14");
-        os.set("platform", hd ? "desktop" : "phone");
-        json::Value dims = json::Value::object();
-        dims.set("widthInPixels", hd ? w : 1280);
-        dims.set("heightInPixels", hd ? h : 720);
-        json::Value dpi = json::Value::object();
-        dpi.set("dpiX", 1);
-        dpi.set("dpiY", 1);
-        json::Value display = json::Value::object();
-        display.set("dimensions", dims);
-        display.set("pixelDensity", dpi);
-        json::Value dev = json::Value::object();
-        dev.set("hw", hw);
-        dev.set("os", os);
-        dev.set("displayInfo", display);
-        json::Value v = json::Value::object();
-        v.set("appInfo", app);
-        v.set("dev", dev);
-        return v.dump();
-    };
-    // 1440p: the xbox.com web client (SDK 10.6.62) in Edge on a 1440p display,
-    // field for field as its X-MS-Device-Info interceptor builds it.
-    static const std::string qhd = [] {
-        json::Value env = json::Value::object();
-        env.set("clientAppId", "www.xbox.com");
-        env.set("clientAppType", "browser");
-        env.set("clientAppVersion", "1.0.2610.0201");
-        env.set("clientSdkVersion", "10.6.65");
-        env.set("httpEnvironment", "prod");
-        env.set("sdkInstallId", [] {  // filled in by the web client; random, per run (nothing of the console)
-            uint8_t b[16];
-            platform::randomBytes(b, sizeof b);
-            b[6] = static_cast<uint8_t>((b[6] & 0x0f) | 0x40);
-            b[8] = static_cast<uint8_t>((b[8] & 0x3f) | 0x80);
-            char id[37];
-            std::snprintf(id, sizeof id, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x", b[0], b[1],
-                          b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
-            return std::string(id);
-        }());
-        json::Value app = json::Value::object();
-        app.set("env", env);
-        json::Value dims = json::Value::object();
-        dims.set("heightInPixels", 1440);
-        dims.set("widthInPixels", 2560);
-        json::Value dpi = json::Value::object();
-        dpi.set("dpiX", 1);
-        dpi.set("dpiY", 1);
-        json::Value display = json::Value::object();
-        display.set("dimensions", dims);
-        display.set("pixelDensity", dpi);
-        json::Value browser = json::Value::object();
-        browser.set("browserName", "edge");
-        browser.set("browserVersion", "141.0.0.0");
-        json::Value hw = json::Value::object();
-        hw.set("make", "Microsoft");
-        hw.set("model", "Windows");
-        hw.set("platformType", "desktop");
-        hw.set("sdkType", "web");
-        json::Value os = json::Value::object();
-        os.set("name", "windows");
-        os.set("ver", "10.0");
-        os.set("platform", "desktop");
-        json::Value dev = json::Value::object();
-        dev.set("displayInfo", display);
-        dev.set("browser", browser);
-        dev.set("hw", hw);
-        dev.set("os", os);
-        json::Value v = json::Value::object();
-        v.set("appInfo", app);
-        v.set("dev", dev);
-        return v.dump();
-    }();
-    // 1080p HQ: the web client on a Tizen TV with a 4K panel, as Better
-    // xCloud sends it.
-    static const std::string tv = [] {
+/* XCloud4 stream_profile.h/c: /play = web/windows (+ displayInfo 4K per
+ * 1080p-G8); tutti gli altri endpoint = native console PS4. */
+const std::string& deviceInfoPlay(Resolution res) {
+    (void)res;
+    static const std::string play = [] {
         json::Value env = json::Value::object();
         env.set("clientAppId", "www.xbox.com");
         env.set("clientAppType", "browser");
@@ -123,7 +34,7 @@ const std::string& deviceInfo(Resolution res) {
         json::Value app = json::Value::object();
         app.set("env", env);
         json::Value os = json::Value::object();
-        os.set("name", "tizen");
+        os.set("name", "windows");
         os.set("ver", "22631.2715");
         os.set("platform", "desktop");
         json::Value hw = json::Value::object();
@@ -152,13 +63,55 @@ const std::string& deviceInfo(Resolution res) {
         v.set("dev", dev);
         return v.dump();
     }();
-    static const std::string hd = build(true), sd = build(false);
-    switch (res) {
-    case Resolution::P720: return sd;
-    case Resolution::P1440: return qhd;
-    case Resolution::P1080HQ: return tv;
-    default: return hd;
-    }
+    return play;
+}
+
+const std::string& deviceInfoNative(Resolution res) {
+    static const std::string androidNative = [] {
+        json::Value env = json::Value::object();
+        env.set("clientAppId", "PSBox");
+        env.set("clientAppType", "native");
+        env.set("clientAppVersion", "0.7.33");
+        env.set("httpEnvironment", "prod");
+        json::Value app = json::Value::object();
+        app.set("env", env);
+        json::Value hw = json::Value::object();
+        hw.set("make", "Sony");
+        hw.set("model", "PS4");
+        json::Value os = json::Value::object();
+        os.set("name", "android");
+        os.set("platform", "console");
+        json::Value dev = json::Value::object();
+        dev.set("hw", hw);
+        dev.set("os", os);
+        json::Value v = json::Value::object();
+        v.set("appInfo", app);
+        v.set("dev", dev);
+        return v.dump();
+    }();
+    static const std::string windowsNative = [] {
+        json::Value env = json::Value::object();
+        env.set("clientAppId", "PSBox");
+        env.set("clientAppType", "native");
+        env.set("clientAppVersion", "0.7.33");
+        env.set("httpEnvironment", "prod");
+        json::Value app = json::Value::object();
+        app.set("env", env);
+        json::Value hw = json::Value::object();
+        hw.set("make", "Sony");
+        hw.set("model", "PS4");
+        json::Value os = json::Value::object();
+        os.set("name", "windows");
+        os.set("platform", "console");
+        json::Value dev = json::Value::object();
+        dev.set("hw", hw);
+        dev.set("os", os);
+        json::Value v = json::Value::object();
+        v.set("appInfo", app);
+        v.set("dev", dev);
+        return v.dump();
+    }();
+    return res == Resolution::P720 ? androidNative : windowsNative;
 }
 
 std::string describe(const net::Response& r) {
@@ -214,14 +167,14 @@ std::string GssvClient::sessionUrl(const std::string& suffix) const {
 }
 
 static net::Request authed(Resolution res, const GssvLogin& l, std::string method, std::string url,
-                           std::string body = {}) {
+                           std::string body = {}, bool playEndpoint = false) {
     net::Request req;
     req.method = std::move(method);
     req.url = std::move(url);
     req.body = std::move(body);
     req.headers = {{"Authorization", "Bearer " + l.gsToken},
                    {"x-gssv-client", kClientHeader},
-                   {"X-MS-Device-Info", deviceInfo(res)}};
+                   {"X-MS-Device-Info", playEndpoint ? deviceInfoPlay(res) : deviceInfoNative(res)}};
     if (!req.body.empty() || req.method == "POST") req.headers.emplace_back("Content-Type", "application/json");
     return req;
 }
@@ -439,25 +392,28 @@ bool GssvClient::startSession(const std::string& titleId, const std::string& loc
     settings.set("highContrast", 0);
     settings.set("locale", locale);
     settings.set("useIceConnection", false);
-    settings.set("timezoneOffsetMinutes", 0);
+    /* Offset locale come XCloud4 (non 0 fisso). */
+    int tzMin = 0;
+    {
+        std::time_t t = std::time(nullptr);
+        std::tm lt{};
+#if defined(_WIN32)
+        localtime_s(&lt, &t);
+#else
+        localtime_r(&t, &lt);
+#endif
+        tzMin = static_cast<int>(lt.tm_gmtoff / 60);
+    }
+    settings.set("timezoneOffsetMinutes", tzMin);
     settings.set("sdkType", "web");
-    settings.set("osName", resolution_ == Resolution::P720       ? "android"
-                           : resolution_ == Resolution::P1080HQ ? "tizen"
-                                                                : "windows");
+    /* XCloud4: osName windows (1080p-G8); android solo sul profilo 720p60. */
+    settings.set("osName", resolution_ == Resolution::P720 ? "android" : "windows");
     settings.set("enableOptionalDataCollection", false);
 
     json::Value body = json::Value::object();
     bool home = offering_ == "xhome";
-    body.set("clientSessionId", [] {  // a new id per session, as the web client sends
-        uint8_t b[16];
-        platform::randomBytes(b, sizeof b);
-        b[6] = static_cast<uint8_t>((b[6] & 0x0f) | 0x40);
-        b[8] = static_cast<uint8_t>((b[8] & 0x3f) | 0x80);
-        char id[37];
-        std::snprintf(id, sizeof id, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x", b[0], b[1], b[2],
-                      b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
-        return std::string(id);
-    }());
+    /* XCloud4 play body: clientSessionId vuoto. */
+    body.set("clientSessionId", "");
     body.set("titleId", home ? "" : titleId);
     body.set("systemUpdateGroup", "");
     body.set("settings", settings);
@@ -465,7 +421,8 @@ bool GssvClient::startSession(const std::string& titleId, const std::string& loc
     body.set("fallbackRegionNames", json::Value::array());
 
     std::string kind = offering_ == "xhome" ? "home" : "cloud";
-    auto r = net::perform(authed(resolution_, login_, "POST", url("/v5/sessions/" + kind + "/play"), body.dump()));
+    auto r = net::perform(
+        authed(resolution_, login_, "POST", url("/v5/sessions/" + kind + "/play"), body.dump(), true));
     auto j = json::parse(r.body);
     if (!r.ok() || !j || !(*j)["sessionPath"].isString()) {
         err = "session start failed: " + describe(r);
@@ -473,6 +430,7 @@ bool GssvClient::startSession(const std::string& titleId, const std::string& loc
     }
     sessionPath_ = (*j)["sessionPath"].str();
     XC_LOGI("session created");  // not its id
+    /* XCloud4: primo keepalive solo dopo Provisioned (xbox_live.c:2396), non qui. */
     return true;
 }
 
@@ -538,6 +496,9 @@ bool GssvClient::sendSdpOffer(const std::string& sdp, std::string& err) {
     cfg.set("chat", ver(1, 1));
     cfg.set("control", ver(1, 3));
     cfg.set("input", ver(1, 9));
+    /* XCloud4 xbox_live.c: canali reliableinput / unreliableinput v9. */
+    cfg.set("reliableinput", ver(9, 9));
+    cfg.set("unreliableinput", ver(9, 9));
     cfg.set("message", ver(1, 1));
 
     json::Value body = json::Value::object();
@@ -614,7 +575,16 @@ bool GssvClient::pollIceCandidates(std::vector<IceCandidate>& out, std::string& 
 }
 
 bool GssvClient::keepalive(std::string& err) {
+    if (sessionPath_.empty()) {
+        err = "keepalive: nessuna sessione";
+        return false;
+    }
     auto r = net::perform(authed(resolution_, login_, "POST", sessionUrl("/keepalive")));
+    /* Nexo/XCloud4: 410 = sessione scaduta. */
+    if (r.status == 410) {
+        err = "keepalive 410: sessione scaduta";
+        return false;
+    }
     if (!r.ok()) {
         err = "keepalive failed: " + describe(r);
         return false;
