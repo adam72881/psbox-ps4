@@ -27,11 +27,12 @@ namespace xc::media {
 namespace {
 constexpr int kProtRw = 0x33;
 constexpr size_t kAlign = 0x4000;
-// Profondità 2, senza Flush a ogni frame. Sulla 01.22 depth 1 più Flush
-// stava sui 10–12 ms; depth 2 senza Flush stava sui 2.4 ms. Moonlight-ps4
-// (videodec2.h) nota che depth 1 serializza sulla coda compute.
-constexpr int kDepth = 2;
-constexpr int kFbCount = kDepth + 2;
+// A 720p depth 1 (XCloud4/Nexo). A 1080p depth 2: sulla 01.22 depth 1
+// stava sui 10–12 ms, depth 2 sui 2.4 ms. Mai riaffidare un FB trattenuto
+// (fb_own.h), qualunque sia la profondità.
+constexpr int kDepth720 = 1;
+constexpr int kDepthHd = 2;
+constexpr int kFbCountMax = kDepthHd + 2;
 
 struct Block {
     void* ptr = nullptr;
@@ -79,8 +80,9 @@ struct State {
     size_t fbStride = 0;
     int fbN = 1;
     int fbI = 0;
+    int depth = kDepthHd;
     FbOwn fbOwn{};
-    Block au[kFbCount];
+    Block au[kFbCountMax];
     int auN = 1;
     int auI = 0;
     std::vector<uint8_t> shadow;
@@ -105,7 +107,7 @@ HwDecoder::~HwDecoder() {
             int rc = st->api.DeleteDecoder(st->dec);
             XC_LOGI("hwdec: DeleteDecoder => %s", hex(rc));
         }
-        for (int i = 0; i < kFbCount; ++i) freeMem(st->au[i]);
+        for (int i = 0; i < kFbCountMax; ++i) freeMem(st->au[i]);
         freeMem(st->fb);
         freeMem(st->cpuGpu);
         freeMem(st->gpu);
@@ -137,7 +139,8 @@ bool HwDecoder::init(int maxWidth, int maxHeight) {
     int h = maxHeight > 0 ? maxHeight : 1080;
     st->maxW = w;
     st->maxH = h;
-    XC_LOGI("hwdec: start %dx%d", w, h);
+    st->depth = (h <= 720) ? kDepth720 : kDepthHd;
+    XC_LOGI("hwdec: start %dx%d depth %d", w, h, st->depth);
 
     int sm = sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_VDECCORE);
     XC_LOGI("hwdec: VDECCORE %s", hex(sm));
@@ -155,7 +158,7 @@ bool HwDecoder::init(int maxWidth, int maxHeight) {
         return setErr(std::string("AllocateComputeQueue fallito ") + hex(rc));
 
     OrbisVideodec2DecoderConfigInfo dc;
-    videodec2_fill_decoder_config_ex(&dc, st->api.queue, w, h, kDepth, ORBIS_VIDEODEC2_THREAD_PRIO_DEFAULT);
+    videodec2_fill_decoder_config_ex(&dc, st->api.queue, w, h, st->depth, ORBIS_VIDEODEC2_THREAD_PRIO_DEFAULT);
     XC_LOGI("hwdec: cfg %u/%u %dx%d dpb %d dep %u prio %d mem %d",
             dc.profile, dc.maxLevel, dc.maxFrameWidth, dc.maxFrameHeight, dc.maxDpbFrameCount,
             dc.decodePipelineDepth, dc.cpuThreadPriority, dc.checkMemoryType ? 1 : 0);
@@ -191,14 +194,16 @@ bool HwDecoder::init(int maxWidth, int maxHeight) {
         size_t align = dm.frameBufferAlignment ? dm.frameBufferAlignment : 0x100u;
         if (align < kAlign) align = kAlign;
         size_t one = (static_cast<size_t>(dm.maxFrameBufferSize) + align - 1) & ~(align - 1);
-        size_t total = one * static_cast<size_t>(kFbCount);
+        int fbCount = st->depth + 2;
+        if (fbCount > kFbCountMax) fbCount = kFbCountMax;
+        size_t total = one * static_cast<size_t>(fbCount);
         rc = sceKernelAllocateDirectMemory(0, static_cast<off_t>(sceKernelGetDirectMemorySize()), total, align,
                                             ORBIS_KERNEL_WC_GARLIC, &st->fb.off);
-        XC_LOGI("hwdec: framebuffer phys %zu x%d => %s", one, kFbCount, hex(rc));
+        XC_LOGI("hwdec: framebuffer phys %zu x%d => %s", one, fbCount, hex(rc));
         if (rc < 0) return setErr(std::string("framebuffer AllocateDirectMemory ") + hex(rc));
         st->fb.size = total;
         st->fbStride = one;
-        st->fbN = kFbCount;
+        st->fbN = fbCount;
         fbOwnInit(&st->fbOwn, st->fbN);
 
         struct Try {
@@ -244,7 +249,7 @@ bool HwDecoder::init(int maxWidth, int maxHeight) {
 
     decoder_ = st->dec;
     XC_LOGI("hwdec: pronto %dx%d dep %d fb %d %s", dc.maxFrameWidth, dc.maxFrameHeight,
-            kDepth, st->fbN, nv12_blit_mode_name());
+            st->depth, st->fbN, nv12_blit_mode_name());
     return true;
 }
 

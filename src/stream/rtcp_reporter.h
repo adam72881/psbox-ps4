@@ -19,7 +19,7 @@ constexpr uint32_t kReceiverSsrc = 0x50534278;  // "PSBx"
 
 class RtcpReporter final : public rtc::MediaHandler {
 public:
-    RtcpReporter(uint32_t clockRate, uint32_t maxBitrate);
+    RtcpReporter(uint32_t clockRate, uint32_t maxBitrate, int abrTier = ABR_1080);
 
     void incoming(rtc::message_vector& messages, const rtc::message_callback& send) override;
     void pump();
@@ -30,6 +30,12 @@ public:
     uint32_t receiveRate() const { return receiveRate_; }
     uint32_t reportsSent() const { return reportsSent_.load(); }
     uint32_t twccSent() const { return twccSent_.load(); }
+    bool demoteWanted() const { return demoteWanted_.load(std::memory_order_relaxed) != 0; }
+    bool promoteWanted() const { return promoteWanted_.load(std::memory_order_relaxed) != 0; }
+    void clearTierHints() {
+        demoteWanted_.store(0, std::memory_order_relaxed);
+        promoteWanted_.store(0, std::memory_order_relaxed);
+    }
 
 private:
     void onRtp(const uint8_t* d, size_t n, uint64_t nowUs);
@@ -59,6 +65,8 @@ private:
     int lossyReports_ = 0;
     BitratePlan abr_{};
     std::atomic<int> pliArmed_{0};
+    std::atomic<int> demoteWanted_{0};
+    std::atomic<int> promoteWanted_{0};
     std::atomic<uint32_t> estimate_{0}, receiveRate_{0}, reportsSent_{0}, twccSent_{0};
 
     static constexpr int kTwccCap = 512;

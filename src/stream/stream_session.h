@@ -68,7 +68,9 @@ struct StreamOptions {
     // buffer, to exercise NACK / key frame recovery.
     int simulatedVideoLoss = 0;
     // Ceiling of the bandwidth estimate sent to the server (REMB), bits/s.
-    uint32_t maxBitrate = 25000000;
+    uint32_t maxBitrate = 10000000;
+    // ABR_720 / ABR_1080 / ABR_1440: floor e rampa dipendono dal tier.
+    int abrTier = 1;
 };
 
 // "a=candidate:..." with a Teredo (2001::/32) address -> the IPv4 address and
@@ -89,6 +91,12 @@ public:
     // Blocking: negotiates, connects and completes the channel handshakes.
     bool start(std::string& err);
     bool isOpen() const;
+    bool iceConnected() const;
+    // Chiusura del canale input senza aver chiamato fail() (ICE ancora su).
+    bool inputChannelDown() const;
+    bool abrDemoteWanted() const;
+    bool abrPromoteWanted() const;
+    void clearAbrTierHints();
 
     void sendGamepad(const GamepadFrame& frame);
     // Solo memoria: pad neutro senza toccare il DataChannel (menu PS / chiusura).
@@ -100,7 +108,9 @@ public:
     void setTouchEnabled(bool on);
     // A controller at `index` (1..3; 0 is attached at the start) came or went.
     void setGamepadConnected(int index, bool connected);
-    void requestKeyframe();
+    // Control videoKeyframeRequested + PLI, rate-limited (500 ms / max 10 in 5 s).
+    // true se la richiesta è partita.
+    bool requestKeyframe();
     // A frame shown: its timings go back to the server (see FrameMetadata).
     void reportFrame(const FrameMetadata& frame);
     // Quanti ack di frame sono usciti sul canale input.

@@ -16,7 +16,6 @@
 #include "stream/abr_plan.h"
 #include "stream/connect_plan.h"
 #include "stream/idr_gate.h"
-#include "stream/keyframe_limit.h"
 #include "stream/stream_session.h"
 #include "ui/strings.h"
 #include "util/log.h"
@@ -72,8 +71,10 @@ struct StreamPlayer::Impl {
     std::atomic<bool> needDecoderReset{false};
     std::atomic<bool> waitIdr{false};  // dopo Reset o perdita di riferimento: solo IDR
     std::atomic<uint64_t> idrSinceMs{0};
-    KfLimit kf{};
     int idrResetDone = 0;
+    int preferredTier = ABR_1080;
+    int wantPromote1080 = 0;
+    int tierSwapArmed = 0;
     FrameSlot shownSlot{};
     uint64_t picSeq = 0;
     struct HeldPic {
@@ -282,7 +283,6 @@ struct StreamPlayer::Impl {
         bool loggedAu = false, loggedDecode = false, loggedBlit = false;
         uint64_t lastTraceSec = platform::nowMs();
         uint64_t presentedAtSec = 0, lateAtSec = 0;
-        kfInit(&kf);
         frameSlotInit(&shownSlot);
         auto presentHeld = [&] {
             if (!held.valid || g_psMenu.load() || g_appStopping.load()) return;
@@ -381,13 +381,17 @@ struct StreamPlayer::Impl {
                 }
                 stats::statsNoteDrop(1, n);
                 if (!waitIdr.exchange(true)) idrSinceMs.store(platform::nowMs());
+                keyframeWanted = true;
+                requestKeyframeIfWanted();
                 platform::sleepMs(40);
                 continue;
             }
-            if (waitIdr.load() && !auIsIdr(frame.data.data(), frame.data.size())) {
-                stats::statsNoteDrop(1, 1);
+            if (waitIdr.load()) {
                 keyframeWanted = true;
                 requestKeyframeIfWanted();
+            }
+            if (waitIdr.load() && !auIsIdr(frame.data.data(), frame.data.size())) {
+                stats::statsNoteDrop(1, 1);
                 continue;
             }
             if (waitIdr.exchange(false)) {
@@ -710,10 +714,18 @@ struct StreamPlayer::Impl {
         orbisAudio = audio_callbacks_orbis.init(0, &opus, nullptr, 0) == 0;
         if (!orbisAudio) XC_LOGW("audio_orbis non partito: lo stream resta senza audio");
         XC_LOGI("video: init Videodec2, niente software");
-        if (!hw.init(1920, 1088)) {
-            err = hw.lastError().empty() ? "Videodec2 non partito" : hw.lastError();
-            XC_LOGE("video: %s", err.c_str());
-            return false;
+        // 720 → depth 1 e buffer 1280x720; 1080/1440 → depth 2 e 1920x1088.
+        {
+            int hwW = 1920, hwH = 1088;
+            if (gssv.resolution() == xcloud::Resolution::P720) {
+                hwW = 1280;
+                hwH = 720;
+            }
+            if (!hw.init(hwW, hwH)) {
+                err = hw.lastError().empty() ? "Videodec2 non partito" : hw.lastError();
+                XC_LOGE("video: %s", err.c_str());
+                return false;
+            }
         }
         trace::beginSession();
         trace::setStage("PLAYER_START");
@@ -852,9 +864,13 @@ struct StreamPlayer::Impl {
             tier = ABR_720;
             break;
         }
+        preferredTier = tier;
         BitratePlan plan = bitrateBegin(tier, maxBitrateMbps > 0 ? static_cast<uint32_t>(maxBitrateMbps) * 1000000u : 0);
         opts.maxBitrate = plan.ceilingBps;
+        opts.abrTier = tier;
         opts.simulatedVideoLoss = simulatedLoss;
+        XC_LOGI("stream: tier %s tetto %u kbps floor %u kbps", opts.resolutionAlias.c_str(), plan.ceilingBps / 1000u,
+                plan.floorBps / 1000u);
         if (const char* loss = std::getenv("XC_SIM_LOSS")) opts.simulatedVideoLoss = std::atoi(loss);
         callbacks = cb;
         options = opts;
@@ -1034,6 +1050,7 @@ struct StreamPlayer::Impl {
             return;
         }
         reconnecting = false;
+        tierSwapArmed = 0;
         updateMicState();
         XC_LOGI("reconnected after %d attempt(s)", reconnectAttempts);
         reconnectAttempts = 0;
@@ -1087,22 +1104,19 @@ struct StreamPlayer::Impl {
         XC_LOGI("screen -> %s: %s", screenPath.c_str(), ok ? "ok" : "failed");
     }
 
-    // Video thread only (data channel sends are thread-safe).
+    // Video/worker: il limiter (500 ms / 10 in 5 s) vive in StreamSession.
     void requestKeyframeIfWanted() {
         if (!keyframeWanted) return;
-        int d = kfDecide(&kf, platform::nowMs());
-        if (d == 0) return;
-        if (d < 0) {
+        auto s = current();
+        if (!s) return;
+        if (!s->requestKeyframe()) {
             stats::statsNoteKf(0);
             return;
         }
-        auto s = current();
-        if (!s) return;
         keyframeWanted = false;
         lastKeyframeRequestMs = platform::nowMs();
         ++keyframeRequests;
         stats::statsNoteKf(1);
-        s->requestKeyframe();
     }
 
     void pumpFast() {
@@ -1121,29 +1135,53 @@ struct StreamPlayer::Impl {
         stats::statsNoteNet(vst.lost.load(), vst.nacks.load(), vst.recovered.load());
         stats::statsNoteBitrate(vst.estimate.load() ? vst.estimate.load() : options.maxBitrate);
         stats::statsNoteAudio(media::audioUnderruns(), media::audioTrimmedFrames());
-        // xCloud sends video all the time, even for a still picture: three
-        // seconds without a packet is a dead connection, long before WebRTC
-        // notices. With the sound still coming, the connection is alive and
-        // the picture only paused (a home Xbox does it while a game starts
-        // and switches display modes): up to 15 s then.
+        // Video fermo < 15 s: resto in sessione, PLI rate-limited. Niente
+        // «Connessione persa». Riconnetto solo se ICE/DTLS è giù, oppure
+        // input chiuso AND nessun video > 15 s AND ICE non connesso.
         uint64_t packets = s->videoStats().packets;
         uint64_t audio = audioPackets;
         bool audioAlive = audio != lastAudioPackets;
         lastAudioPackets = audio;
         silentTicks = packets == lastRtpPackets ? silentTicks + 1 : 0;
         lastRtpPackets = packets;
-        int limit = audioAlive ? 15 : 3;
-        // Il video fermo non è una connessione persa: si continua a mandare
-        // RR, REMB, ack e pad. Riconnettere qui è ciò che fa comparire
-        // «ricollega il controller».
-        if (silentTicks >= limit && s->isOpen()) {
-            if (silentTicks == limit || silentTicks % 5 == 0) {
+        if (silentTicks >= 1 && silentTicks <= 15 && s->isOpen()) {
+            if (silentTicks == 1 || silentTicks % 2 == 0) {
                 XC_LOGW("video fermo da %d s%s: resto in sessione, keyframe", silentTicks,
                         audioAlive ? " (l'audio arriva)" : "");
-                s->requestKeyframe();
+                keyframeWanted = true;
+                requestKeyframeIfWanted();
             }
-        } else if (silentTicks >= limit && !s->isOpen() && !reconnecting.exchange(true)) {
-            XC_LOGW("no video for %d s%s: reconnecting", silentTicks, audioAlive ? " (sound still coming)" : "");
+        }
+        bool iceOk = s->iceConnected();
+        bool inputDead = s->inputChannelDown();
+        if (inputDead && silentTicks > 15 && !iceOk && !reconnecting.exchange(true)) {
+            XC_LOGW("input chiuso, video fermo da %d s, ICE giù: riconnetto", silentTicks);
+        } else if (!s->isOpen() && !iceOk && silentTicks > 15 && !reconnecting.exchange(true)) {
+            XC_LOGW("sessione chiusa e ICE giù dopo %d s senza video: riconnetto", silentTicks);
+        }
+
+        if (!tierSwapArmed && s->abrDemoteWanted() && preferredTier >= ABR_1080) {
+            tierSwapArmed = 1;
+            s->clearAbrTierHints();
+            XC_LOGW("abr: stall ripetuti a 1080, cedo a 720p @ 8 Mb/s");
+            gssv.setResolution(xcloud::Resolution::P720);
+            options.resolutionAlias = "720HQ";
+            options.maxBitrate = abrCeiling(ABR_720);
+            options.abrTier = ABR_720;
+            preferredTier = ABR_720;
+            wantPromote1080 = 1;
+            reconnecting.store(true);
+        } else if (!tierSwapArmed && s->abrPromoteWanted() && wantPromote1080) {
+            tierSwapArmed = 1;
+            s->clearAbrTierHints();
+            XC_LOGI("abr: 60 s puliti a 720, offro 1080 @ 10 Mb/s");
+            gssv.setResolution(xcloud::Resolution::P1080HQ);
+            options.resolutionAlias = "1080HQ";
+            options.maxBitrate = abrCeiling(ABR_1080);
+            options.abrTier = ABR_1080;
+            preferredTier = ABR_1080;
+            wantPromote1080 = 0;
+            reconnecting.store(true);
         }
     }
 

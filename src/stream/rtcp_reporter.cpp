@@ -101,11 +101,11 @@ void logTwccPacket(uint32_t n, const std::vector<uint8_t>& b, uint16_t base, int
 
 }  // namespace
 
-RtcpReporter::RtcpReporter(uint32_t clockRate, uint32_t maxBitrate)
+RtcpReporter::RtcpReporter(uint32_t clockRate, uint32_t maxBitrate, int abrTier)
     : clockRate_(clockRate), maxBitrate_(maxBitrate) {
-    abr_ = bitrateBegin(ABR_1080, 0);
-    abr_.ceilingBps = maxBitrate ? maxBitrate : abr_.ceilingBps;
-    abr_.currentBps = abr_.ceilingBps;
+    int tier = abrTier;
+    if (tier < ABR_720 || tier > ABR_1440) tier = ABR_1080;
+    abr_ = bitrateBegin(tier, maxBitrate);
     estimate_ = abr_.currentBps;
 }
 
@@ -378,12 +378,26 @@ void RtcpReporter::report(uint64_t now, const rtc::message_callback& send) {
     put32(b, lastSr_);
     put32(b, lastSr_ ? dlsr : 0);
 
-    // Con transport-cc attivo: solo RR (+ TWCC a parte). REMB a 25 Mbps
-    // insieme a TWCC confonde il GCC del server (PS5/browser: solo TWCC).
+    // RR + TWCC + REMB. Il REMB porta la stima ABR (anche al tetto): senza,
+    // con solo TWCC la stima restava bloccata a bitrate_ask (01.51).
     uint32_t rate = intervalUs ? static_cast<uint32_t>(bytesSinceReport_ * 8 * 1000000 / intervalUs) : 0;
     receiveRate_ = rate;
-    bitrateOnReport(&abr_, fraction, static_cast<int>(intervalUs / 1000));
+    int stallMs = 0;
+    if (lastRtpUs_.load()) {
+        uint64_t quiet = now > lastRtpUs_.load() ? now - lastRtpUs_.load() : 0;
+        stallMs = static_cast<int>(quiet / 1000u);
+    } else if (started_) {
+        stallMs = kAbrStallMs;
+    }
+    uint32_t before = abr_.currentBps;
+    bitrateOnSample(&abr_, rate, fraction, static_cast<int>(intervalUs / 1000), stallMs);
     estimate_ = abr_.currentBps;
+    if (bitrateDemoteDue(&abr_)) demoteWanted_.store(1, std::memory_order_relaxed);
+    if (bitratePromoteDue(&abr_)) promoteWanted_.store(1, std::memory_order_relaxed);
+    if (abr_.lastChanged) {
+        XC_LOGI("abr: %u → %u kbps (%s) recv %u kbps stall %d ms", before / 1000u, abr_.currentBps / 1000u,
+                abr_.lastReason ? abr_.lastReason : "?", rate / 1000u, stallMs);
+    }
     bool sentRemb = bitrateSendRemb(&abr_) != 0;
     if (sentRemb) {
         std::vector<uint8_t> remb;
@@ -394,7 +408,7 @@ void RtcpReporter::report(uint64_t now, const rtc::message_callback& send) {
         }
     }
     uint32_t n = ++reportsSent_;
-    if (n <= 4 || n % 5 == 0)
+    if (n <= 4 || n % 5 == 0 || abr_.lastChanged)
         XC_LOGI("rtcp: RR %u kbps (recv) stima %u kbps ssrc %08x loss %u n %u twcc %u%s", rate / 1000u,
                 abr_.currentBps / 1000u, mediaSsrc_, static_cast<unsigned>(fraction), n, twccSent_.load(),
                 sentRemb ? " REMB" : "");
@@ -410,7 +424,7 @@ void RtcpReporter::report(uint64_t now, const rtc::message_callback& send) {
 }
 
 void RtcpReporter::sendRemb(uint32_t bps, uint32_t mediaSsrc, std::vector<uint8_t>& b) {
-    // Solo quando la stima è sotto il tetto. Al tetto il TWCC basta.
+    // Tetto ABR verso il server; va con TWCC.
     uint8_t exp = 0;
     uint32_t mantissa = bps;
     while (mantissa >= (1u << 18)) {
@@ -458,7 +472,7 @@ void RtcpReporter::pump() {
             lastPliUs_ = now;
             XC_LOGI("rtcp: PLI video fermo");
         }
-        // Niente REMB iniziale: con TWCC il server rampa da solo.
+        /* REMB è nel report() (anche con TWCC): senza, la stima resta a ask. */
         if (lastReportUs_ && now - lastReportUs_ < kReportIntervalUs) return;
         if (!started_) {
             lastReportUs_ = now;

@@ -12,6 +12,7 @@
 #include "stream/idr_gate.h"
 #include "stream/keyframe_limit.h"
 #include "stream/nack_plan.h"
+#include "stream/stream_dims.h"
 
 #include <atomic>
 #include <chrono>
@@ -174,21 +175,40 @@ int main() {
     expect("al massimo 10 keyframe in 5 s", sent <= kKfMaxInWindow && sent >= 1);
     expect("il tetto ne blocca una", blocked == 1);
 
+    expect("720HQ → 1280x720", streamDimsForAlias("720HQ").w == 1280 && streamDimsForAlias("720HQ").h == 720);
+    expect("720 → 1280x720", streamDimsForAlias("720").w == 1280 && streamDimsForAlias("720").h == 720);
+    expect("1080HQ → 1920x1080", streamDimsForAlias("1080HQ").w == 1920 && streamDimsForAlias("1080HQ").h == 1080);
+    expect("1440 → 2560x1440", streamDimsForAlias("1440").w == 2560 && streamDimsForAlias("1440").h == 1440);
+    expect("fmtp 720 Baseline 42e020", std::strstr(streamH264Fmtp("720HQ"), "42e020") != nullptr);
+    expect("fmtp 1080 Baseline 42e02a", std::strstr(streamH264Fmtp("1080HQ"), "42e02a") != nullptr);
+
     BitratePlan p720 = bitrateBegin(ABR_720, 0);
     BitratePlan p1080 = bitrateBegin(ABR_1080, 0);
     BitratePlan capped = bitrateBegin(ABR_1080, 5000000);
     expect("720 parte a 8 Mb/s", p720.ceilingBps == 8000000 && p720.currentBps == 8000000);
-    expect("1080 parte a 12 Mb/s", p1080.ceilingBps == 12000000);
+    expect("720 floor 4 Mb/s", p720.floorBps == 4000000);
+    expect("1080 tetto 12 partenza 10", p1080.ceilingBps == 12000000 && p1080.currentBps == 10000000);
+    expect("1080 floor 6 Mb/s", p1080.floorBps == 6000000);
     expect("il tetto utente vince", capped.ceilingBps == 5000000);
     expect("SDP in kbps", bitrateSdpKbps(&p1080) == 12000);
-    expect("al tetto niente REMB", !bitrateSendRemb(&p1080));
-    bitrateOnReport(&p1080, 20, 1000);
-    expect("una perdita toglie il 20%", p1080.currentBps == 9600000);
-    expect("sotto il tetto si manda REMB", bitrateSendRemb(&p1080));
-    for (int i = 0; i < 20; ++i) bitrateOnReport(&p1080, 0, 1000);
-    expect("dopo 20 s puliti sale di 250 kb/s", p1080.currentBps == 9850000);
-    while (p1080.currentBps < p1080.ceilingBps) bitrateOnReport(&p1080, 0, 20000);
+    expect("REMB anche al tetto", bitrateSendRemb(&p1080));
+    bitrateOnSample(&p1080, 10000000, 20, 1000, 0);
+    expect("una perdita toglie il 20%", p1080.currentBps == 8000000);
+    expect("REMB sotto il tetto", bitrateSendRemb(&p1080));
+    for (int i = 0; i < 20; ++i) bitrateOnSample(&p1080, p1080.currentBps, 0, 1000, 0);
+    expect("dopo 20 s puliti sale di 250 kb/s", p1080.currentBps == 8250000);
+    while (p1080.currentBps < p1080.ceilingBps) bitrateOnSample(&p1080, p1080.currentBps, 0, 20000, 0);
     expect("non supera il tetto", p1080.currentBps == p1080.ceilingBps);
+    BitratePlan stall = bitrateBegin(ABR_1080, 0);
+    bitrateOnSample(&stall, 0, 0, 1000, 1500);
+    expect("stall −40%", stall.currentBps == 6000000 && stall.stallCuts == 1);
+    expect("REMB dopo stall", bitrateSendRemb(&stall));
+    BitratePlan low = bitrateBegin(ABR_1080, 0);
+    bitrateOnSample(&low, 1000000, 0, 1000, 0);
+    bitrateOnSample(&low, 1000000, 0, 1000, 0);
+    expect("recv <30% per 2 s −40%", low.currentBps == 6000000);
+    bitrateOnSample(&stall, 0, 0, 1000, 1500);
+    expect("secondo stall chiede demote", bitrateDemoteDue(&stall));
 
     FbOwn fb;
     fbOwnInit(&fb, 4);
@@ -268,7 +288,11 @@ int main() {
     expect("reconnect a 20 s", player.find("kReconnectDtlsBudgetMs") != std::string::npos);
     expect("niente attesa di flip nel blit", player.find("drawNv12(held.nv12.data(), held.pitch, held.w, held.h, false)") != std::string::npos);
     expect("il present con wait è sparito", player.find("drawNv12(hp.data, pitch, w, h, true)") == std::string::npos);
-    expect("bitrate 12 Mb/s nel piano", player.find("bitrateBegin") != std::string::npos);
+    expect("piano bitrate", player.find("bitrateBegin") != std::string::npos);
+    expect("dimensioni da alias", slurp("src/stream/stream_session.cpp").find("streamDimsForAlias") != std::string::npos);
+    expect("limiter keyframe in sessione", sess.find("kfDecide") != std::string::npos);
+    expect("goog-remb in offerta", slurp("src/stream/stream_session.cpp").find("goog-remb") != std::string::npos);
+    expect("depth 1 a 720", slurp("src/media/hw_decoder_ps4.cpp").find("kDepth720") != std::string::npos);
     expect("niente offerta a 30 Mb/s", player.find("30000000") == std::string::npos);
     std::string hw = slurp("src/media/hw_decoder_ps4.cpp");
     expect("il decoder offre solo buffer liberi", hw.find("fbOffer") != std::string::npos && hw.find("fbRelease") != std::string::npos);

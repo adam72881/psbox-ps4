@@ -3,6 +3,8 @@
 #include "stream/stream_session.h"
 
 #include "stream/connect_plan.h"
+#include "stream/keyframe_limit.h"
+#include "stream/stream_dims.h"
 
 #include "stream/h264_receiver.h"
 #include "stream/rtcp_reporter.h"
@@ -168,6 +170,7 @@ struct StreamSession::Impl {
     bool gatheringDone = false;
     bool handshakeDone = false;
     bool iceUp = false;
+    std::atomic<bool> inputDown{false};
     bool failed = false;
     std::string failReason;
 
@@ -206,13 +209,30 @@ struct StreamSession::Impl {
     std::mutex outMu;
     std::vector<std::pair<std::shared_ptr<rtc::DataChannel>, std::string>> outText;
     std::atomic<bool> keyframeJsonWanted{false};
+    KfLimit kfLimit{};
+    std::mutex kfMu;
     std::atomic<uint64_t> acked{0};
     // After the picture stopped for a while (a lag spike), the server may
     // keep receiving the pad and ignore it: the pads are announced again.
     std::atomic<uint64_t> lastVideoMs{0};
     std::atomic<bool> padsStale{false};
 
-    Impl(xcloud::GssvClient& g, StreamCallbacks c, StreamOptions o) : gssv(g), cb(std::move(c)), opt(o) {}
+    Impl(xcloud::GssvClient& g, StreamCallbacks c, StreamOptions o) : gssv(g), cb(std::move(c)), opt(o) {
+        kfInit(&kfLimit);
+    }
+
+    /* 1 se il limiter ammette: messaggio control + PLI. */
+    int tryKeyframe() {
+        std::lock_guard<std::mutex> lock(kfMu);
+        int d = kfDecide(&kfLimit, platform::nowMs());
+        if (d <= 0) return 0;
+        json::Value v = json::Value::object();
+        v.set("message", "videoKeyframeRequested");
+        v.set("ifrRequested", true);
+        sendText(control, v.dump());
+        if (videoReporter) videoReporter->armPli();
+        return 1;
+    }
 
     double nowMs() const { return stream::clockMs(); }
 
@@ -285,10 +305,16 @@ struct StreamSession::Impl {
             batch.swap(outText);
         }
         if (keyframeJsonWanted.exchange(false)) {
-            json::Value v = json::Value::object();
-            v.set("message", "videoKeyframeRequested");
-            v.set("ifrRequested", true);
-            batch.emplace_back(control, v.dump());
+            /* Stesso limiter di requestKeyframe: niente burst dal path RTP. */
+            std::lock_guard<std::mutex> lock(kfMu);
+            int d = kfDecide(&kfLimit, platform::nowMs());
+            if (d > 0) {
+                json::Value v = json::Value::object();
+                v.set("message", "videoKeyframeRequested");
+                v.set("ifrRequested", true);
+                batch.emplace_back(control, v.dump());
+                if (videoReporter) videoReporter->armPli();
+            }
         }
         if (batch.empty()) return;
         std::lock_guard<std::mutex> lock(dcSendMu);
@@ -389,9 +415,10 @@ struct StreamSession::Impl {
         sendText(message, messageEnvelope("/streaming/characteristics/clientdevicecapabilities", json::Value::object()));
 
         // Come il client web: horizontal/vertical sono i pixel dell'elemento
-        // video, non i millimetri del pannello.
-        int w = opt.resolutionAlias == "1440" ? 2560 : opt.resolutionAlias == "720" ? 1280 : 1920;
-        int h = opt.resolutionAlias == "1440" ? 1440 : opt.resolutionAlias == "720" ? 720 : 1080;
+        // video. 720HQ / 1080HQ devono mappare la base (bug 01.51: == "720"
+        // falliva e mandava 1920x1080 con alias 720HQ).
+        StreamDims dim = streamDimsForAlias(opt.resolutionAlias.c_str());
+        int w = dim.w, h = dim.h;
         json::Value dims = json::Value::object();
         dims.set("horizontal", w);
         dims.set("vertical", h);
@@ -403,7 +430,8 @@ struct StreamSession::Impl {
         dims.set("safeAreaBottom", h);
         dims.set("supportsCustomResolution", true);
         sendText(message, messageEnvelope("/streaming/characteristics/dimensionschanged", dims));
-        XC_LOGI("message: config client inviata %dx%d systemUis %s", w, h,
+        XC_LOGI("message: config client inviata %dx%d (alias %s) systemUis %s", w, h,
+                opt.resolutionAlias.empty() ? "-" : opt.resolutionAlias.c_str(),
                 cb.textInput ? "tastiera" : "vuoto");
     }
 
@@ -592,13 +620,25 @@ struct StreamSession::Impl {
         ch->onOpen([label] { XC_LOGI("data channel %s open", label); });
         ch->onClosed([this, label] {
             XC_LOGI("data channel %s closed", label);
-            // La chat vocale si chiude da sola se non c'è il microfono: non è
-            // la sessione di gioco. Gli altri canali sì.
-            // chat e message sono canali di interfaccia. Chiuderli non è la
-            // sessione di gioco: control e input restano, e si continua a
-            // mandare pad, ack e RTCP. È la chiusura di message che faceva
-            // comparire «connessione persa».
+            // chat e message sono canali di interfaccia: chiuderli non è la
+            // sessione di gioco. control resta critico.
             if (std::strcmp(label, "chat") == 0 || std::strcmp(label, "message") == 0) return;
+            // Input chiuso con ICE ancora su: non «Connessione persa». Si resta
+            // in sessione; PLI su RTCP può ancora riprendere il video. Si
+            // riconnette solo se dopo >15 s senza video l'ICE non è connesso.
+            if (std::strcmp(label, "input") == 0) {
+                inputDown.store(true);
+                bool iceOk = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    iceOk = iceUp;
+                }
+                if (iceOk) {
+                    XC_LOGW("data channel input closed, ICE ancora su: resto in sessione (PLI)");
+                    if (videoReporter) videoReporter->armPli();
+                    return;
+                }
+            }
             if (open) fail(std::string("data channel ") + label + " closed");
         });
         return ch;
@@ -673,6 +713,7 @@ struct StreamSession::Impl {
         input = makeChannel("input", "1.0");
         input->onOpen([this] {
             XC_LOGI("data channel input open");
+            inputDown.store(false);
             GamepadFrame f;
             f.index = 0;
             sendPad(f);
@@ -728,23 +769,27 @@ struct StreamSession::Impl {
 
         // Video: H.264 only, Main before Constrained Baseline / Baseline.
         rtc::Description::Video v("1", rtc::Description::Direction::RecvOnly);
-        // Main profile at level 5.1 (0x33): the level that allows 1440p60; with
-        // 3.1 the service tops out at 1080p (it answers level 4.2).
-        v.addH264Codec(102, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d0033");
-        v.addH264Codec(104, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f");
-        v.addH264Codec(106, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f");
+        // Constrained Baseline prima (come XCloud4): 42e020 a 720, 42e02a a 1080.
+        // Poi Main 4d0033 come fallback per 1440 dove serve.
+        const char* fmtp = streamH264Fmtp(opt.resolutionAlias.c_str());
+        v.addH264Codec(102, fmtp);
+        v.addH264Codec(104, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d0033");
+        v.addH264Codec(106, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f");
         // Come PS5 v0.9.8 e 01.35: transport-cc nell'offerta (ext id 3).
-        // La 01.36 l'ha tolto «per allinearsi al REMB-only» ma sul PS5
-        // l'offerta ha ancora transport-cc: senza, su Orbis il server non
-        // risponde al ClientHello DTLS (0 byte RX → timeout).
+        // REMB (goog-remb) resta il tetto ABR anche con TWCC (01.52).
         v.addExtMap(rtc::Description::Entry::ExtMap(
             3, "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"));
         for (int pt : {102, 104, 106}) {
-            if (auto* m = v.rtpMap(pt)) m->addFeedback("transport-cc");
+            if (auto* m = v.rtpMap(pt)) {
+                m->addFeedback("transport-cc");
+                m->addFeedback("goog-remb");
+            }
         }
         v.setBitrate(static_cast<int>(opt.maxBitrate / 1000u));
         v.addSSRC(kReceiverSsrc, "video");
-        XC_LOGI("video: offro %u kbps, ssrc rtcp %08x, transport-cc", opt.maxBitrate / 1000u, kReceiverSsrc);
+        StreamDims offerDim = streamDimsForAlias(opt.resolutionAlias.c_str());
+        XC_LOGI("video: offro %u kbps %dx%d fmtp %s, ssrc rtcp %08x, transport-cc+remb",
+                opt.maxBitrate / 1000u, offerDim.w, offerDim.h, fmtp, kReceiverSsrc);
         video = pc->addTrack(v);
         // Our jitter buffer (NACK, whole frames only) in place of
         // H264RtpDepacketizer, which hands over frames with holes in them.
@@ -758,7 +803,7 @@ struct StreamSession::Impl {
             },
             videoStats);
         videoReceiver->setSimulatedLoss(opt.simulatedVideoLoss);
-        videoReporter = std::make_shared<RtcpReporter>(90000, opt.maxBitrate);
+        videoReporter = std::make_shared<RtcpReporter>(90000, opt.maxBitrate, opt.abrTier);
         videoReceiver->addToChain(videoReporter);
         video->setMediaHandler(videoReceiver);
         XC_LOGI("webrtc: data channel e tracce audio/video pronte");
@@ -1134,13 +1179,7 @@ struct StreamSession::Impl {
         sendInputBinary(inputReport(seq, nowMs(), &frame, frames));
     }
 
-    void requestKeyframe() {
-        json::Value v = json::Value::object();
-        v.set("message", "videoKeyframeRequested");
-        v.set("ifrRequested", true);
-        sendText(control, v.dump());
-        if (videoReporter) videoReporter->armPli();
-    }
+    int requestKeyframe() { return tryKeyframe(); }
 
     uint64_t lastQuietKf = 0;
 
@@ -1257,6 +1296,25 @@ bool StreamSession::start(std::string& err) {
 }
 bool StreamSession::isOpen() const { return impl_->open; }
 
+bool StreamSession::iceConnected() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->iceUp;
+}
+
+bool StreamSession::inputChannelDown() const { return impl_->inputDown.load(); }
+
+bool StreamSession::abrDemoteWanted() const {
+    return impl_->videoReporter && impl_->videoReporter->demoteWanted();
+}
+
+bool StreamSession::abrPromoteWanted() const {
+    return impl_->videoReporter && impl_->videoReporter->promoteWanted();
+}
+
+void StreamSession::clearAbrTierHints() {
+    if (impl_->videoReporter) impl_->videoReporter->clearTierHints();
+}
+
 void StreamSession::sendGamepad(const GamepadFrame& frame) {
     Impl& d = *impl_;
     if (d.padsStale.exchange(false)) d.announceGamepad();
@@ -1293,11 +1351,12 @@ void StreamSession::setGamepadConnected(int index, bool connected) {
     impl_->sendGamepadChanged(index, connected);
 }
 
-void StreamSession::requestKeyframe() {
+bool StreamSession::requestKeyframe() {
     try {
-        impl_->requestKeyframe();
+        return impl_->requestKeyframe() != 0;
     } catch (const std::exception& e) {
         XC_LOGW("keyframe request: %s", e.what());
+        return false;
     }
 }
 void StreamSession::reportFrame(const FrameMetadata& frame) {
