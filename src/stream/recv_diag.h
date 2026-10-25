@@ -41,6 +41,9 @@ typedef struct PsboxRecvSnap {
 
 void psbox_rd_snapshot(PsboxRecvSnap* out);
 void psbox_rd_reset(void);
+/* 01.56: log 1 Hz su thread proprio (anche se il worker è in start()). */
+void psbox_rd_start_logger(void);
+void psbox_rd_stop_logger(void);
 
 #ifdef __cplusplus
 }

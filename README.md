@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <img alt="Build" src="https://img.shields.io/badge/build-01.55-0b6bcb?style=flat-square" />
+  <img alt="Build" src="https://img.shields.io/badge/build-01.56-0b6bcb?style=flat-square" />
   <img alt="Console" src="https://img.shields.io/badge/PS4-GoldHEN%2011.52-003087?style=flat-square" />
   <img alt="Stream" src="https://img.shields.io/badge/xCloud-1080HQ-107c10?style=flat-square" />
   <img alt="License" src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue?style=flat-square" />
@@ -28,7 +28,7 @@ Client homebrew di **Xbox Cloud Gaming**: login Microsoft, catalogo Game Pass, s
 | **Upstream** | [RafaelNGP/xbox-cloud-gaming-ps5](https://github.com/RafaelNGP/xbox-cloud-gaming-ps5) |
 | **Console** | PS4 + GoldHEN (riferimento **11.52**) |
 | **Title ID** | `XCLD00001` |
-| **Build** | `1.0.55-ps4` → `dist/PSBox-PS4-01.55.pkg` |
+| **Build** | `1.0.56-ps4` → `dist/PSBox-PS4-01.56.pkg` |
 | **Dati** | `/data/psbox` (account, settings, log) |
 | **Licenza** | GPL-3.0-or-later (come l’upstream) |
 
@@ -47,23 +47,23 @@ Client homebrew di **Xbox Cloud Gaming**: login Microsoft, catalogo Game Pass, s
 
 | File | Note |
 | --- | --- |
-| [**PSBox-PS4-01.55.pkg**](https://github.com/adam72881/psbox-ps4/releases/latest) | Build corrente — Package Installer / GoldHEN (firmware **11.52**) |
+| [**PSBox-PS4-01.56.pkg**](https://github.com/adam72881/psbox-ps4/releases/latest) | Build corrente — Package Installer / GoldHEN (firmware **11.52**) |
 | [Releases](https://github.com/adam72881/psbox-ps4/releases) | Storico versioni e checksum SHA-256 |
 
-**SHA-256 (01.55):** `0176de425d6bf31cd43beb55a1114c6c1017b1914eb56dc695b8180c0999082e`. Storico **01.53:** `be096b24a61d9d8bbda9cbd8998bc11e05c9a601d6cc4989329fda845d668b02`.
+**SHA-256 (01.56):** da CI (artifact `PSBox-PS4`). Storico **01.55:** `0176de425d6bf31cd43beb55a1114c6c1017b1914eb56dc695b8180c0999082e`.
 
 Se la Release non è ancora pubblicata, compila con `./scripts/build_pkg.sh` oppure usa il pkg già in `dist/` sul tuo PC di build.
 
 ## Installazione
 
-1. Con GoldHEN attivo, installa `PSBox-PS4-01.55.pkg` (Package Installer / GoldHEN).
+1. Con GoldHEN attivo, installa `PSBox-PS4-01.56.pkg` (Package Installer / GoldHEN).
 2. Aggiornamento locale: copia un pkg più nuovo in `/data/psbox/update/`, apri l’app e conferma **Sì** nel dialogo (BGFT su `/user/data/...`, attesa fine task).
 3. Servono internet e un account Microsoft con Game Pass che includa xCloud.
 
 **Da PC (FTP GoldHEN `:2121`):**
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\ps4_deploy.ps1 -Pkg .\dist\PSBox-PS4-01.55.pkg
+powershell -ExecutionPolicy Bypass -File .\tools\ps4_deploy.ps1 -Pkg .\dist\PSBox-PS4-01.56.pkg
 ```
 
 I dati restano in `/data/psbox`. Non condividere `account.json`.
@@ -76,7 +76,7 @@ Serve clang 18, lld, CMake, Ninja, Python 3, OpenSSL 1.1 per PkgTool.
 ./scripts/build_pkg.sh
 ```
 
-Output: `dist/PSBox-PS4-01.55.pkg` e `dist/psbox-install.bin`.  
+Output: `dist/PSBox-PS4-01.56.pkg` e `dist/psbox-install.bin`.  
 Dipendenze: OpenOrbis 0.5.4, mbedTLS 3.6.2, libdatachannel 0.24.6, opus 1.5.2.
 
 ## Diagnostica stream

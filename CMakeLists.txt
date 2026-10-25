@@ -3,7 +3,7 @@
 # Port PS4: stesso nucleo di PSBox (auth, xCloud, WebRTC, UI). Il target
 # predefinito è OpenOrbis. cmake/openorbis.cmake imposta XCLOUD_PS4.
 cmake_minimum_required(VERSION 3.20)
-project(xcloud_ps4 VERSION 1.0.55 LANGUAGES C CXX)
+project(xcloud_ps4 VERSION 1.0.56 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

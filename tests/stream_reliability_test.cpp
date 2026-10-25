@@ -326,7 +326,16 @@ int main() {
     expect("STUN Google", slurp("src/stream/stream_session.cpp").find("stun.l.google.com") != std::string::npos);
     expect("ECDSA", slurp("src/stream/stream_session.cpp").find("CertificateType::Ecdsa") != std::string::npos);
     expect("coda lock-free", slurp("src/app/stream_player.cpp").find("FrameQueue") != std::string::npos);
-    expect("recv diag 1 Hz", slurp("src/app/stream_player.cpp").find("psbox_rd_snapshot") != std::string::npos);
+    expect("recv diag thread dedicato", slurp("src/app/stream_player.cpp").find("psbox_rd_start_logger") != std::string::npos);
+    expect("flush outbound durante negoziazione",
+           sess.find("flushOutbound()") != std::string::npos &&
+               sess.find("Handshake (e i JSON di onHandshakeAck)") != std::string::npos);
+    expect("capabilities XCloud4 non vuote",
+           sess.find("supportsHevc") != std::string::npos && sess.find("maxBitrateKbps") != std::string::npos);
+    expect("sigwait unlink marker", crash.find("unlink(g_marker)") != std::string::npos);
+    expect("bg=1 post-stream senza VideoOutClose",
+           life.find("post-stream (no VideoOutClose") != std::string::npos);
+    expect("niente ShellUiFg dopo homeSuspend", life.find("!st.homeSuspended") != std::string::npos);
     expect("libdatachannel 0.24.6", slurp("scripts/fetch_deps.sh").find("v0.24.6") != std::string::npos);
     expect("juice pin XCloud4", slurp("scripts/fetch_deps.sh").find("b89c792") != std::string::npos);
     expect("RR solo su SR", slurp("src/stream/rtcp_reporter.cpp").find("RR su SR") != std::string::npos);

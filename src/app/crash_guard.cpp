@@ -168,11 +168,13 @@ void sigwaitLoop() {
         int sig = 0;
         if (sigwait(&set, &sig) != 0) continue;
         if (!closeSignalWakes(sig)) continue;
-        xc::app::stats::statsFinish("chiusura");
-        xc::app::stats::statsWriteFinal();
+        // 01.56: dopo bg=1 (VideoOut/pad già chiusi) Chiudi manda SIGTERM.
+        // Niente stats/heap: solo write+fsync+_exit. Si cancella il marker
+        // così il boot successivo non legge «last line / bg=1…» come crash.
         const char fin[] = "exit: processo terminato (segnale)\n";
         flushFd(STDERR_FILENO, fin, static_cast<int>(sizeof fin - 1));
         flushFd(g_logFd, fin, static_cast<int>(sizeof fin - 1));
+        if (g_marker[0]) ::unlink(g_marker);
         _exit(0);
     }
 }

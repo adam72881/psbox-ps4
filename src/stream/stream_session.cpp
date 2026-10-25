@@ -404,13 +404,33 @@ struct StreamSession::Impl {
         touch.set("touchInputEnabled", false);
         queueText(message, messageEnvelope("/streaming/characteristics/touchinputenabledchanged", touch));
 
-        queueText(message, messageEnvelope("/streaming/characteristics/clientdevicecapabilities", json::Value::object()));
-
-        // Come il client web: horizontal/vertical sono i pixel dell'elemento
-        // video. 720HQ / 1080HQ devono mappare la base (bug 01.51: == "720"
-        // falliva e mandava 1920x1080 con alias 720HQ).
+        // XCloud4 rtc_transport start_channels: capabilities piene (non {}),
+        // poi dimensions, poi alias su control. Il server spegne l'RTP ~5 s
+        // senza questa sequenza (01.55: Handshake in coda e mai flushato).
         StreamDims dim = streamDimsForAlias(opt.resolutionAlias.c_str());
         int w = dim.w, h = dim.h;
+        uint32_t kbps = opt.maxBitrate / 1000u;
+        if (!kbps) kbps = 12000;
+        json::Value videoCap = json::Value::object();
+        videoCap.set("width", w);
+        videoCap.set("height", h);
+        videoCap.set("maxWidth", w);
+        videoCap.set("maxHeight", h);
+        videoCap.set("maxBitrateKbps", static_cast<int>(kbps));
+        json::Value caps = json::Value::object();
+        caps.set("supportsCustomResolution", true);
+        caps.set("supportsHevc", false);
+        caps.set("supportsHdr", false);
+        caps.set("supportsFps", 60);
+        caps.set("maxWidth", w);
+        caps.set("maxHeight", h);
+        caps.set("maxBitrateKbps", static_cast<int>(kbps));
+        caps.set("video", videoCap);
+        queueText(message, messageEnvelope("/streaming/characteristics/clientdevicecapabilities", caps));
+
+        // Come il client web / XCloud4: horizontal/vertical = pixel video.
+        // 720HQ / 1080HQ devono mappare la base (bug 01.51: == "720"
+        // falliva e mandava 1920x1080 con alias 720HQ).
         json::Value dims = json::Value::object();
         dims.set("horizontal", w);
         dims.set("vertical", h);
@@ -462,8 +482,11 @@ struct StreamSession::Impl {
         sendClientConfig();
         if (opt.resolutionAlias == "1440" && !gssv.isHome())
             resolutionPending = true;
-        else if (!opt.resolutionAlias.empty())
+        else         if (!opt.resolutionAlias.empty())
             sendResolution(opt.resolutionAlias);
+        // Auth/config/alias restano in outText: li flusha waitFor/negotiateOnce
+        // sul thread di negoziazione (non send dal callback DC).
+        XC_LOGI("RTC canales Xbox preparados (auth+pad+config+alias in coda)");
         {
             std::lock_guard<std::mutex> lock(mutex);
             handshakeDone = true;
@@ -801,7 +824,15 @@ struct StreamSession::Impl {
             auto slice = std::chrono::milliseconds(kNegotiateSliceMs);
             if (end - now < slice) slice = std::chrono::duration_cast<std::chrono::milliseconds>(end - now);
             cv.wait_for(lock, slice, [&] { return failed || pred() || stopRequested(); });
+            // 01.56: Handshake (e i JSON di onHandshakeAck) sono queueText dal
+            // callback DC; flushOutbound viveva solo in pumpFast DOPO start().
+            // Senza flush qui l'Handshake non parte → niente HandshakeAck →
+            // niente auth/config/alias → il server taglia l'RTP ~5 s, e il
+            // worker resta bloccato in start() (niente stream:/recv: in log).
             lock.unlock();
+            flushOutbound();
+            if (videoReporter) videoReporter->pump();
+            if (audioReporter) audioReporter->pump();
             negotiateKeepalive();
             lock.lock();
         }
@@ -877,7 +908,7 @@ struct StreamSession::Impl {
         }
         std::string offer = std::string(*local);
         if (!offerSdpOk(offer.c_str()))
-            XC_LOGW("offerta SDP fuori politica 01.55 (TWCC/PT extra/audio send?)");
+            XC_LOGW("offerta SDP fuori politica 01.56 (TWCC/PT extra/audio send?)");
         else
             XC_LOGI("offerta SDP: PT102 Baseline, audio recvonly, no TWCC/a=ssrc");
         XC_LOGD("local offer:\n%s", offer.c_str());
@@ -1033,12 +1064,19 @@ struct StreamSession::Impl {
                 return false;
             }
             {
-                std::lock_guard<std::mutex> lock(mutex);
-                if (failed) {
-                    err = failReason;
-                    return false;
+                bool done = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (failed) {
+                        err = failReason;
+                        return false;
+                    }
+                    done = handshakeDone;
                 }
-                if (handshakeDone) {
+                if (done) {
+                    // Auth/config/alias accodati in onHandshakeAck: flush prima
+                    // di dichiarare la negoziazione ok (XCloud4 start_channels).
+                    flushOutbound();
 #if defined(XCLOUD_PS4)
                     ::xc::app::trace::setStage("DTLS_OK");
 #endif
@@ -1073,6 +1111,7 @@ struct StreamSession::Impl {
             }
 #endif
             if (waitFor([this] { return handshakeDone; }, 200)) {
+                flushOutbound();
 #if defined(XCLOUD_PS4)
                 ::xc::app::trace::setStage("DTLS_OK");
 #endif

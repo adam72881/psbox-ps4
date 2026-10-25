@@ -2,7 +2,7 @@
 # Linux headless harness — same auth/GSSV/WebRTC/input/ack code as the PS4 app.
 #   cmake -S host -B build-host -G Ninja && cmake --build build-host -j$(nproc)
 cmake_minimum_required(VERSION 3.20)
-project(psbox_host VERSION 1.0.55 LANGUAGES C CXX)
+project(psbox_host VERSION 1.0.56 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

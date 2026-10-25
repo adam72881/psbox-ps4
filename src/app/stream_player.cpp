@@ -204,6 +204,7 @@ struct StreamPlayer::Impl {
         running = false;
         cv.notify_all();
         audioCv.notify_all();
+        psbox_rd_stop_logger();
         const char* why = "fine";
         if (reason.find("lost") != std::string::npos || reason.find("persa") != std::string::npos ||
             reason.find("couldn't") != std::string::npos)
@@ -902,6 +903,9 @@ struct StreamPlayer::Impl {
         }
         stream::armNewSession();
         stats::statsBegin(platform::dataDir() + "/stats", opts.resolutionAlias.c_str(), opts.maxBitrate, stats::kStatsIntervalMs);
+        // Prima di start(): se negotiateOnce resta in attesa handshake, il
+        // worker non chiama tick() — i contatori devono uscire lo stesso.
+        psbox_rd_start_logger();
         XC_LOGI("stream: avvio PeerConnection");
         auto dropSession = [](std::shared_ptr<stream::StreamSession> failed) {
             if (!failed) return;
@@ -1126,8 +1130,6 @@ struct StreamPlayer::Impl {
         if (auto s = current()) s->pumpFast();
     }
 
-    uint64_t lastRecvDiagMs = 0;
-
     // About once a second (worker thread).
     void tick() {
         if (!running) return;
@@ -1135,24 +1137,8 @@ struct StreamPlayer::Impl {
         auto s = current();
         if (!s) return;
         s->tick();
-        uint64_t nowDiag = platform::nowMs();
-        if (nowDiag - lastRecvDiagMs >= 1000) {
-            lastRecvDiagMs = nowDiag;
-            PsboxRecvSnap snap{};
-            psbox_rd_snapshot(&snap);
-            XC_LOGI(
-                "recv: poll=%llu dtls_in=%llu push_ok=%llu push_drop=%llu dorecv=%llu q=%d inside=%d "
-                "consent_tx=%llu consent_rx=%llu rtp[%08x]=%llu rtp[%08x]=%llu",
-                static_cast<unsigned long long>(snap.poll_recv),
-                static_cast<unsigned long long>(snap.dtls_incoming),
-                static_cast<unsigned long long>(snap.dtls_push_ok),
-                static_cast<unsigned long long>(snap.dtls_push_drop),
-                static_cast<unsigned long long>(snap.dorecv), snap.queue_size, snap.inside_push,
-                static_cast<unsigned long long>(snap.consent_sent),
-                static_cast<unsigned long long>(snap.consent_recv), snap.rtp_ssrc_a,
-                static_cast<unsigned long long>(snap.rtp_a), snap.rtp_ssrc_b,
-                static_cast<unsigned long long>(snap.rtp_b));
-        }
+        // recv: 1 Hz è sul thread dedicato (psbox_rd_start_logger), non qui:
+        // in 01.55 start() bloccava il worker e i contatori non comparivano.
         const auto& vst = s->videoStats();
         stats::statsNoteNet(vst.lost.load(), vst.nacks.load(), vst.recovered.load());
         stats::statsNoteBitrate(vst.estimate.load() ? vst.estimate.load() : options.maxBitrate);

@@ -14,7 +14,7 @@ static const int kOfferTwcc = 0;
 static const int kOfferExtraH264Pt = 0; /* niente 104/106 */
 static const int kKeepaliveIntervalMs = 30000;
 
-/* 1 se l'SDP locale rispetta la politica 01.55. */
+/* 1 se l'SDP locale rispetta la politica 01.56. */
 static int offerSdpOk(const char* sdp) {
     if (!sdp || !sdp[0]) return 0;
     if (strstr(sdp, "transport-cc")) return 0;

@@ -1,7 +1,11 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Contatori permanenti del percorso di ricezione (xcloud.log, 1 Hz).
+ * 01.56: thread dedicato — non dipende dal worker bloccato in start().
  */
 #include "stream/recv_diag.h"
+
+#include "platform/platform.h"
+#include "util/log.h"
 
 #include <atomic>
 #include <cstring>
@@ -21,6 +25,26 @@ std::atomic<uint32_t> g_ssrc_a{0};
 std::atomic<uint32_t> g_ssrc_b{0};
 std::atomic<int> g_inside_push{0};
 std::atomic<int> g_queue_size{0};
+
+std::atomic<int> g_diagRun{0};
+platform::Thread g_diagThread;
+
+void logRecvOnce() {
+    PsboxRecvSnap snap{};
+    psbox_rd_snapshot(&snap);
+    XC_LOGI(
+        "recv: poll=%llu dtls_in=%llu push_ok=%llu push_drop=%llu dorecv=%llu q=%d inside=%d "
+        "consent_tx=%llu consent_rx=%llu rtp[%08x]=%llu rtp[%08x]=%llu",
+        static_cast<unsigned long long>(snap.poll_recv),
+        static_cast<unsigned long long>(snap.dtls_incoming),
+        static_cast<unsigned long long>(snap.dtls_push_ok),
+        static_cast<unsigned long long>(snap.dtls_push_drop),
+        static_cast<unsigned long long>(snap.dorecv), snap.queue_size, snap.inside_push,
+        static_cast<unsigned long long>(snap.consent_sent),
+        static_cast<unsigned long long>(snap.consent_recv), snap.rtp_ssrc_a,
+        static_cast<unsigned long long>(snap.rtp_a), snap.rtp_ssrc_b,
+        static_cast<unsigned long long>(snap.rtp_b));
+}
 
 }  // namespace
 
@@ -96,4 +120,27 @@ extern "C" void psbox_rd_reset(void) {
     g_ssrc_b.store(0, std::memory_order_relaxed);
     g_inside_push.store(0, std::memory_order_relaxed);
     g_queue_size.store(0, std::memory_order_relaxed);
+}
+
+extern "C" void psbox_rd_start_logger(void) {
+    if (g_diagRun.exchange(1)) return;
+    if (!platform::startThread(
+            g_diagThread,
+            [] {
+                XC_LOGI("recv: logger 1 Hz (thread dedicato)");
+                while (g_diagRun.load(std::memory_order_relaxed)) {
+                    logRecvOnce();
+                    for (int i = 0; i < 10 && g_diagRun.load(std::memory_order_relaxed); ++i)
+                        platform::sleepMs(100);
+                }
+            },
+            1u << 20)) {
+        g_diagRun.store(0);
+        XC_LOGW("recv: logger non partito");
+    }
+}
+
+extern "C" void psbox_rd_stop_logger(void) {
+    if (!g_diagRun.exchange(0)) return;
+    g_diagThread.join();
 }
