@@ -6,15 +6,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "../auth/device_auth.h"
+#include "../auth/xbox_catalog.h"
+#include "../auth/xbox_session.h"
+#include "../ui/product_metadata.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-typedef struct X4AuthSnapshot X4AuthSnapshot;
-typedef struct X4CatalogSnapshot X4CatalogSnapshot;
-typedef struct X4RecentSnapshot X4RecentSnapshot;
-typedef struct X4SessionSnapshot X4SessionSnapshot;
-typedef struct X4ProductMetadata X4ProductMetadata;
 
 /* 0 ok, <0 fatal init failure (fonts/assets). */
 int psbox_ui_init(void);
