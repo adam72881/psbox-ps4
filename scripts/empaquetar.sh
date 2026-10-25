@@ -87,6 +87,13 @@ for asset in "${FONT_FILES[@]}"; do
     [[ -s "assets/fonts/$asset" ]] || { echo "Missing font asset: $asset" >&2; exit 1; }
     cp "assets/fonts/$asset" "$PACKAGE_ROOT/assets/fonts/$asset"
 done
+# PSBox Inter fonts + CA bundle (UI / HTTPS for box art).
+for ttf in Inter-Regular.ttf Inter-SemiBold.ttf Inter-Bold.ttf; do
+    [[ -s "assets/fonts/$ttf" ]] || { echo "Missing Inter font: $ttf" >&2; exit 1; }
+    cp "assets/fonts/$ttf" "$PACKAGE_ROOT/assets/fonts/$ttf"
+done
+[[ -s assets/cacert.pem ]] || { echo 'Missing assets/cacert.pem' >&2; exit 1; }
+cp assets/cacert.pem "$PACKAGE_ROOT/assets/cacert.pem"
 cp build/eboot.bin "$PACKAGE_ROOT/eboot.bin"
 # Revalidate the staged SELF, rather than trusting the copy/source preflight.
 python3 scripts/package_identity.py verify --mode "$PACKAGE_MODE" \
@@ -110,6 +117,10 @@ if [[ "$INCLUDE_DEMO" == 1 ]]; then
     PACKAGE_FILES='eboot.bin assets/sample.h264 sce_module/libSceFios2.prx sce_module/libc.prx sce_sys/param.sfo sce_sys/icon0.png LICENSE.txt THIRD_PARTY_NOTICES.md'
 fi
 for asset in "${FONT_FILES[@]}"; do PACKAGE_FILES+=" assets/fonts/$asset"; done
+for ttf in Inter-Regular.ttf Inter-SemiBold.ttf Inter-Bold.ttf; do
+    PACKAGE_FILES+=" assets/fonts/$ttf"
+done
+PACKAGE_FILES+=" assets/cacert.pem"
 for license in "${LICENSE_FILES[@]}"; do
     PACKAGE_FILES+=" licenses/${license##*/}"
 done

@@ -10,7 +10,7 @@ X4_WEBRTC_PREFIX ?= $(X4_WEBRTC_ROOT)/prefix
 CC := clang
 CXX := clang++
 LD := ld.lld
-CFLAGS := --target=x86_64-pc-freebsd12-elf -std=c23 -fPIC -funwind-tables -O2 -g -Wall -Wextra -MMD -MP -c -isysroot $(SDK) -I$(X4_WEBRTC_ROOT)/overlay -I$(X4_WEBRTC_PREFIX)/include -isystem $(SDK)/include -D_BSD_SOURCE -DX4_OPENORBIS
+CFLAGS := --target=x86_64-pc-freebsd12-elf -std=c23 -fPIC -funwind-tables -O2 -g -Wall -Wextra -MMD -MP -c -isysroot $(SDK) -I$(X4_WEBRTC_ROOT)/overlay -I$(X4_WEBRTC_PREFIX)/include -Isrc/psbox -Ithird_party/stb -Ithird_party/qrcodegen -Ithird_party/goldhen_sdk -Isrc/psbox/payload -isystem $(SDK)/include -D_BSD_SOURCE -DX4_OPENORBIS -DXC_APP_VERSION=\"01.57\"
 # Allocation preparation only. Native decoder/SDP/request capabilities remain
 # at the verified 720p configuration until a separate compatibility probe.
 X4_VIDEO_CAPACITY_1080 ?= 0
@@ -95,8 +95,39 @@ SOURCES := $(wildcard src/core/*.c src/ui/*.c src/video/*.c src/input/*.c src/au
 # llvmorg-11.0.0, commit 176249bd6732a8044d457092ed932768724a6f06.
 # Exact upstream SHA256: 39d39fc245662b760c7c74a29218eeb8c66805996dc00e25e1e77693e53a77a5.
 # Full license: docs/licenses/LLVM-libcxx-11-LICENSE.TXT.
-CXX_SOURCES := src/streaming/rtc_condition_variable.cpp
-OBJECTS := $(patsubst src/%.c,build/%.o,$(SOURCES)) $(patsubst src/%.cpp,build/%.o,$(CXX_SOURCES))
+# PSBox/PSCloud UI and app features (no stream stack, no --wrap=setsockopt).
+PSBOX_CXX_SOURCES := \
+	src/psbox/psbox_ui.cpp \
+	src/psbox/display/display_x4.cpp \
+	src/psbox/platform/platform_ps4.cpp \
+	src/psbox/platform/posix_common.cpp \
+	src/psbox/util/log.cpp \
+	src/psbox/util/json.cpp \
+	src/psbox/net/http.cpp \
+	src/psbox/net/builtin_ca_bundle.cpp \
+	src/psbox/ui/app_ui.cpp \
+	src/psbox/ui/stream_menu.cpp \
+	src/psbox/ui/canvas.cpp \
+	src/psbox/ui/font.cpp \
+	src/psbox/ui/image_cache.cpp \
+	src/psbox/ui/brand.cpp \
+	src/psbox/ui/strings.cpp \
+	src/psbox/ui/pad_icons.cpp \
+	src/psbox/ui/accent_color.cpp \
+	src/psbox/app/settings.cpp \
+	src/psbox/app/local_update.cpp \
+	src/psbox/app/crash_guard.cpp \
+	src/psbox/app/crash_log.cpp \
+	src/psbox/app/screenshot.cpp \
+	src/psbox/app/report.cpp \
+	src/psbox/app/stream_trace.cpp \
+	src/psbox/app/update_check.cpp
+PSBOX_C_SOURCES := src/psbox/platform/entropy_ps4.c third_party/goldhen_sdk/sdk_jailbreak.c
+CXX_SOURCES := src/streaming/rtc_condition_variable.cpp $(PSBOX_CXX_SOURCES)
+SOURCES += $(PSBOX_C_SOURCES)
+OBJECTS := $(patsubst src/%.c,build/%.o,$(filter src/%.c,$(SOURCES))) \
+	$(patsubst third_party/%.c,build/third_party/%.o,$(filter third_party/%.c,$(SOURCES))) \
+	$(patsubst src/%.cpp,build/%.o,$(CXX_SOURCES))
 OBJECTS += build/third_party/qrcodegen/qrcodegen.o
 
 .PHONY: all package

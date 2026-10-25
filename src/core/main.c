@@ -16,6 +16,7 @@
 #include "lifecycle.h"
 #include "build_identity.h"
 #include "psbox_exit.h"
+#include "../psbox/psbox_ui.h"
 #include "probe_controller.h"
 #include "../streaming/stream_profile.h"
 #include "../ui/stream_video_status.h"
@@ -227,6 +228,7 @@ int main(void)
 #else
     /* PSBox: blocca SIGTERM prima di qualsiasi thread (Chiudi dal menu PS). */
     (void)psbox_exit_install();
+    int psbox_ui = 0;
     X4Display display={.handle=-1};
     X4Controller controller;
     X4Screen screen = {0};
@@ -305,6 +307,13 @@ reopen_interface:;
         for (;;) sceKernelUsleep(100000);
     }
     x4_controller_init(&controller);
+    psbox_ui = (psbox_ui_init() == 0);
+    if (psbox_ui) {
+        printf("PSBox: UI PSCloud attiva (base XCloud4)\n");
+        psbox_ui_poll_local_update("01.57");
+    } else {
+        printf("PSBox: UI PSCloud non disponibile, resto su UI XCloud4 nativa\n");
+    }
 #if X4_STREAM_PROFILE
     stream_display_active=false;
     if(!live){live_retained=0;live_error=0;
@@ -557,6 +566,7 @@ reopen_interface:;
         interaction_phase(X4_MON_PHASE_MAIN_STATUS,sceKernelGetProcessTime());
 #endif
         x4_auth_snapshot(auth, &account);
+        if (psbox_ui) psbox_ui_set_auth(&account);
         bool catalog_copied = x4_auth_catalog_snapshot_cached(auth, &catalog, &catalog_cursor) != 0;
         if (catalog_copied) {
             ++ui_generation;
@@ -566,6 +576,7 @@ reopen_interface:;
             x4_catalog_browser_rebuild(&catalog_browser, &catalog);
             x4_recent_refresh_catalog(&recent, &catalog);
             if (catalog.state != X4_CATALOG_READY) catalog_browser.editing = false;
+            if (psbox_ui) psbox_ui_set_catalog(&catalog);
         }
         bool recent_copied = x4_auth_recent_snapshot_cached(auth, &recent_snapshot, &recent_cursor) != 0;
         if (recent_copied) {
@@ -579,6 +590,33 @@ reopen_interface:;
                     recent_snapshot.http_status, &catalog);
             else if (recent_snapshot.state == X4_CATALOG_IDLE) x4_recent_init(&recent);
             x4_catalog_browser_sync_recents(&catalog_browser, &recent);
+            if (psbox_ui) psbox_ui_set_recent(&recent_snapshot);
+        }
+        x4_auth_session_snapshot(auth, &session);
+        if (psbox_ui) psbox_ui_set_session(&session);
+        if (psbox_ui && !closing && screen.page != 6) {
+            char want_title[96] = {0};
+            float lx = (controller.data.leftStick.x - 128) / 128.f;
+            float ly = (controller.data.leftStick.y - 128) / 128.f;
+            float rx = (controller.data.rightStick.x - 128) / 128.f;
+            float ry = (controller.data.rightStick.y - 128) / 128.f;
+            float l2 = controller.data.analogButtons.l2 / 255.f;
+            float r2 = controller.data.analogButtons.r2 / 255.f;
+            int ui_act = psbox_ui_handle(controller.pressed, controller.data.buttons, lx, ly, rx, ry, l2, r2,
+                                         sceKernelGetProcessTime() / 1000ull, want_title, sizeof want_title);
+            if (ui_act < 0 && pending_launch) {
+                pending_launch = 0;
+            } else if (ui_act > 0 && want_title[0] && !x4_auth_busy(auth) && pending_auth < 0 &&
+                       !pending_launch) {
+                for (unsigned i = 0; i < catalog.count; ++i) {
+                    if (strcmp(catalog.titles[i].id, want_title) == 0) {
+                        catalog_selected = i;
+                        pending_launch = 1;
+                        screen.page = 5;
+                        break;
+                    }
+                }
+            }
         }
         bool metadata_changed = false;
         if (screen.page == 5 && !x4_auth_busy(auth)) {
@@ -589,6 +627,7 @@ reopen_interface:;
                 metadata_revision = revision;
                 x4_catalog_presentation_ingest(&presentation, ui_generation, revision, completed, n);
                 metadata_changed = x4_catalog_presentation_apply_names(&presentation, &catalog);
+                if (psbox_ui && n) psbox_ui_ingest_metadata(completed, n);
                 if (metadata_changed) {
                     x4_catalog_browser_rebuild(&catalog_browser, &catalog);
                     x4_recent_refresh_catalog(&recent, &catalog);
@@ -602,6 +641,7 @@ reopen_interface:;
                 x4_auth_cancel(auth);
                 session_back = 1;
             }
+            /* Leave from PSBox in-stream menu is handled after draw (return 2). */
             /* Keep the session page visible until remote cleanup finishes. */
             if (session_back && !x4_auth_busy(auth)) {
                 session_back = 0;
@@ -938,12 +978,26 @@ reopen_interface:;
         /* Media draw records the independent native-output identity. Display
          * uses the actual drawn publication tag, never a later snapshot. */
         (void)drawn_output;
+        if (psbox_ui && !drew_live && screen.page != 6 && !closing) {
+            psbox_ui_draw(x4_display_pixels(&display), sceKernelGetProcessTime() / 1000ull);
+        } else {
         if (!drew_live && screen.page != 5) x4_screen_draw(&screen, &controller, x4_display_pixels(&display));
         if (screen.page == 3) x4_media_draw(&video, &audio, x4_display_pixels(&display));
         if (screen.page == 6) {
-            if (drew_live)
+            if (drew_live) {
                 x4_live_overlay(&live_status, &session, live_muted, &touch_menu, show_banner, x4_display_pixels(&display));
-            else {
+                if (psbox_ui) {
+                    int menu_rc = psbox_ui_stream_menu(x4_display_pixels(&display), controller.pressed,
+                                                       controller.data.buttons,
+                                                       sceKernelGetProcessTime() / 1000ull,
+                                                       (int)live_status.width, (int)live_status.height, 0, 0);
+                    if (menu_rc == 2 && !session_back) {
+                        trace_inactive(live);
+                        x4_auth_cancel(auth);
+                        session_back = 1;
+                    }
+                }
+            } else {
                 X4SessionSnapshot shown = session;
 #if X4_STREAM_PROFILE
                 if(!live_error && live && !closing && !session_back &&
@@ -980,6 +1034,7 @@ reopen_interface:;
 #if X4_STREAM_PROFILE && !X4_PUBLIC
             x4_stream_settings_ui_draw(&stream_settings_ui,x4_display_pixels(&display));
 #endif
+        }
         }
         x4_exit_error_draw(screen.exit_error, x4_display_pixels(&display));
         uint64_t present_begin = sceKernelGetProcessTime();

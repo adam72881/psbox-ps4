@@ -39,9 +39,12 @@ export X4_RUNTIME_MODULES="$OO_PS4_TOOLCHAIN/samples/hello_world/sce_module"
 | Title / CONTENT_ID / APP_VER `01.57` / nome pkg / icon0 | **PSBox** (`scripts/package_identity.py` mode `psbox`, `assets/icon0.png`) |
 | SIGTERM → `_exit(0)` (exit post-menu) | **PSBox** (`src/core/psbox_exit.c`) |
 | Contatori recv/stream / NACK / grace | **XCloud4** (invariati; non i patch CMake PSBox 01.56) |
-| UI C++ PSCloud (libreria/grafica precedente) | In `legacy/psbox/` — **non** ancora innestata su questa base |
-| Update GoldHEN Remote Package Install | In `legacy/psbox/src/app/local_update.*` — **non** ancora portato |
+| UI C++ PSCloud (AppUi, settings, stream menu, …) | **PSBox** (`src/psbox/`, facade `psbox_ui.*` su hook X4) |
+| Update GoldHEN RPI | **PSBox** (`src/psbox/app/local_update.*`; payload helper stub) |
+| Crash guard / screenshot / report / trace | **PSBox** (`src/psbox/app/*`) |
+| `--wrap=setsockopt` / patch juice PSBox | **Esclusi** (causa stop ~6 s in 01.56) |
 
+Matrice feature-per-feature: [docs/PSBOX_FEATURE_MATRIX_01.57.md](docs/PSBOX_FEATURE_MATRIX_01.57.md).  
 Provenienza import: [UPSTREAM_XCLOUD4.txt](UPSTREAM_XCLOUD4.txt).
 
 ## Crediti
