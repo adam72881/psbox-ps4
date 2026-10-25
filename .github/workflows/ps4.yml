@@ -1,9 +1,14 @@
 name: PS4
 
-# Solo manuale: i push frequenti (import sorgente) spamavano e-mail di failure.
-# Avvia da Actions → PS4 → Run workflow quando serve una build CI.
+# PSBox 01.57+: XCloud4 streaming base, PSBox packaging identity.
 on:
   workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - cursor/xcloud4-base-e0ea
+      - cursor/stream-reliability-e0ea
+      - main
 
 jobs:
   pkg:
@@ -23,10 +28,15 @@ jobs:
         with:
           path: ~/ps4dev/OpenOrbis
           key: openorbis-v0.5.4-llvm18
+      - name: Cache XCloud4 WebRTC
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/xcloud4/webrtc
+          key: x4-webrtc-0.24.6-b89c792-mbedtls-068ff08-opus-1.5.2
       - name: Compila il .pkg
-        run: ./scripts/build_pkg.sh
+        run: chmod +x scripts/build_pkg.sh && ./scripts/build_pkg.sh
       - name: Carica il pacchetto
         uses: actions/upload-artifact@v4
         with:
           name: PSBox-PS4
-          path: dist/*.pkg
+          path: dist/PSBox-PS4-*.pkg

@@ -1,0 +1,13 @@
+XCloud4 upstream (streaming base for PSBox 01.57+)
+===============================================
+Source: https://github.com/asp11edgr/XCloud4
+Tag / release: v1.1.0-beta
+Archive: XCloud4-1.1.0-beta-source.zip (GitHub release source)
+License: GPL-3.0-only (see LICENSE, THIRD_PARTY_NOTICES.md)
+
+Import policy (Adam, 2026-10-25): full XCloud4 tree is the project BASE.
+PSBox overlays (packaging identity, exit handler, branding) live on top.
+On transport/stream conflicts, XCloud4 code wins unchanged.
+Unported PSBox C++ UI / GoldHEN RPI update remain under legacy/psbox/.
+6b6c1d7d7d15bd8eebcbc0842de3dffd7cdd7eb68aafdfe11c5752fd8e16e6c1  /tmp/x4src.zip
+Archive SHA-256 recorded above (XCloud4-1.1.0-beta-source.zip).

@@ -1,0 +1,28 @@
+{
+  "format": "X4FNT01",
+  "generator": "Pillow 12.3.0",
+  "layout": "BASIC, independent glyph advances, no kerning/shaping",
+  "sizes": [
+    18,
+    26,
+    28,
+    32,
+    38,
+    46,
+    56
+  ],
+  "weights": [
+    "Regular",
+    "SemiBold"
+  ],
+  "codepoints": 442,
+  "faces": 14,
+  "glyphs": 6188,
+  "atlas_bytes": 3346263,
+  "alpha_bytes": 3197271,
+  "fallback_bytes": 184531,
+  "runtime_combined_limit": 4194304,
+  "maximum_heap_atlas_bytes": 4009773,
+  "atlas_sha256": "d52d9dfc72809e566b87634547fde0f88201b50db2af84dfc3888ffe78983b50",
+  "fallback_sha256": "709f041c8ee6236033b5350f2945cbf59cff493307fb251069cc4974b811fea7"
+}

@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/nothings/stb",
+  "commit": "5736b15f7ea0ffb08dd38af21067c314d6a3aae9",
+  "selection": "MIT license alternative; JPEG and PNG only; no stdio",
+  "files": {
+    "stb_image.h": {
+      "sha256": "38e08c1c5ab8869ae8d605ddaefa85ad3fea24a2964fd63a099c0c0f79c70bcc",
+      "bytes": 284733
+    },
+    "LICENSE": {
+      "sha256": "bebfe904b14301657e4e5d655c811d51fd31b97c455b9cc2d8600d6bac6cff63",
+      "bytes": 2510
+    }
+  }
+}
