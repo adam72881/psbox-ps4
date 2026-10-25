@@ -50,7 +50,7 @@ Client homebrew di **Xbox Cloud Gaming**: login Microsoft, catalogo Game Pass, s
 | [**PSBox-PS4-01.56.pkg**](https://github.com/adam72881/psbox-ps4/releases/latest) | Build corrente — Package Installer / GoldHEN (firmware **11.52**) |
 | [Releases](https://github.com/adam72881/psbox-ps4/releases) | Storico versioni e checksum SHA-256 |
 
-**SHA-256 (01.56):** da CI (artifact `PSBox-PS4`). Storico **01.55:** `0176de425d6bf31cd43beb55a1114c6c1017b1914eb56dc695b8180c0999082e`.
+**SHA-256 (01.56):** `9f0b52e65bd0e7e3025a7f66b5c5959705c74a9087bd1bcb7aca2119e2aa9cb1`. Storico **01.55:** `0176de425d6bf31cd43beb55a1114c6c1017b1914eb56dc695b8180c0999082e`.
 
 Se la Release non è ancora pubblicata, compila con `./scripts/build_pkg.sh` oppure usa il pkg già in `dist/` sul tuo PC di build.
 
