@@ -27,7 +27,7 @@ std::atomic<int> g_inside_push{0};
 std::atomic<int> g_queue_size{0};
 
 std::atomic<int> g_diagRun{0};
-platform::Thread g_diagThread;
+xc::platform::Thread g_diagThread;
 
 void logRecvOnce() {
     PsboxRecvSnap snap{};
@@ -124,14 +124,14 @@ extern "C" void psbox_rd_reset(void) {
 
 extern "C" void psbox_rd_start_logger(void) {
     if (g_diagRun.exchange(1)) return;
-    if (!platform::startThread(
+    if (!xc::platform::startThread(
             g_diagThread,
             [] {
                 XC_LOGI("recv: logger 1 Hz (thread dedicato)");
                 while (g_diagRun.load(std::memory_order_relaxed)) {
                     logRecvOnce();
                     for (int i = 0; i < 10 && g_diagRun.load(std::memory_order_relaxed); ++i)
-                        platform::sleepMs(100);
+                        xc::platform::sleepMs(100);
                 }
             },
             1u << 20)) {
