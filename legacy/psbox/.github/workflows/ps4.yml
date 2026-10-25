@@ -1,0 +1,32 @@
+name: PS4
+
+# Solo manuale: i push frequenti (import sorgente) spamavano e-mail di failure.
+# Avvia da Actions → PS4 → Run workflow quando serve una build CI.
+on:
+  workflow_dispatch:
+
+jobs:
+  pkg:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compilatore e CMake
+        run: sudo apt-get update && sudo apt-get install -y clang lld-18 llvm-18 cmake ninja-build python3 curl ca-certificates
+      - name: libssl 1.1 per PkgTool
+        run: |
+          if [[ ! -e /usr/lib/x86_64-linux-gnu/libssl.so.1.1 ]]; then
+            curl -fsSL -o /tmp/libssl1.1.deb http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2.24_amd64.deb
+            sudo dpkg -i /tmp/libssl1.1.deb
+          fi
+      - name: Cache OpenOrbis
+        uses: actions/cache@v4
+        with:
+          path: ~/ps4dev/OpenOrbis
+          key: openorbis-v0.5.4-llvm18
+      - name: Compila il .pkg
+        run: ./scripts/build_pkg.sh
+      - name: Carica il pacchetto
+        uses: actions/upload-artifact@v4
+        with:
+          name: PSBox-PS4
+          path: dist/*.pkg

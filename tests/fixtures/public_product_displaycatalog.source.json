@@ -1,0 +1,10 @@
+{
+  "source": "https://displaycatalog.mp.microsoft.com/v7.0/products?bigIds=9NKX70BBCDRN&market=MX&languages=es-MX&fieldsTemplate=Details",
+  "retrieved_utc": "2026-10-11T08:05:31.478949+00:00",
+  "http_status": 200,
+  "sha256": "0567e32106b6691641cf780d9bb4ea5f4af5d11ff40e23b9e7db339495f3c6ac",
+  "length": 54428,
+  "top_keys": [
+    "Products"
+  ]
+}

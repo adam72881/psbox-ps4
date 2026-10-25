@@ -1,64 +1,28 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 RafaelNGP
-// TrueType text through stb_truetype, with a glyph cache per pixel size.
-// Coordinates are the top-left corner of the line box.
+/* SPDX-License-Identifier: GPL-3.0-only */
 #pragma once
+#include <stddef.h>
+#include <stdint.h>
 
-#include "ui/canvas.h"
-
-#include <map>
-#include <memory>
-#include <mutex>
-#include <string>
-#include <string_view>
-#include <vector>
-
-namespace xc::ui {
-
-class Font {
-public:
-    Font();
-    ~Font();
-    Font(const Font&) = delete;
-    Font& operator=(const Font&) = delete;
-
-    bool load(const std::string& path);
-
-    int lineHeight(int px) const;
-    // The `y` to draw at so that capital letters sit centred in a box of
-    // height `boxH` starting at `boxY` (badges, keys, buttons).
-    int centeredY(int boxY, int boxH, int px) const;
-    int measure(std::string_view text, int px) const;
-    // Returns the x after the last glyph.
-    int draw(Canvas& c, std::string_view text, int x, int y, int px, Color color) const;
-
-    // Word-wraps to `maxWidth`; at most `maxLines` (the last gets "...").
-    std::vector<std::string> wrap(std::string_view text, int px, int maxWidth, int maxLines) const;
-    // Shortens with "..." to fit `maxWidth`.
-    std::string fit(std::string_view text, int px, int maxWidth) const;
-
-private:
-    struct Glyph {
-        int w = 0, h = 0, xoff = 0, yoff = 0, advance = 0;
-        std::vector<uint8_t> bitmap;
-    };
-    const Glyph& glyph(uint32_t codepoint, int px) const;
-    float scale(int px) const;
-
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-    std::vector<unsigned char> data_;
-    mutable std::mutex mutex_;
-    mutable std::map<std::pair<uint32_t, int>, Glyph> cache_;
-};
-
-// The three weights the UI uses.
-struct Fonts {
-    Font regular, semibold, bold;
-    bool load(const std::string& dir);
-};
-
-// Next UTF-8 code point from `s` at `i` (advances `i`); U+FFFD on bad input.
-uint32_t nextCodepoint(std::string_view s, size_t& i);
-
-}  // namespace xc::ui
+/* UI-thread-owned, fixed-budget precomputed alpha atlas. init accepts a file
+ * or the containing directory. 0 = verified atlas loaded; -1 = smooth built-in
+ * Regular fallback remains usable. close releases the optional heap atlas.
+ * Neither rendering nor measuring allocates or reads files. */
+int x4_font_init(const char *asset_path);
+void x4_font_close(void);
+int x4_font_is_fallback(void);
+size_t x4_font_heap_bytes(void);
+/* x/y is the top-left of a line box, rather than the font baseline. All
+ * sizes are bounded to 8..96 pixels. Width includes the right ink overhang. */
+void x4_text_px(uint32_t *pixels, int x, int y, int size, int semibold,
+                const char *text, uint32_t color);
+int x4_text_width_px(int size, int semibold, const char *text);
+void x4_text_ellipsis_px(uint32_t *pixels, int x, int y, int size, int semibold,
+                        const char *text, int max_width, uint32_t color);
+/* Returns bytes written excluding NUL; sanitizes invalid UTF-8 with U+FFFD,
+ * preserves complete codepoints, and appends U+2026 when truncating. Newlines
+ * end this single-line operation. Output is always NUL-terminated if cap > 0. */
+size_t x4_text_fit_utf8(char *out, size_t cap, int size, int semibold,
+                       const char *text, int max_width);
+/* Decode one codepoint, consuming at least one byte of a nonempty string.
+ * Invalid/overlong/surrogate/truncated encodings yield U+FFFD. */
+uint32_t x4_utf8_next(const char **cursor);
