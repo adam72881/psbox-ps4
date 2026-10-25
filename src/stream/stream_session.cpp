@@ -3,6 +3,7 @@
 #include "stream/stream_session.h"
 
 #include "stream/connect_plan.h"
+#include "stream/input_plan.h"
 #include "stream/keyframe_limit.h"
 #include "stream/stream_dims.h"
 
@@ -27,6 +28,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -191,9 +193,8 @@ struct StreamSession::Impl {
     std::shared_ptr<Guard> guard = std::make_shared<Guard>();
     std::atomic<int> otherInputReports{0};
     // Controllers: which slots are attached; what each sent last and when
-    // (sendGamepad's thread). A pad that didn't change is sent again only
-    // every kPadRepeatMs, not at the input loop's rate.
-    static constexpr uint64_t kPadRepeatMs = 50;
+    // (sendGamepad's thread). Keepalive a 60 Hz anche se il pad non cambia.
+    static constexpr uint64_t kPadRepeatMs = static_cast<uint64_t>(kInputPadIntervalMs);
     std::atomic<uint32_t> padsAttached{0};
     GamepadFrame lastPad[4];
     uint64_t lastPadMs[4] = {};
@@ -482,9 +483,7 @@ struct StreamSession::Impl {
             sendResolution(opt.resolutionAlias);
 
 
-        // One touch point, as the web client announces (touch is then turned
-        // on only while a touch screen is up: setTouchEnabled()).
-        sendBinary(input, clientMetadataReport(0, nowMs(), static_cast<uint8_t>(std::getenv("XC_TOUCH_POINTS") ? std::atoi(std::getenv("XC_TOUCH_POINTS")) : 1)));
+        /* ClientMetadata parte all'open del canale input (XCloud4), non qui. */
         sendClientConfig();
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -613,9 +612,17 @@ struct StreamSession::Impl {
 
     // --- set-up ---------------------------------------------------------------
 
-    std::shared_ptr<rtc::DataChannel> makeChannel(const char* label, const char* protocol) {
+    std::shared_ptr<rtc::DataChannel> makeChannel(const char* label, const char* protocol,
+                                                  bool inputUnreliable = false) {
         rtc::DataChannelInit init;
         init.protocol = protocol;
+        /* XCloud4 rtc_transport.c: input unordered + maxRetransmits=0.
+         * Reliable+ordered → HOL blocking SCTP: un pacchetto perso ferma
+         * tutti i successivi e il server mette in pausa lo stream (01.52). */
+        if (inputUnreliable) {
+            init.reliability.unordered = kInputUnordered != 0;
+            init.reliability.maxRetransmits = kInputMaxRetransmits;
+        }
         auto ch = pc->createDataChannel(label, init);
         ch->onOpen([label] { XC_LOGI("data channel %s open", label); });
         ch->onClosed([this, label] {
@@ -710,13 +717,15 @@ struct StreamSession::Impl {
             XC_LOGI("data channel control open");
             announceGamepad();
         });
-        input = makeChannel("input", "1.0");
+        input = makeChannel("input", "1.0", true);
         input->onOpen([this] {
-            XC_LOGI("data channel input open");
+            XC_LOGI("data channel input open (unordered, maxRetransmits=0)");
             inputDown.store(false);
-            GamepadFrame f;
-            f.index = 0;
-            sendPad(f);
+            /* Solo ClientMetadata (type 8) all'apertura, come XCloud4. */
+            uint32_t seq = inputSequence.fetch_add(1);
+            uint8_t touches = 1;
+            if (const char* t = std::getenv("XC_TOUCH_POINTS")) touches = static_cast<uint8_t>(std::atoi(t));
+            sendBinary(input, clientMetadataReport(seq, nowMs(), touches));
         });
         message = makeChannel("message", "messageV1");
 
@@ -1153,10 +1162,11 @@ struct StreamSession::Impl {
         return false;
     }
 
-    // Come 01.35: ack+pad nello stesso datagramma (inputReport). Gli ack
-    // restano in coda finché pumpFast/sendPad (mai send dal thread video).
+    // Solo gamepad type 2 a 60 Hz (XCloud4). Niente Metadata type1 di default.
+    // Skip se bufferedAmount>0: niente code/raffiche sul canale input.
     void sendPad(const GamepadFrame& frame) {
         if (!input || !input->isOpen() || g_streamStop.load()) return;
+        if (inputSkipIfBuffered(input->bufferedAmount())) return;
         std::vector<FrameMetadata> frames;
         uint32_t seq;
         {
@@ -1165,18 +1175,24 @@ struct StreamSession::Impl {
                 lastPad[frame.index] = frame;
                 lastPadMs[frame.index] = platform::nowMs();
             }
-            if (pendingFrames.size() > 30)
-                pendingFrames.erase(pendingFrames.begin(), pendingFrames.end() - 30);
-            frames.swap(pendingFrames);
+            if (opt.sendFrameAcks) {
+                if (pendingFrames.size() > 30)
+                    pendingFrames.erase(pendingFrames.begin(), pendingFrames.end() - 30);
+                frames.swap(pendingFrames);
+            } else {
+                pendingFrames.clear();
+            }
             seq = inputSequence++;
         }
         static int once = 0;
-        if (!once++) XC_LOGI("input: primo pad");
+        if (!once++) XC_LOGI("input: primo pad (60 Hz, no Metadata type1)");
         if (!frames.empty()) {
             uint64_t prev = acked.fetch_add(frames.size());
             if (prev == 0) XC_LOGI("input: ack frame");
+            sendInputBinary(inputReport(seq, nowMs(), &frame, frames));
+            return;
         }
-        sendInputBinary(inputReport(seq, nowMs(), &frame, frames));
+        sendInputBinary(gamepadReport(seq, nowMs(), frame));
     }
 
     int requestKeyframe() { return tryKeyframe(); }
@@ -1360,12 +1376,9 @@ bool StreamSession::requestKeyframe() {
     }
 }
 void StreamSession::reportFrame(const FrameMetadata& frame) {
-    // Accoda solo: il send sul DataChannel "input" avviene in sendPad /
-    // pumpFast (thread main/worker). Un DataChannel::send dal thread video
-    // (o dal drain del decoder) mentre juice/SCTP processano un altro
-    // messaggio crea deadlock usrsctp (coda DTLS piena, pad appeso su
-    // inputSendMu) — riprodotto sull'harness Linux.
-    if (!impl_->open || g_streamStop.load()) return;
+    // Off di default (XCloud4 non manda Metadata type1). Con sendFrameAcks
+    // si accoda solo: il send resta in sendPad/pumpFast, mai dal thread video.
+    if (!impl_ || !impl_->opt.sendFrameAcks || !impl_->open || g_streamStop.load()) return;
     std::lock_guard<std::mutex> lock(impl_->padMu);
     impl_->pendingFrames.push_back(frame);
     if (impl_->pendingFrames.size() > 60)

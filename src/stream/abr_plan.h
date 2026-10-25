@@ -1,9 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * ABR reale: il tetto SDP è fisso; la stima REMB scende se il recv resta
- * sotto il 30% per 2 s, se il video è fermo oltre 1 s, o se il RR vede
- * perdite. +250 kb/s solo dopo 20 s puliti. Floor 4 Mb/s a 720 e 6 a 1080.
- * Politica riallineata a ciò che fanno XCloud4/Nexo (tetti bassi, taglio
- * sullo stall), reimplementata qui senza copiare il loro codice.
+ * ABR come Nexo adaptive_bitrate.h: si taglia su loss / local_dropped /
+ * stale_ingress (RTP fermo), non sul solo receive rate (una scena statica
+ * a 38 kbps non è congestione). Nessun taglio nei primi kAbrWarmupMs.
+ * +250 kb/s dopo 20 s puliti. Floor 4 Mb/s a 720 e 6 a 1080.
  */
 #ifndef PSBOX_ABR_PLAN_H
 #define PSBOX_ABR_PLAN_H
@@ -14,8 +13,8 @@ enum AbrTier { ABR_720 = 0, ABR_1080 = 1, ABR_1440 = 2 };
 
 static const uint32_t kAbrStepBps = 250000;
 static const int kAbrCleanMs = 20000;
-static const int kAbrLowRecvMs = 2000;
 static const int kAbrStallMs = 1000;
+static const int kAbrWarmupMs = 5000;
 static const int kAbrPromoteCleanMs = 60000;
 
 struct BitratePlan {
@@ -24,7 +23,7 @@ struct BitratePlan {
     uint32_t floorBps;
     uint32_t currentBps;
     unsigned long long cleanMs;
-    unsigned long long lowRecvMs;
+    unsigned long long aliveMs;
     unsigned int stallCuts;
     int lastChanged; /* 1 se l'ultimo sample ha mosso currentBps */
     const char* lastReason;
@@ -54,7 +53,7 @@ static BitratePlan bitrateBegin(int tier, uint32_t userCapBps) {
     p.currentBps = cap;
     if (tier == ABR_1080 && cap >= 10000000 && p.currentBps > 10000000) p.currentBps = 10000000;
     p.cleanMs = 0;
-    p.lowRecvMs = 0;
+    p.aliveMs = 0;
     p.stallCuts = 0;
     p.lastChanged = 0;
     p.lastReason = "start";
@@ -80,7 +79,6 @@ static int bitrateCut40(BitratePlan* p, const char* why) {
     next = p->currentBps - (p->currentBps * 2u) / 5u;
     next = bitrateClamp(p, next);
     p->cleanMs = 0;
-    p->lowRecvMs = 0;
     if (next == p->currentBps) {
         p->lastChanged = 0;
         return 0;
@@ -92,36 +90,42 @@ static int bitrateCut40(BitratePlan* p, const char* why) {
 }
 
 /*
- * recvBps = throughput ricevuto nell'intervallo RR.
- * stallMs = ms senza pacchetto RTP video (0 se il video arriva).
  * lossFraction = RR 0..255.
- * Ritorna 1 se currentBps è cambiato (va loggato e va mandato REMB).
+ * stallMs = ms senza pacchetto RTP video (stale_ingress).
+ * localDropped = drop locali (coda piena / scarti) nell'intervallo.
+ * recvBps è solo diagnostica: non guida il taglio (scena statica ≠ congestione).
+ * Ritorna 1 se currentBps è cambiato.
  */
-static int bitrateOnSample(BitratePlan* p, uint32_t recvBps, int lossFraction, int elapsedMs, int stallMs) {
+static int bitrateOnSample(BitratePlan* p, uint32_t recvBps, int lossFraction, int elapsedMs, int stallMs,
+                           int localDropped) {
     uint32_t next;
     int changed = 0;
+    (void)recvBps;
     if (!p) return 0;
     p->lastChanged = 0;
     if (elapsedMs < 0) elapsedMs = 0;
     if (stallMs < 0) stallMs = 0;
+    if (localDropped < 0) localDropped = 0;
 
+    int inWarmup = p->aliveMs < (unsigned long long)kAbrWarmupMs;
+    p->aliveMs += (unsigned long long)elapsedMs;
+    if (inWarmup) {
+        p->lastReason = "warmup";
+        return 0;
+    }
+
+    /* stale_ingress: nessun RTP per ≥ 1 s. */
     if (stallMs >= kAbrStallMs) {
         p->stallCuts++;
-        if (bitrateCut40(p, "stall")) return 1;
-        /* Già al floor: conta comunque lo stall per un eventuale demote. */
+        if (bitrateCut40(p, "stale_ingress")) return 1;
         p->lastReason = "stall_floor";
         return 0;
     }
 
-    /* recv < 30% del target per ≥ 2 s cumulativi. */
-    if (p->currentBps > 0 && recvBps * 10u < p->currentBps * 3u) {
-        p->lowRecvMs += (unsigned long long)elapsedMs;
-        if (p->lowRecvMs >= (unsigned long long)kAbrLowRecvMs) {
-            if (bitrateCut40(p, "recv_low")) return 1;
-            return 0;
-        }
-    } else {
-        p->lowRecvMs = 0;
+    /* Drop locali (coda / scarti decoder): congestione lato client. */
+    if (localDropped > 0) {
+        if (bitrateCut40(p, "local_dropped")) return 1;
+        return 0;
     }
 
     if (lossFraction > 0) {
@@ -153,11 +157,10 @@ static int bitrateOnSample(BitratePlan* p, uint32_t recvBps, int lossFraction, i
 
 /* Compat: solo RR loss, senza recv/stall. */
 static void bitrateOnReport(BitratePlan* p, int lossFraction, int elapsedMs) {
-    (void)bitrateOnSample(p, p ? p->currentBps : 0, lossFraction, elapsedMs, 0);
+    (void)bitrateOnSample(p, p ? p->currentBps : 0, lossFraction, elapsedMs, 0, 0);
 }
 
-/* REMB sempre (anche con TWCC): è il tetto che il server vede. Senza REMB
- * la stima restava fissa a bitrate_ask mentre recv scendeva a 0 (01.51). */
+/* REMB sempre (anche con TWCC): è il tetto che il server vede. */
 static int bitrateSendRemb(const BitratePlan* p) {
     return p && p->currentBps > 0;
 }
@@ -165,7 +168,7 @@ static int bitrateSendRemb(const BitratePlan* p) {
 /* Dopo 60 s puliti a 720, se l'utente voleva 1080, si può promuovere. */
 static int bitratePromoteDue(const BitratePlan* p) {
     return p && p->tier == ABR_720 && p->cleanMs >= (unsigned long long)kAbrPromoteCleanMs &&
-           p->currentBps >= p->ceilingBps && p->lowRecvMs == 0;
+           p->currentBps >= p->ceilingBps;
 }
 
 /* Due tagli da stall a 1080: cedere a 720. */

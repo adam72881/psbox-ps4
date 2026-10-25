@@ -390,7 +390,7 @@ void RtcpReporter::report(uint64_t now, const rtc::message_callback& send) {
         stallMs = kAbrStallMs;
     }
     uint32_t before = abr_.currentBps;
-    bitrateOnSample(&abr_, rate, fraction, static_cast<int>(intervalUs / 1000), stallMs);
+    bitrateOnSample(&abr_, rate, fraction, static_cast<int>(intervalUs / 1000), stallMs, 0);
     estimate_ = abr_.currentBps;
     if (bitrateDemoteDue(&abr_)) demoteWanted_.store(1, std::memory_order_relaxed);
     if (bitratePromoteDue(&abr_)) promoteWanted_.store(1, std::memory_order_relaxed);

@@ -71,6 +71,8 @@ struct StreamOptions {
     uint32_t maxBitrate = 10000000;
     // ABR_720 / ABR_1080 / ABR_1440: floor e rampa dipendono dal tier.
     int abrTier = 1;
+    // Metadata type1 (frame-ack): off di default come XCloud4. Solo gamepad.
+    bool sendFrameAcks = false;
 };
 
 // "a=candidate:..." with a Teredo (2001::/32) address -> the IPv4 address and

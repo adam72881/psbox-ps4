@@ -1,17 +1,14 @@
-# Release 01.52 (v1.0.52)
+# Release 01.53 (v1.0.53)
 
 | File | Note |
 | --- | --- |
-| `PSBox-PS4-01.52.pkg` | Build CI. SHA-256 dall'artifact `PSBox-PS4`. |
+| `PSBox-PS4-01.53.pkg` | Build CI. SHA-256 dall'artifact `PSBox-PS4`. |
 
-## Contenuto 01.52
+## Contenuto 01.53
 
-Fix radice sul FAIL 01.51 (720HQ → 1920x1080; stima fissa senza REMB; Connessione persa).
+Fix radice sul FAIL console 01.52 (server in pausa con 0 loss: HOL sul canale input + frame-ack Metadata + ABR su recv statico).
 
-- **BUG1:** `dimensionschanged` usa `streamDimsForAlias`: `720`/`720HQ` → 1280×720, `1080`/`1080HQ` → 1920×1080, `1440` → 2560×1440.
-- **BUG2:** REMB sempre (anche con TWCC) + ABR su recv/stall (−40%, floor 4/6 Mb/s).
-- **P1a:** attesa IDR dopo coda piena, errorFrame, menu PS; scarto P-frame; reset a 5 s.
-- **P1b:** limiter keyframe 500 ms / max 10 in 5 s; control + PLI.
-- **P1c:** tetto 8 Mb/s @720, 12 @1080 (partenza 10); `b=AS` = tetto; Baseline `42e020`/`42e02a`.
-- **P1d:** Videodec2 depth 1 a 720p; FB trattenuti non ri-offerti.
-- Chiusura: `sceSystemServiceLoadExec("exit")` + sigwait. UI invariata.
+- **Input SCTP:** canale `input` unordered + `maxRetransmits=0` (XCloud4 `rtc_transport.c`).
+- **Input reports:** solo `ClientMetadata` (type 8) all'apertura; poi gamepad type 2 a 60 Hz; skip se `bufferedAmount>0`; niente Metadata type1 di default (`sendFrameAcks=false`).
+- **ABR:** taglio su loss / local_dropped / stale_ingress; niente taglio sul solo receive rate; warmup 5 s senza tagli.
+- Resta dalla 01.52: dims 720HQ, REMB+TWCC, waitIdr, limiter KF, Baseline, depth 1 @720, LoadExec exit. UI invariata.
