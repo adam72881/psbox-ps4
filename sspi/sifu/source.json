@@ -1,10 +1,10 @@
 {
   "schema": "gamesearch.source/v1",
   "id": "dlpsgame-sifu-cusa25761",
-  "name": "DLPSGame · Sifu (CUSA25761 EUR)",
-  "version": "1.0.0",
+  "name": "DLPSGame · Sifu (CUSA25761 EU)",
+  "version": "1.0.1",
   "engine": {
-    "id": "embedded-catalog-v1",
+    "type": "embedded-catalog-v1",
     "entryFile": "catalog.json"
   },
   "capabilities": [
@@ -14,14 +14,19 @@
   ],
   "files": [
     {
-      "path": "catalog.json",
-      "size": 372,
-      "sha256": "f80bbe2d8fc5807a95bede46bc475dfcf3af38d161e4ab4486d18e1841f1802f"
+      "path": "index/titles.json",
+      "size": 254,
+      "sha256": "2a50b85e6de0458016c96a9be90c25c6e145fce63b031b84d1c56eafa6423096"
     },
     {
       "path": "packages/sifu.json",
-      "size": 515,
-      "sha256": "f808d21d78d2e7154881e3ceead45b0c2a2f2c20ec9db1b732ecb86d139eb8f2"
+      "size": 520,
+      "sha256": "3695831b5b5164e3b7be2d7b7fbdf027cf03741f05dd31d1ac4ddb27719fabfa"
+    },
+    {
+      "path": "catalog.json",
+      "size": 334,
+      "sha256": "fbbdf74b36bddc3a6e4e69f6a0d148c4883c635d8e83bce9767bb99394b5e8e5"
     }
   ]
 }
