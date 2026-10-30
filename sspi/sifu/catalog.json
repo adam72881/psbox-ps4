@@ -2,17 +2,13 @@
   "format": "embedded-catalog-v1",
   "formatVersion": 1,
   "searchNormalization": "nfkd-lower-alnum-spaces-v1",
-  "indexFiles": [
-    "index/titles.json"
-  ],
-  "packageFiles": [
-    "packages/sifu.json"
-  ],
+  "indexFiles": ["index/titles.json"],
+  "packageFiles": ["packages/sifu.json"],
   "counts": {
     "titles": 1,
     "readyTitles": 1,
     "releases": 1,
-    "multipartGroups": 0,
+    "multipartGroups": 1,
     "unresolved": 0
   }
 }

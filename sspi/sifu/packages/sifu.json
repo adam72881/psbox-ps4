@@ -2,17 +2,29 @@
   "titles": {
     "CUSA25761": [
       {
-        "id": "sifu-cusa25761-eu-base-v129-vikingfile",
+        "id": "sifu-cusa25761-eu-base-v129-mediafire-multipart",
         "titleId": "CUSA25761",
         "region": "EU",
         "kind": "base",
         "version": "1.29",
-        "label": "Base game · EU · v1.29 · VikingFile",
-        "hoster": "VikingFile",
-        "name": "Sifu-CUSA25761-EUR-v1.29.pkg",
-        "url": "https://vik1ngfile.site/f/zgkRF3KmXV",
+        "label": "Base game · EU · v1.29 · MediaFire · 2-part RAR",
+        "hoster": "MediaFire",
+        "name": "CUSA25761_SIFU_(1.29)_100%_Deluxe_Oxeres-[DLPSGAME.COM].part1.rar",
+        "url": "https://www.mediafire.com/file/snaqjg7g2s9sqt1/CUSA25761_SIFU_(1.29)_100%_Deluxe_Oxeres-[DLPSGAME.COM].part1.rar/file",
         "accessType": "HosterLanding",
-        "sourcePageUrl": "https://dlpsgame.com/sifu-ps4-pkg/"
+        "sourcePageUrl": "https://dlpsgame.com/sifu-ps4-pkg/",
+        "volumes": [
+          {
+            "url": "https://www.mediafire.com/file/snaqjg7g2s9sqt1/CUSA25761_SIFU_(1.29)_100%_Deluxe_Oxeres-[DLPSGAME.COM].part1.rar/file",
+            "name": "CUSA25761_SIFU_(1.29)_100%_Deluxe_Oxeres-[DLPSGAME.COM].part1.rar",
+            "accessType": "HosterLanding"
+          },
+          {
+            "url": "https://www.mediafire.com/file/1y9887nblfphywo/CUSA25761_SIFU_(1.29)_100%_Deluxe_Oxeres-[DLPSGAME.COM].part2.rar/file",
+            "name": "CUSA25761_SIFU_(1.29)_100%_Deluxe_Oxeres-[DLPSGAME.COM].part2.rar",
+            "accessType": "HosterLanding"
+          }
+        ]
       }
     ]
   }
