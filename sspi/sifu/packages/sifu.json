@@ -1,0 +1,19 @@
+{
+  "titleId": "CUSA25761",
+  "region": "EUR",
+  "name": "Sifu",
+  "packages": [
+    {
+      "id": "sifu-cusa25761-eur-base-v129-vikingfile",
+      "titleId": "CUSA25761",
+      "kind": "base",
+      "version": "1.29",
+      "label": "Base game · EUR · v1.29 · VikingFile",
+      "hoster": "VikingFile",
+      "name": "Sifu-CUSA25761-EUR-v1.29.pkg",
+      "url": "https://vik1ngfile.site/f/zgkRF3KmXV",
+      "accessType": "HosterLanding",
+      "sourcePageUrl": "https://dlpsgame.com/sifu-ps4-pkg/"
+    }
+  ]
+}
