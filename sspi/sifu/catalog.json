@@ -1,0 +1,18 @@
+{
+  "format": "embedded-catalog-v1",
+  "formatVersion": 1,
+  "searchNormalization": "nfkd-lower-alnum-spaces-v1",
+  "titles": [
+    {
+      "titleId": "CUSA25761",
+      "region": "EUR",
+      "name": "Sifu",
+      "packagesFile": "packages/sifu.json",
+      "releaseCount": 1,
+      "kinds": [
+        "base"
+      ],
+      "searchText": "Sifu CUSA25761 EUR"
+    }
+  ]
+}
