@@ -15,8 +15,8 @@
   "files": [
     {
       "path": "index/titles.json",
-      "size": 254,
-      "sha256": "2a50b85e6de0458016c96a9be90c25c6e145fce63b031b84d1c56eafa6423096"
+      "size": 238,
+      "sha256": "d18c43cdf3e5efde6bbf5a42437cea4d3125aee9402a829ee1a5e8920327715d"
     },
     {
       "path": "packages/sifu.json",
