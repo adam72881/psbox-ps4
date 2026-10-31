@@ -132,3 +132,12 @@ docs/           PROBLEMI.md e note
 
 GPL-3.0-or-later — [`LICENSE`](LICENSE).  
 Attribuzione upstream obbligatoria — [`NOTICE.md`](NOTICE.md).
+
+## Sorgente SSPI
+
+La sorgente catalogo PS4 per SSPI è disponibile qui:
+
+- [PS4 Games List (.gssource)](https://raw.githubusercontent.com/adam72881/psbox-ps4/main/sspi/ps4-games-list/ps4-games-list.gssource)
+- [Istruzioni e note](sspi/ps4-games-list/README.md)
+
+Importa in SSPI il collegamento RAW al file `.gssource`. Il file è stato copiato senza modificarne il contenuto dal progetto upstream [mylesniutta/ps4-games-list](https://github.com/mylesniutta/ps4-games-list).
